@@ -28,8 +28,6 @@ struct Project {
 #[serde(rename_all = "camelCase")]
 struct ToolSettingsInput {
     enabled: bool,
-    executable: String,
-    profile: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -40,15 +38,13 @@ struct SettingsInput {
     claude_code: ToolSettingsInput,
     github_username: String,
     github_token: String,
+    default_provider: String,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolSettings {
     enabled: bool,
-    executable: String,
-    profile: String,
-    configured: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -59,6 +55,7 @@ struct Settings {
     claude_code: ToolSettings,
     github_username: String,
     github_token_configured: bool,
+    default_provider: String,
 }
 
 #[derive(Debug)]
@@ -125,21 +122,14 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 }
 
 fn tool_settings_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolSettings> {
-    let executable: String = row.get(1)?;
     Ok(ToolSettings {
         enabled: row.get(0)?,
-        configured: !executable.trim().is_empty(),
-        executable,
-        profile: row.get(2)?,
     })
 }
 
 fn default_tool_settings() -> ToolSettings {
     ToolSettings {
         enabled: false,
-        executable: String::new(),
-        profile: String::new(),
-        configured: false,
     }
 }
 
@@ -149,7 +139,7 @@ fn read_tool_settings(
 ) -> Result<ToolSettings, String> {
     connection
         .query_row(
-            "SELECT enabled, executable, profile FROM tool_settings WHERE provider = ?1",
+            "SELECT enabled FROM tool_settings WHERE provider = ?1",
             [provider],
             tool_settings_from_row,
         )
@@ -163,30 +153,6 @@ fn github_token_configured() -> bool {
     keyring::Entry::new(GITHUB_CREDENTIAL_SERVICE, GITHUB_CREDENTIAL_USER)
         .and_then(|entry| entry.get_password())
         .is_ok()
-}
-
-fn validate_tool(provider: &str, settings: &ToolSettingsInput) -> Result<(), String> {
-    if !settings.enabled {
-        return Ok(());
-    }
-    if settings.executable.trim().is_empty() {
-        return Err(format!("Set an executable for {provider} or disable it."));
-    }
-
-    let output = Command::new(settings.executable.trim())
-        .arg("--version")
-        .output()
-        .map_err(|error| format!("Unable to start {provider}: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(if detail.is_empty() {
-        format!("{provider} did not accept the --version check.")
-    } else {
-        format!("{provider} check failed: {detail}")
-    })
 }
 
 #[tauri::command]
@@ -205,6 +171,13 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
             |row| row.get::<_, String>(0),
         )
         .unwrap_or_default();
+    let default_provider = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'default_provider'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "claudeCode".to_owned());
 
     Ok(Settings {
         copilot: read("copilot"),
@@ -212,14 +185,18 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
         claude_code: read("claude_code"),
         github_username,
         github_token_configured: github_token_configured(),
+        default_provider,
     })
 }
 
 #[tauri::command]
 fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<Settings, String> {
-    validate_tool("GitHub Copilot", &input.copilot)?;
-    validate_tool("Gemini CLI", &input.gemini)?;
-    validate_tool("Claude Code", &input.claude_code)?;
+    if !matches!(
+        input.default_provider.as_str(),
+        "copilot" | "gemini" | "claudeCode"
+    ) {
+        return Err("Choose a supported default AI agent.".to_owned());
+    }
 
     let github_token = input.github_token.trim().to_owned();
     if !github_token.is_empty() {
@@ -244,13 +221,11 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
     ] {
         transaction
             .execute(
-                "INSERT INTO tool_settings (provider, enabled, executable, profile)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO tool_settings (provider, enabled)
+                     VALUES (?1, ?2)
                  ON CONFLICT(provider) DO UPDATE SET
-                   enabled = excluded.enabled,
-                   executable = excluded.executable,
-                   profile = excluded.profile",
-                params![provider, settings.enabled, settings.executable.trim(), settings.profile.trim()],
+                   enabled = excluded.enabled",
+                params![provider, settings.enabled],
             )
             .map_err(|error| format!("Unable to save {provider} settings: {error}"))?;
     }
@@ -261,6 +236,13 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
             [&input.github_username.trim()],
         )
         .map_err(|error| format!("Unable to save GitHub settings: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO app_settings (key, value) VALUES ('default_provider', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&input.default_provider],
+        )
+        .map_err(|error| format!("Unable to save default provider: {error}"))?;
     transaction
         .commit()
         .map_err(|error| format!("Unable to commit settings: {error}"))?;
@@ -366,9 +348,7 @@ fn open_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error:
          );
          CREATE TABLE IF NOT EXISTS tool_settings (
            provider TEXT PRIMARY KEY NOT NULL,
-           enabled INTEGER NOT NULL DEFAULT 0,
-           executable TEXT NOT NULL DEFAULT '',
-           profile TEXT NOT NULL DEFAULT ''
+           enabled INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS app_settings (
            key TEXT PRIMARY KEY NOT NULL,

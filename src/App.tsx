@@ -15,9 +15,6 @@ type Project = {
 
 type ToolSettings = {
   enabled: boolean;
-  executable: string;
-  profile: string;
-  configured: boolean;
 };
 
 type Settings = {
@@ -26,15 +23,13 @@ type Settings = {
   claudeCode: ToolSettings;
   githubUsername: string;
   githubTokenConfigured: boolean;
+  defaultProvider: "copilot" | "gemini" | "claudeCode";
 };
 
 type SettingsForm = Settings & { githubToken: string };
 
 const emptyToolSettings = (): ToolSettings => ({
   enabled: false,
-  executable: "",
-  profile: "",
-  configured: false,
 });
 
 const emptySettings = (): Settings => ({
@@ -43,6 +38,7 @@ const emptySettings = (): Settings => ({
   claudeCode: emptyToolSettings(),
   githubUsername: "",
   githubTokenConfigured: false,
+  defaultProvider: "claudeCode",
 });
 
 const navItems = [
@@ -81,13 +77,13 @@ function SettingsView({
   onSave: (event: FormEvent<HTMLFormElement>) => void;
   saving: boolean;
 }) {
-  const updateTool = (key: "copilot" | "gemini" | "claudeCode", field: keyof ToolSettings, value: string | boolean) => {
+  const updateTool = (key: "copilot" | "gemini" | "claudeCode", field: keyof ToolSettings, value: boolean) => {
     setSettings({ ...settings, [key]: { ...settings[key], [field]: value } });
   };
   const tools = [
-    { key: "copilot" as const, label: "GitHub Copilot", command: "copilot", description: "Use Copilot CLI for delegated agent runs." },
-    { key: "gemini" as const, label: "Gemini CLI", command: "gemini", description: "Use Gemini CLI as an additional agent provider." },
-    { key: "claudeCode" as const, label: "Claude Code", command: "claude", description: "Use Claude Code for supervised implementation sessions." },
+    { key: "copilot" as const, label: "GitHub Copilot CLI", command: "copilot login", description: "Run copilot login in a terminal to start the browser-based GitHub sign-in flow." },
+    { key: "gemini" as const, label: "Gemini CLI", command: "gemini", description: "Start Gemini and choose Sign in with Google. API key and Vertex AI modes are also supported." },
+    { key: "claudeCode" as const, label: "Claude Code CLI", command: "claude", description: "Start Claude and follow the sign-in flow. Use /login inside Claude Code to switch accounts." },
   ];
 
   return (
@@ -104,14 +100,17 @@ function SettingsView({
             return (
               <article className="provider-card" key={tool.key}>
                 <div className="provider-title"><div className="provider-logo">{tool.label.charAt(0)}</div><div><h3>{tool.label}</h3><span>{tool.description}</span></div><label className="toggle"><input type="checkbox" checked={value.enabled} onChange={(event) => updateTool(tool.key, "enabled", event.currentTarget.checked)} /><span /></label></div>
-                <label className="field-label" htmlFor={`${tool.key}-executable`}>EXECUTABLE</label>
-                <input id={`${tool.key}-executable`} className="settings-input" value={value.executable} onChange={(event) => updateTool(tool.key, "executable", event.currentTarget.value)} placeholder={tool.command} />
-                <label className="field-label" htmlFor={`${tool.key}-profile`}>PROFILE / CONFIGURATION (OPTIONAL)</label>
-                <input id={`${tool.key}-profile`} className="settings-input" value={value.profile} onChange={(event) => updateTool(tool.key, "profile", event.currentTarget.value)} placeholder="Default profile" />
-                <span className={`setup-state ${value.configured ? "configured" : ""}`}><span /> {value.configured ? "Executable configured" : "Not configured"}</span>
+                <div className="login-command"><code>{tool.command}</code><span>Use the CLI's own login and credential storage.</span></div>
+                <span className={`setup-state ${value.enabled ? "configured" : ""}`}><span /> {value.enabled ? "Enabled for delegation" : "Disabled"}</span>
               </article>
             );
           })}
+        </div>
+      </section>
+      <section className="settings-section">
+        <div className="section-header"><div><h2>Default AI agent</h2><span className="section-caption">New delegated tasks use this provider unless a task overrides it.</span></div></div>
+        <div className="default-agent-card">
+          {tools.map((tool) => <label className="agent-option" key={tool.key}><input type="radio" name="defaultProvider" value={tool.key} checked={settings.defaultProvider === tool.key} onChange={() => setSettings({ ...settings, defaultProvider: tool.key })} /><span><strong>{tool.label}</strong><small>{tool.command}</small></span></label>)}
         </div>
       </section>
       <section className="settings-section">
