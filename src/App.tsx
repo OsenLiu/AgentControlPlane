@@ -13,6 +13,38 @@ type Project = {
   gitState: "clean" | "dirty";
 };
 
+type ToolSettings = {
+  enabled: boolean;
+  executable: string;
+  profile: string;
+  configured: boolean;
+};
+
+type Settings = {
+  copilot: ToolSettings;
+  gemini: ToolSettings;
+  claudeCode: ToolSettings;
+  githubUsername: string;
+  githubTokenConfigured: boolean;
+};
+
+type SettingsForm = Settings & { githubToken: string };
+
+const emptyToolSettings = (): ToolSettings => ({
+  enabled: false,
+  executable: "",
+  profile: "",
+  configured: false,
+});
+
+const emptySettings = (): Settings => ({
+  copilot: emptyToolSettings(),
+  gemini: emptyToolSettings(),
+  claudeCode: emptyToolSettings(),
+  githubUsername: "",
+  githubTokenConfigured: false,
+});
+
 const navItems = [
   ["⌂", "Dashboard"],
   ["▣", "Projects"],
@@ -20,6 +52,7 @@ const navItems = [
   ["!", "Attention inbox"],
   ["↗", "Pipeline"],
   ["◌", "Analytics"],
+  ["⚙", "Settings"],
 ];
 
 function StatusBadge({ status }: { status: Status }) {
@@ -37,6 +70,61 @@ function StatusBadge({ status }: { status: Status }) {
   );
 }
 
+function SettingsView({
+  settings,
+  setSettings,
+  onSave,
+  saving,
+}: {
+  settings: SettingsForm;
+  setSettings: (settings: SettingsForm) => void;
+  onSave: (event: FormEvent<HTMLFormElement>) => void;
+  saving: boolean;
+}) {
+  const updateTool = (key: "copilot" | "gemini" | "claudeCode", field: keyof ToolSettings, value: string | boolean) => {
+    setSettings({ ...settings, [key]: { ...settings[key], [field]: value } });
+  };
+  const tools = [
+    { key: "copilot" as const, label: "GitHub Copilot", command: "copilot", description: "Use Copilot CLI for delegated agent runs." },
+    { key: "gemini" as const, label: "Gemini CLI", command: "gemini", description: "Use Gemini CLI as an additional agent provider." },
+    { key: "claudeCode" as const, label: "Claude Code", command: "claude", description: "Use Claude Code for supervised implementation sessions." },
+  ];
+
+  return (
+    <form className="settings-page" onSubmit={onSave}>
+      <header className="settings-header">
+        <div><p className="eyebrow">APPLICATION SETTINGS</p><h1>Integrations</h1><p className="subtitle">Configure local agent CLIs and your GitHub connection.</p></div>
+        <button className="primary-button" type="submit" disabled={saving}>{saving ? "Saving…" : "Save settings"}</button>
+      </header>
+      <section className="settings-section">
+        <div className="section-header"><div><h2>Agent providers</h2><span className="section-caption">Executables run locally through the Rust supervisor.</span></div></div>
+        <div className="provider-grid">
+          {tools.map((tool) => {
+            const value = settings[tool.key];
+            return (
+              <article className="provider-card" key={tool.key}>
+                <div className="provider-title"><div className="provider-logo">{tool.label.charAt(0)}</div><div><h3>{tool.label}</h3><span>{tool.description}</span></div><label className="toggle"><input type="checkbox" checked={value.enabled} onChange={(event) => updateTool(tool.key, "enabled", event.currentTarget.checked)} /><span /></label></div>
+                <label className="field-label" htmlFor={`${tool.key}-executable`}>EXECUTABLE</label>
+                <input id={`${tool.key}-executable`} className="settings-input" value={value.executable} onChange={(event) => updateTool(tool.key, "executable", event.currentTarget.value)} placeholder={tool.command} />
+                <label className="field-label" htmlFor={`${tool.key}-profile`}>PROFILE / CONFIGURATION (OPTIONAL)</label>
+                <input id={`${tool.key}-profile`} className="settings-input" value={value.profile} onChange={(event) => updateTool(tool.key, "profile", event.currentTarget.value)} placeholder="Default profile" />
+                <span className={`setup-state ${value.configured ? "configured" : ""}`}><span /> {value.configured ? "Executable configured" : "Not configured"}</span>
+              </article>
+            );
+          })}
+        </div>
+      </section>
+      <section className="settings-section">
+        <div className="section-header"><div><h2>GitHub access</h2><span className="section-caption">Used for Actions, releases, repository analytics, and deep links.</span></div></div>
+        <div className="github-card">
+          <div className="github-heading"><div className="github-logo">GH</div><div><h3>GitHub account</h3><span>Tokens are stored only in the operating system credential vault.</span></div><span className={`setup-state ${settings.githubTokenConfigured ? "configured" : ""}`}><span /> {settings.githubTokenConfigured ? "Token saved" : "Token not set"}</span></div>
+          <div className="github-fields"><div><label className="field-label" htmlFor="github-username">USERNAME</label><input id="github-username" className="settings-input" value={settings.githubUsername} onChange={(event) => setSettings({ ...settings, githubUsername: event.currentTarget.value })} placeholder="GitHub username" /></div><div><label className="field-label" htmlFor="github-token">PERSONAL ACCESS TOKEN</label><input id="github-token" className="settings-input" type="password" autoComplete="new-password" value={settings.githubToken} onChange={(event) => setSettings({ ...settings, githubToken: event.currentTarget.value })} placeholder={settings.githubTokenConfigured ? "Leave blank to keep saved token" : "ghp_…"} /></div></div>
+        </div>
+      </section>
+    </form>
+  );
+}
+
 function App() {
   const [activeNav, setActiveNav] = useState("Dashboard");
   const [showAddProject, setShowAddProject] = useState(false);
@@ -45,6 +133,8 @@ function App() {
   const [loadingProjects, setLoadingProjects] = useState(true);
   const [savingProject, setSavingProject] = useState(false);
   const [error, setError] = useState("");
+  const [settings, setSettings] = useState<SettingsForm>({ ...emptySettings(), githubToken: "" });
+  const [savingSettings, setSavingSettings] = useState(false);
 
   async function loadProjects() {
     setLoadingProjects(true);
@@ -60,7 +150,32 @@ function App() {
 
   useEffect(() => {
     void loadProjects();
+    void loadSettings();
   }, []);
+
+  async function loadSettings() {
+    try {
+      const loaded = await invoke<Settings>("load_settings");
+      setSettings({ ...loaded, githubToken: "" });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function saveSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSavingSettings(true);
+    setError("");
+    try {
+      const { githubToken, ...input } = settings;
+      const saved = await invoke<Settings>("save_settings", { input: { ...input, githubToken } });
+      setSettings({ ...saved, githubToken: "" });
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSavingSettings(false);
+    }
+  }
 
   async function addProject(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -120,6 +235,7 @@ function App() {
       </aside>
 
       <main className="main-content">
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
@@ -194,6 +310,7 @@ function App() {
             </div>
           </section>
         </div>
+        </>}
       </main>
 
       {showAddProject && (
