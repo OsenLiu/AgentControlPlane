@@ -1,47 +1,17 @@
-import { useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
 type Status = "healthy" | "running" | "waiting" | "failed";
 
 type Project = {
+  id: string;
   name: string;
   path: string;
   branch: string;
-  agents: number;
-  progress: number;
-  pipeline: Status;
-  git: "clean" | "dirty";
+  currentCommit: string;
+  gitState: "clean" | "dirty";
 };
-
-const projects: Project[] = [
-  {
-    name: "Agent Control Plane",
-    path: "~/Work/AgentControlPlane",
-    branch: "main",
-    agents: 2,
-    progress: 68,
-    pipeline: "healthy",
-    git: "dirty",
-  },
-  {
-    name: "ClickShare Desktop",
-    path: "~/Work/ClickShare",
-    branch: "feature/session-recovery",
-    agents: 1,
-    progress: 42,
-    pipeline: "running",
-    git: "clean",
-  },
-  {
-    name: "Protocol Gateway",
-    path: "~/Work/ProtocolGateway",
-    branch: "develop",
-    agents: 0,
-    progress: 91,
-    pipeline: "waiting",
-    git: "clean",
-  },
-];
 
 const navItems = [
   ["⌂", "Dashboard"],
@@ -70,6 +40,43 @@ function StatusBadge({ status }: { status: Status }) {
 function App() {
   const [activeNav, setActiveNav] = useState("Dashboard");
   const [showAddProject, setShowAddProject] = useState(false);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [projectPath, setProjectPath] = useState("");
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [savingProject, setSavingProject] = useState(false);
+  const [error, setError] = useState("");
+
+  async function loadProjects() {
+    setLoadingProjects(true);
+    try {
+      setProjects(await invoke<Project[]>("list_projects"));
+      setError("");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoadingProjects(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadProjects();
+  }, []);
+
+  async function addProject(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSavingProject(true);
+    setError("");
+    try {
+      await invoke<Project>("register_project", { path: projectPath });
+      setProjectPath("");
+      setShowAddProject(false);
+      await loadProjects();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSavingProject(false);
+    }
+  }
 
   return (
     <div className="app-shell">
@@ -127,9 +134,9 @@ function App() {
         <section className="summary-grid" aria-label="Workspace summary">
           <article className="summary-card">
             <div className="card-heading"><span>ACTIVE AGENTS</span><span className="card-icon purple">◉</span></div>
-            <strong className="metric">3 <small>/ 5</small></strong>
-            <div className="metric-meta"><span className="trend-up">↑ 1</span> since yesterday</div>
-            <div className="mini-bars"><i /><i /><i /><i className="muted" /><i className="muted" /></div>
+            <strong className="metric">{projects.length} <small>projects</small></strong>
+            <div className="metric-meta">Connected local repositories</div>
+            <div className="mini-bars"><i /><i /><i className="muted" /><i className="muted" /><i className="muted" /></div>
           </article>
           <article className="summary-card">
             <div className="card-heading"><span>NEEDS ATTENTION</span><span className="card-icon amber">!</span></div>
@@ -139,8 +146,8 @@ function App() {
           </article>
           <article className="summary-card">
             <div className="card-heading"><span>READY BACKLOG</span><span className="card-icon blue">≡</span></div>
-            <strong className="metric">12</strong>
-            <div className="metric-meta"><span className="trend-up">↑ 3</span> tasks ready to run</div>
+            <strong className="metric">—</strong>
+            <div className="metric-meta">Tasks arrive in Phase 1</div>
             <div className="backlog-line"><span style={{ width: "72%" }} /></div>
           </article>
           <article className="summary-card">
@@ -158,13 +165,15 @@ function App() {
           </div>
           <div className="table-card">
             <div className="table-row table-head"><span>PROJECT</span><span>ACTIVE AGENTS</span><span>PROGRESS</span><span>PIPELINE</span><span>GIT STATE</span><span /></div>
-            {projects.map((project) => (
+            {loadingProjects && <div className="empty-row">Loading local projects…</div>}
+            {!loadingProjects && projects.length === 0 && <div className="empty-row">No projects connected yet. Add a local Git repository to get started.</div>}
+            {!loadingProjects && projects.map((project) => (
               <div className="table-row" key={project.name}>
                 <div className="project-name"><span className="project-avatar">{project.name.charAt(0)}</span><div><strong>{project.name}</strong><span><code>{project.branch}</code> · {project.path}</span></div></div>
-                <span className="agent-count"><span className={project.agents ? "pulse-dot" : "idle-dot"} /> {project.agents || "—"} {project.agents ? "active" : "idle"}</span>
-                <div className="progress-cell"><div className="progress-track"><span style={{ width: `${project.progress}%` }} /></div><small>{project.progress}%</small></div>
-                <StatusBadge status={project.pipeline} />
-                <span className={`git-state ${project.git}`}><span /> {project.git === "clean" ? "Clean" : "3 changes"}</span>
+                <span className="agent-count"><span className="idle-dot" /> No agents</span>
+                <div className="progress-cell"><div className="progress-track"><span style={{ width: "0%" }} /></div><small>—</small></div>
+                <StatusBadge status="waiting" />
+                <span className={`git-state ${project.gitState}`}><span /> {project.gitState === "clean" ? "Clean" : "Changes"}</span>
                 <button className="row-action" aria-label={`Open ${project.name}`}>→</button>
               </div>
             ))}
@@ -174,19 +183,14 @@ function App() {
         <div className="lower-grid">
           <section className="section-block">
             <div className="section-header"><div><h2>Attention inbox</h2><span className="section-caption">Items that need your decision</span></div><button className="text-button">Open inbox <span>→</span></button></div>
-            <div className="inbox-card">
-              <div className="inbox-item"><span className="inbox-icon high">!</span><div><strong>Review requested</strong><span>Session recovery · Agent Control Plane</span></div><time>8m ago</time></div>
-              <div className="inbox-item"><span className="inbox-icon question">?</span><div><strong>Agent has a question</strong><span>Which auth provider should be used?</span></div><time>24m ago</time></div>
-              <div className="inbox-item"><span className="inbox-icon failure">×</span><div><strong>Pipeline failed</strong><span>ClickShare Desktop · GitHub Actions</span></div><time>1h ago</time></div>
-              <div className="inbox-item"><span className="inbox-icon review">✓</span><div><strong>Permission request</strong><span>Run integration tests with network access</span></div><time>2h ago</time></div>
-            </div>
+              <div className="inbox-card">
+                <div className="empty-card">The attention inbox will become active when supervised runs are available.</div>
+              </div>
           </section>
           <section className="section-block activity-section">
             <div className="section-header"><div><h2>Live activity</h2><span className="section-caption live-caption"><span /> Streaming now</span></div><button className="text-button">View transcript <span>→</span></button></div>
             <div className="activity-card">
-              <div className="activity-item"><span className="activity-line purple-line" /><div><strong>Implementing SQLite migrations</strong><span>Agent Control Plane · Run #12</span></div><time>Running · 04:32</time></div>
-              <div className="activity-item"><span className="activity-line blue-line" /><div><strong>Running unit tests</strong><span>ClickShare Desktop · Run #8</span></div><time>Running · 01:18</time></div>
-              <div className="activity-item"><span className="activity-line green-line" /><div><strong>Task accepted</strong><span>Protocol Gateway · Run #21</span></div><time>12 min ago</time></div>
+              <div className="empty-card">Live activity will appear when an agent session is connected.</div>
             </div>
           </section>
         </div>
@@ -194,15 +198,16 @@ function App() {
 
       {showAddProject && (
         <div className="modal-backdrop" role="presentation" onClick={() => setShowAddProject(false)}>
-          <div className="modal" role="dialog" aria-modal="true" aria-labelledby="add-project-title" onClick={(event) => event.stopPropagation()}>
-            <div className="modal-title"><div><p className="eyebrow">PROJECT SETUP</p><h2 id="add-project-title">Add a local project</h2></div><button className="close-button" onClick={() => setShowAddProject(false)} aria-label="Close">×</button></div>
+          <form className="modal" role="dialog" aria-modal="true" aria-labelledby="add-project-title" onSubmit={addProject} onClick={(event) => event.stopPropagation()}>
+            <div className="modal-title"><div><p className="eyebrow">PROJECT SETUP</p><h2 id="add-project-title">Add a local project</h2></div><button type="button" className="close-button" onClick={() => setShowAddProject(false)} aria-label="Close">×</button></div>
             <p className="modal-copy">Connect an existing local Git checkout. Remote cloning is not available in the first release.</p>
             <label className="field-label" htmlFor="project-path">Repository path</label>
-            <input id="project-path" className="path-input" placeholder="/Users/you/Projects/my-repository" autoFocus />
-            <div className="modal-actions"><button className="secondary-button" onClick={() => setShowAddProject(false)}>Cancel</button><button className="primary-button" onClick={() => setShowAddProject(false)}>Validate repository</button></div>
-          </div>
+            <input id="project-path" className="path-input" value={projectPath} onChange={(event) => setProjectPath(event.currentTarget.value)} placeholder="/Users/you/Projects/my-repository" autoFocus />
+            <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowAddProject(false)}>Cancel</button><button type="submit" className="primary-button" disabled={savingProject || !projectPath.trim()}>{savingProject ? "Validating…" : "Validate repository"}</button></div>
+          </form>
         </div>
       )}
+      {error && <div className="error-toast" role="alert"><strong>Action failed</strong><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error">×</button></div>}
     </div>
   );
 }
