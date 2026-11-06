@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
 type Status = "healthy" | "running" | "waiting" | "failed";
@@ -46,8 +47,6 @@ const navItems = [
   ["▣", "Projects"],
   ["◉", "Agent sessions"],
   ["!", "Attention inbox"],
-  ["↗", "Pipeline"],
-  ["◌", "Analytics"],
   ["⚙", "Settings"],
 ];
 
@@ -131,6 +130,7 @@ function App() {
   const [projectPath, setProjectPath] = useState("");
   const [loadingProjects, setLoadingProjects] = useState(true);
   const [savingProject, setSavingProject] = useState(false);
+  const [pickingProjectFolder, setPickingProjectFolder] = useState(false);
   const [error, setError] = useState("");
   const [settings, setSettings] = useState<SettingsForm>({ ...emptySettings(), githubToken: "" });
   const [savingSettings, setSavingSettings] = useState(false);
@@ -189,6 +189,26 @@ function App() {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSavingProject(false);
+    }
+
+  }
+
+  async function chooseProjectFolder() {
+    setPickingProjectFolder(true);
+    setError("");
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "Choose a project folder",
+      });
+      if (typeof selected === "string") {
+        setProjectPath(selected);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setPickingProjectFolder(false);
     }
   }
 
@@ -318,7 +338,7 @@ function App() {
             <div className="modal-title"><div><p className="eyebrow">PROJECT SETUP</p><h2 id="add-project-title">Add a local project</h2></div><button type="button" className="close-button" onClick={() => setShowAddProject(false)} aria-label="Close">×</button></div>
             <p className="modal-copy">Connect an existing local Git checkout. Remote cloning is not available in the first release.</p>
             <label className="field-label" htmlFor="project-path">Repository path</label>
-            <input id="project-path" className="path-input" value={projectPath} onChange={(event) => setProjectPath(event.currentTarget.value)} placeholder="/Users/you/Projects/my-repository" autoFocus />
+            <div className="path-picker-row"><input id="project-path" className="path-input" value={projectPath} onChange={(event) => setProjectPath(event.currentTarget.value)} placeholder="/Users/you/Projects/my-repository" autoFocus /><button type="button" className="secondary-button browse-button" onClick={() => void chooseProjectFolder()} disabled={pickingProjectFolder}>{pickingProjectFolder ? "Opening…" : "Open folder"}</button></div>
             <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowAddProject(false)}>Cancel</button><button type="submit" className="primary-button" disabled={savingProject || !projectPath.trim()}>{savingProject ? "Validating…" : "Validate repository"}</button></div>
           </form>
         </div>
