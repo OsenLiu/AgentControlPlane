@@ -29,6 +29,77 @@ type Settings = {
 
 type SettingsForm = Settings & { githubToken: string };
 
+type SessionStatus = "running" | "waiting" | "paused" | "failed";
+
+type AgentSession = {
+  id: string;
+  project: string;
+  task: string;
+  branch: string;
+  status: SessionStatus;
+  step: string;
+  elapsed: string;
+  tokens: string;
+  permissionMode: "Plan" | "Accept edits" | "Auto";
+  managed: boolean;
+  lastEvent: string;
+};
+
+const agentSessions: AgentSession[] = [
+  {
+    id: "session-1",
+    project: "Agent Control Plane",
+    task: "Implement supervised session controls",
+    branch: "feat/session-controls",
+    status: "running",
+    step: "Writing session event handlers",
+    elapsed: "18m 42s",
+    tokens: "42.8k",
+    permissionMode: "Accept edits",
+    managed: true,
+    lastEvent: "Updated src/App.tsx",
+  },
+  {
+    id: "session-2",
+    project: "Design System",
+    task: "Add empty states to component gallery",
+    branch: "chore/empty-states",
+    status: "waiting",
+    step: "Waiting for your answer",
+    elapsed: "7m 15s",
+    tokens: "18.4k",
+    permissionMode: "Plan",
+    managed: true,
+    lastEvent: "Should the loading state use skeleton rows?",
+  },
+  {
+    id: "session-3",
+    project: "Release Toolkit",
+    task: "Upgrade pipeline action versions",
+    branch: "maintenance/actions-v4",
+    status: "paused",
+    step: "Paused by supervisor",
+    elapsed: "1h 04m",
+    tokens: "67.1k",
+    permissionMode: "Auto",
+    managed: true,
+    lastEvent: "Paused 12 minutes ago",
+  },
+  {
+    id: "session-4",
+    project: "Docs Hub",
+    task: "Refresh installation guide",
+    branch: "docs/installation",
+    status: "failed",
+    step: "Process exited unexpectedly",
+    elapsed: "22m 09s",
+    tokens: "31.6k",
+    permissionMode: "Plan",
+    managed: false,
+    lastEvent: "Claude CLI exited with code 1",
+  },
+];
+
 const emptyToolSettings = (): ToolSettings => ({
   enabled: false,
 });
@@ -120,6 +191,117 @@ function SettingsView({
         </div>
       </section>
     </form>
+  );
+}
+
+function SessionStatusBadge({ status }: { status: SessionStatus }) {
+  const labels: Record<SessionStatus, string> = {
+    running: "Running",
+    waiting: "Waiting for you",
+    paused: "Paused",
+    failed: "Failed",
+  };
+  return (
+    <span className={`session-status session-status-${status}`}>
+      <span className="session-status-dot" aria-hidden="true" />
+      {labels[status]}
+    </span>
+  );
+}
+
+function AgentSessionsView() {
+  const [selectedId, setSelectedId] = useState("session-1");
+  const [filter, setFilter] = useState<"all" | SessionStatus>("all");
+  const [query, setQuery] = useState("");
+  const [permissionMode, setPermissionMode] = useState<AgentSession["permissionMode"]>("Accept edits");
+  const selectedSession = agentSessions.find((session) => session.id === selectedId) ?? agentSessions[0];
+  const visibleSessions = agentSessions.filter((session) => {
+    const matchesFilter = filter === "all" || session.status === filter;
+    const searchable = `${session.project} ${session.task} ${session.branch}`.toLowerCase();
+    return matchesFilter && searchable.includes(query.toLowerCase());
+  });
+
+  useEffect(() => {
+    setPermissionMode(selectedSession.permissionMode);
+  }, [selectedSession]);
+
+  return (
+    <div className="sessions-page">
+      <header className="sessions-header">
+        <div>
+          <p className="eyebrow">SUPERVISOR / LIVE SESSIONS</p>
+          <h1>Agent sessions</h1>
+          <p className="subtitle">Inspect transcripts, answer questions, and keep delegated work moving.</p>
+        </div>
+        <div className="session-header-actions">
+          <span className="connection-pill"><span /> Supervisor online</span>
+          <button className="secondary-button"><span className="refresh-glyph">↻</span> Refresh</button>
+        </div>
+      </header>
+
+      <section className="session-summary-grid" aria-label="Session summary">
+        <article className="session-summary-card"><span className="summary-icon running-icon">◉</span><div><strong>1</strong><span>Running now</span></div><small>Live output streaming</small></article>
+        <article className="session-summary-card"><span className="summary-icon waiting-icon">?</span><div><strong>1</strong><span>Needs your input</span></div><small>Reply to keep it moving</small></article>
+        <article className="session-summary-card"><span className="summary-icon paused-icon">Ⅱ</span><div><strong>1</strong><span>Paused</span></div><small>Supervisor controlled</small></article>
+        <article className="session-summary-card"><span className="summary-icon token-icon">⌁</span><div><strong>159.9k</strong><span>Tokens this hour</span></div><small>Across 4 sessions</small></article>
+      </section>
+
+      <div className="session-toolbar">
+        <div className="session-tabs" role="tablist" aria-label="Filter sessions">
+          {(["all", "running", "waiting", "paused", "failed"] as const).map((value) => (
+            <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)} role="tab" aria-selected={filter === value}>
+              {value === "all" ? "All sessions" : value.charAt(0).toUpperCase() + value.slice(1)}
+              {value !== "all" && <span>{agentSessions.filter((session) => session.status === value).length}</span>}
+            </button>
+          ))}
+        </div>
+        <label className="session-search"><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="Search sessions" aria-label="Search sessions" /></label>
+      </div>
+
+      <div className="sessions-workspace">
+        <section className="session-list-panel" aria-label="Agent session list">
+          <div className="panel-heading"><div><h2>Connected sessions</h2><span>{visibleSessions.length} of {agentSessions.length} sessions</span></div><button className="icon-button" aria-label="Session list options">•••</button></div>
+          <div className="session-list">
+            {visibleSessions.map((session) => (
+              <button className={`session-list-item ${selectedSession.id === session.id ? "selected" : ""}`} key={session.id} onClick={() => setSelectedId(session.id)}>
+                <div className={`session-avatar avatar-${session.status}`}>{session.project.charAt(0)}</div>
+                <div className="session-list-copy">
+                  <div className="session-list-title"><strong>{session.task}</strong>{session.managed && <span className="managed-tag">MANAGED</span>}</div>
+                  <span className="session-project">{session.project} <code>{session.branch}</code></span>
+                  <div className="session-list-meta"><SessionStatusBadge status={session.status} /><time>{session.elapsed}</time></div>
+                </div>
+                <span className="session-chevron">›</span>
+              </button>
+            ))}
+            {visibleSessions.length === 0 && <div className="empty-session-list">No sessions match this filter.</div>}
+          </div>
+          <div className="read-only-note"><span>◌</span><div><strong>Read-only sessions are visible too</strong><span>Only app-managed sessions can receive replies or permission changes.</span></div></div>
+        </section>
+
+        <section className="session-detail-panel" aria-label="Selected agent session">
+          <div className="detail-header">
+            <div className="detail-title"><div className={`session-avatar avatar-${selectedSession.status}`}>{selectedSession.project.charAt(0)}</div><div><div className="detail-name-row"><h2>{selectedSession.task}</h2><SessionStatusBadge status={selectedSession.status} /></div><p>{selectedSession.project} <span>·</span> <code>{selectedSession.branch}</code></p></div></div>
+            <button className="icon-button" aria-label="More session actions">•••</button>
+          </div>
+          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{selectedSession.elapsed}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
+
+          <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
+          <div className="transcript">
+            <div className="transcript-line system-line"><time>10:42:18</time><div><span className="transcript-label">SUPERVISOR</span><p>Session resumed with <strong>{selectedSession.permissionMode}</strong> permissions.</p></div></div>
+            <div className="transcript-line"><time>10:43:02</time><div><span className="transcript-label agent-label">CLAUDE</span><p>I found the existing navigation state and am wiring the session detail view into the desktop shell.</p><code className="transcript-code">src/App.tsx · src/App.css</code></div></div>
+            <div className="transcript-line"><time>10:45:27</time><div><span className="transcript-label agent-label">CLAUDE</span><p>Updated the session list and added a waiting-state banner. Running the frontend type check now.</p><div className="check-result"><span>✓</span> tsc --noEmit <strong>passed</strong></div></div></div>
+            <div className="transcript-line active-line"><time>10:46:11</time><div><span className="transcript-label agent-label">CLAUDE</span><p>{selectedSession.lastEvent}</p><span className="typing-indicator"><i /><i /><i /> Working</span></div></div>
+          </div>
+
+          <div className="control-panel">
+            <div className="control-panel-heading"><div><h3>Supervisor controls</h3><span>Changes apply to the running process.</span></div><span className={`managed-state ${selectedSession.managed ? "managed" : ""}`}><span /> {selectedSession.managed ? "App managed" : "Read only"}</span></div>
+            <div className="permission-row"><span className="control-label">Permission mode</span><div className="permission-options">{(["Plan", "Accept edits", "Auto"] as const).map((mode) => <button key={mode} className={permissionMode === mode ? "selected" : ""} disabled={!selectedSession.managed} onClick={() => setPermissionMode(mode)}>{mode}</button>)}</div></div>
+            <div className="reply-row"><input disabled={!selectedSession.managed || selectedSession.status !== "waiting"} placeholder={selectedSession.status === "waiting" ? "Reply to the agent…" : "Replies are enabled when the agent is waiting"} aria-label="Reply to agent" /><button className="primary-button" disabled={!selectedSession.managed || selectedSession.status !== "waiting"}>Send reply <span>↗</span></button></div>
+            <div className="control-actions"><button className="secondary-button" disabled={!selectedSession.managed || selectedSession.status !== "running"}>Ⅱ Pause session</button><button className="danger-button" disabled={!selectedSession.managed}>Stop session</button></div>
+          </div>
+        </section>
+      </div>
+    </div>
   );
 }
 
@@ -254,7 +436,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
