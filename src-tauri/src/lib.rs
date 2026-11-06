@@ -24,6 +24,23 @@ struct Project {
     git_state: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSession {
+    id: String,
+    project: String,
+    task: String,
+    branch: String,
+    provider: String,
+    status: String,
+    step: String,
+    elapsed: String,
+    tokens: String,
+    permission_mode: String,
+    managed: bool,
+    last_event: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolSettingsInput {
@@ -119,6 +136,32 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         current_commit: row.get(4)?,
         git_state: row.get(5)?,
     })
+}
+
+fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
+    let token_count: i64 = row.get(8)?;
+    Ok(AgentSession {
+        id: row.get(0)?,
+        project: row.get(1)?,
+        task: row.get(2)?,
+        branch: row.get(3)?,
+        provider: row.get(4)?,
+        status: row.get(5)?,
+        step: row.get(6)?,
+        elapsed: row.get(7)?,
+        tokens: format!("{:.1}k", token_count as f64 / 1000.0),
+        permission_mode: row.get(9)?,
+        managed: row.get::<_, String>(10)? == "managed",
+        last_event: row.get(11)?,
+    })
+}
+
+fn validate_session_status(status: &str) -> Result<(), String> {
+    match status {
+        "starting" | "running" | "waiting" | "paused" | "completed" | "failed"
+        | "orphaned" | "unknown" => Ok(()),
+        _ => Err(format!("Unsupported agent session status: {status}")),
+    }
 }
 
 fn tool_settings_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolSettings> {
@@ -271,6 +314,56 @@ fn list_projects(database: State<'_, Database>) -> Result<Vec<Project>, String> 
         .map_err(|error| format!("Unable to decode project data: {error}"))
 }
 
+fn list_agent_sessions_from_connection(
+    connection: &Connection,
+    project_id: Option<&str>,
+    status: Option<&str>,
+) -> Result<Vec<AgentSession>, String> {
+    if let Some(value) = status {
+        validate_session_status(value)?;
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT s.id, p.name, s.task, s.branch, s.provider, s.status,
+                    s.current_step, s.started_at, s.token_count,
+                    s.permission_mode, s.origin, s.last_event
+             FROM agent_sessions s
+             JOIN projects p ON p.id = s.project_id
+             WHERE (?1 IS NULL OR s.project_id = ?1)
+               AND (?2 IS NULL OR s.status = ?2)
+             ORDER BY
+               CASE s.status
+                 WHEN 'waiting' THEN 0
+                 WHEN 'running' THEN 1
+                 WHEN 'starting' THEN 2
+                 WHEN 'paused' THEN 3
+                 ELSE 4
+               END,
+               s.updated_at DESC",
+        )
+        .map_err(|error| format!("Unable to read agent sessions: {error}"))?;
+
+    statement
+        .query_map(params![project_id, status], agent_session_from_row)
+        .map_err(|error| format!("Unable to read agent sessions: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to decode agent session data: {error}"))
+}
+
+#[tauri::command]
+fn list_agent_sessions(
+    project_id: Option<String>,
+    status: Option<String>,
+    database: State<'_, Database>,
+) -> Result<Vec<AgentSession>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    list_agent_sessions_from_connection(&connection, project_id.as_deref(), status.as_deref())
+}
+
 #[tauri::command]
 fn register_project(path: String, database: State<'_, Database>) -> Result<Project, String> {
     let requested_path = PathBuf::from(path.trim());
@@ -329,11 +422,7 @@ fn register_project(path: String, database: State<'_, Database>) -> Result<Proje
     Ok(project)
 }
 
-fn open_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error::Error>> {
-    let data_dir = app.path().app_data_dir()?;
-    fs::create_dir_all(&data_dir)?;
-    let database_path = data_dir.join("agent-control-plane.sqlite3");
-    let connection = Connection::open(database_path)?;
+fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(
         "PRAGMA journal_mode = WAL;
          CREATE TABLE IF NOT EXISTS projects (
@@ -353,8 +442,55 @@ fn open_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error:
          CREATE TABLE IF NOT EXISTS app_settings (
            key TEXT PRIMARY KEY NOT NULL,
            value TEXT NOT NULL DEFAULT ''
+         );
+         CREATE TABLE IF NOT EXISTS agent_sessions (
+           id TEXT PRIMARY KEY NOT NULL,
+           project_id TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           external_session_id TEXT,
+           task TEXT NOT NULL,
+           branch TEXT NOT NULL DEFAULT '',
+           status TEXT NOT NULL,
+           status_reason TEXT NOT NULL DEFAULT '',
+           current_step TEXT NOT NULL DEFAULT '',
+           token_count INTEGER NOT NULL DEFAULT 0,
+           permission_mode TEXT NOT NULL DEFAULT 'plan',
+           origin TEXT NOT NULL DEFAULT 'observed',
+           last_event TEXT NOT NULL DEFAULT '',
+           pid INTEGER,
+           process_start_time TEXT,
+           transcript_path TEXT,
+           started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           last_seen_at TEXT,
+           completed_at TEXT,
+           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           UNIQUE(provider, external_session_id)
+         );
+         CREATE INDEX IF NOT EXISTS idx_agent_sessions_project
+           ON agent_sessions(project_id);
+         CREATE INDEX IF NOT EXISTS idx_agent_sessions_status
+           ON agent_sessions(status);
+         CREATE INDEX IF NOT EXISTS idx_agent_sessions_updated
+           ON agent_sessions(updated_at DESC);
+         CREATE TABLE IF NOT EXISTS session_events (
+           id TEXT PRIMARY KEY NOT NULL,
+           session_id TEXT NOT NULL,
+           sequence INTEGER NOT NULL,
+           event_type TEXT NOT NULL,
+           payload TEXT NOT NULL,
+           observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           UNIQUE(session_id, sequence)
          );",
-    )?;
+    )
+}
+
+fn open_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error::Error>> {
+    let data_dir = app.path().app_data_dir()?;
+    fs::create_dir_all(&data_dir)?;
+    let database_path = data_dir.join("agent-control-plane.sqlite3");
+    let connection = Connection::open(database_path)?;
+    initialize_schema(&connection)?;
     Ok(Database(Mutex::new(connection)))
 }
 
@@ -369,10 +505,69 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_projects,
+            list_agent_sessions,
             register_project,
             load_settings,
             save_settings
         ])
         .run(tauri::generate_context!())
         .expect("error while running Agent Control Plane");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_database_has_an_empty_session_read_model() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+
+        let sessions = list_agent_sessions_from_connection(&connection, None, None)
+            .expect("session query");
+
+        assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn session_read_model_returns_persisted_copilot_session() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, path, branch, current_commit, git_state)
+                 VALUES ('project-1', 'Control Plane', '/tmp/control-plane', 'main', 'abc', 'clean')",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions
+                 (id, project_id, provider, task, branch, status, status_reason,
+                  current_step, token_count, permission_mode, origin, last_event)
+                 VALUES ('session-1', 'project-1', 'copilot', 'Implement sessions',
+                         'feat/sessions', 'waiting', 'Agent asked a question',
+                         'Waiting for your answer', 12800, 'plan', 'managed',
+                         'Which provider should be used?')",
+                [],
+            )
+            .expect("session");
+
+        let sessions = list_agent_sessions_from_connection(&connection, None, None)
+            .expect("session query");
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "session-1");
+        assert_eq!(sessions[0].provider, "copilot");
+        assert_eq!(sessions[0].status, "waiting");
+        assert!(sessions[0].managed);
+        assert_eq!(sessions[0].tokens, "12.8k");
+    }
+
+    #[test]
+    fn session_status_validation_rejects_unknown_states() {
+        assert!(validate_session_status("running").is_ok());
+        assert!(validate_session_status("waiting").is_ok());
+        assert!(validate_session_status("not-a-session-state").is_err());
+    }
 }
