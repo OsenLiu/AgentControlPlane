@@ -209,8 +209,13 @@ fn copilot_command() -> Command {
     Command::new(executable)
 }
 
-fn copilot_start_args() -> [&'static str; 2] {
-    ["--acp", "--stdio"]
+fn copilot_start_args(resume_session_id: Option<&str>) -> Vec<String> {
+    let mut args = vec!["--acp".to_owned(), "--stdio".to_owned()];
+    if let Some(session_id) = resume_session_id {
+        args.push("--resume".to_owned());
+        args.push(session_id.to_owned());
+    }
+    args
 }
 
 fn copilot_session_id() -> String {
@@ -1000,6 +1005,7 @@ fn start_copilot_reader(
     session_id: String,
     project_path: String,
     task: String,
+    resume_external_id: Option<String>,
 ) {
     thread::spawn(move || {
         let stderr_reader = thread::spawn(move || {
@@ -1028,8 +1034,17 @@ fn start_copilot_reader(
         for line in reader.lines().map_while(Result::ok) {
             if let Ok(message) = serde_json::from_str::<Value>(&line) {
                 if message["id"].as_i64() == Some(1) {
-                    let _ = write_acp_request(
-                        &mut stdin.lock().expect("Copilot stdin lock"),
+                    let request = if let Some(external_session_id) = resume_external_id.as_deref() {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "session/prompt",
+                            "params": {
+                                "sessionId": external_session_id,
+                                "prompt": [{ "type": "text", "text": task.clone() }]
+                            }
+                        })
+                    } else {
                         json!({
                             "jsonrpc": "2.0",
                             "id": 2,
@@ -1038,11 +1053,18 @@ fn start_copilot_reader(
                                 "cwd": project_path.clone(),
                                 "mcpServers": []
                             }
-                        }),
+                        })
+                    };
+                    let _ = write_acp_request(
+                        &mut stdin.lock().expect("Copilot stdin lock"),
+                        request,
                     );
                 }
                 if message["id"].as_i64() == Some(2) && !prompt_sent {
-                    if let Some(external_session_id) = message["result"]["sessionId"].as_str() {
+                    let external_session_id = resume_external_id
+                        .as_deref()
+                        .or_else(|| message["result"]["sessionId"].as_str());
+                    if let Some(external_session_id) = external_session_id {
                         if let Ok(connection) = database.lock() {
                             let _ = connection.execute(
                                 "UPDATE agent_sessions
@@ -1054,18 +1076,20 @@ fn start_copilot_reader(
                             );
                         }
                     }
-                    let _ = write_acp_request(
-                        &mut stdin.lock().expect("Copilot stdin lock"),
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": 3,
-                            "method": "session/prompt",
-                            "params": {
-                                "sessionId": message["result"]["sessionId"],
-                                "prompt": [{ "type": "text", "text": task.clone() }]
-                            }
-                        }),
-                    );
+                    if resume_external_id.is_none() {
+                        let _ = write_acp_request(
+                            &mut stdin.lock().expect("Copilot stdin lock"),
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": 3,
+                                "method": "session/prompt",
+                                "params": {
+                                    "sessionId": message["result"]["sessionId"],
+                                    "prompt": [{ "type": "text", "text": task.clone() }]
+                                }
+                            }),
+                        );
+                    }
                     prompt_sent = true;
                 }
 
@@ -1096,29 +1120,61 @@ fn start_copilot_reader(
 
 #[tauri::command]
 fn start_copilot_session(
-    project_id: String,
+    project_id: Option<String>,
     task: String,
+    resume_session_id: Option<String>,
     database: State<'_, Database>,
     supervisor: State<'_, Supervisor>,
     app: tauri::AppHandle,
 ) -> Result<AgentSession, String> {
-    let task = task.trim().to_owned();
-    if task.is_empty() {
-        return Err("Describe the task before starting a Copilot session.".to_owned());
-    }
-
-    let (project_path, branch) = {
+    let mut task = task.trim().to_owned();
+    let (project_id, project_path, branch, session_id, resume_external_id) = {
         let connection = database
             .0
             .lock()
             .map_err(|_| "Project database is unavailable.".to_owned())?;
-        connection
-            .query_row(
-                "SELECT path, branch FROM projects WHERE id = ?1",
-                [&project_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        if let Some(session_id) = resume_session_id.as_deref() {
+            let (project_id, external_id, stored_task): (String, String, String) = connection
+                .query_row(
+                    "SELECT project_id, external_session_id, task
+                     FROM agent_sessions
+                     WHERE id = ?1 AND provider = 'copilot'",
+                    [session_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .map_err(|error| format!("Unable to find Copilot session to resume: {error}"))?;
+            if task.is_empty() {
+                task = stored_task;
+            }
+            let (path, branch) = connection
+                .query_row(
+                    "SELECT path, branch FROM projects WHERE id = ?1",
+                    [&project_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|error| format!("Unable to find project for Copilot session: {error}"))?;
+            (
+                project_id,
+                path,
+                branch,
+                session_id.to_owned(),
+                Some(external_id),
             )
-            .map_err(|error| format!("Unable to find project for Copilot session: {error}"))?
+        } else {
+            let project_id = project_id
+                .ok_or_else(|| "A project is required to start a Copilot session.".to_owned())?;
+            if task.is_empty() {
+                return Err("Describe the task before starting a Copilot session.".to_owned());
+            }
+            let (path, branch) = connection
+                .query_row(
+                    "SELECT path, branch FROM projects WHERE id = ?1",
+                    [&project_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .map_err(|error| format!("Unable to find project for Copilot session: {error}"))?;
+            (project_id, path, branch, copilot_session_id(), None)
+        }
     };
 
     let version = copilot_command()
@@ -1129,9 +1185,8 @@ fn start_copilot_session(
         return Err("Copilot CLI rejected the version check.".to_owned());
     }
 
-    let session_id = copilot_session_id();
     let mut child = copilot_command()
-        .args(copilot_start_args())
+        .args(copilot_start_args(resume_external_id.as_deref()))
         .current_dir(&project_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1159,15 +1214,28 @@ fn start_copilot_session(
             .0
             .lock()
             .map_err(|_| "Agent session database is unavailable.".to_owned())?;
-        connection
-            .execute(
-                "INSERT INTO agent_sessions
-                 (id, project_id, provider, task, branch, status, status_reason,
-                  current_step, permission_mode, origin, pid, last_event)
-                 VALUES (?1, ?2, 'copilot', ?3, ?4, 'starting', '',
-                         'Starting Copilot ACP session', 'plan', 'managed', ?5, '')",
-                params![session_id, project_id, task, branch, pid],
-            )
+        if resume_external_id.is_some() {
+            connection
+                .execute(
+                    "UPDATE agent_sessions
+                     SET project_id = ?2, task = ?3, branch = ?4, status = 'starting',
+                         status_reason = '', current_step = 'Starting Copilot ACP session',
+                         origin = 'managed', pid = ?5, archived = 0,
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?1",
+                    params![session_id, project_id, task, branch, pid],
+                )
+        } else {
+            connection
+                .execute(
+                    "INSERT INTO agent_sessions
+                     (id, project_id, provider, task, branch, status, status_reason,
+                      current_step, permission_mode, origin, pid, last_event)
+                     VALUES (?1, ?2, 'copilot', ?3, ?4, 'starting', '',
+                             'Starting Copilot ACP session', 'plan', 'managed', ?5, '')",
+                    params![session_id, project_id, task, branch, pid],
+                )
+        }
             .map_err(|error| format!("Unable to persist Copilot session: {error}"))?;
     }
 
@@ -1188,6 +1256,7 @@ fn start_copilot_session(
         session_id.clone(),
         project_path,
         task,
+        resume_external_id,
     );
 
     let connection = database

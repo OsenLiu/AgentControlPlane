@@ -163,4 +163,40 @@ describe("App", () => {
       archived: false,
     }));
   });
+
+  it("resumes a Copilot session from its existing session id", async () => {
+    const session = {
+      id: "session-to-resume",
+      project: "demo",
+      task: "Resume this session",
+      branch: "main",
+      provider: "copilot",
+      status: "completed",
+      step: "Finished",
+      elapsed: "2026-11-09 11:20:00",
+      tokens: "1.0k",
+      permissionMode: "unknown",
+      managed: false,
+      lastEvent: "Available to resume in Copilot CLI",
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [];
+      if (command === "load_settings") return settings;
+      if (command === "list_agent_sessions") return [session];
+      if (command === "get_session_transcript") return [];
+      if (command === "start_copilot_session") return session;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    expect(await screen.findByRole("button", { name: "Resume session" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("start_copilot_session", {
+      projectId: null,
+      task: "",
+      resumeSessionId: "session-to-resume",
+    }));
+  });
 });

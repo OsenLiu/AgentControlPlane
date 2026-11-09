@@ -198,6 +198,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [task, setTask] = useState("");
   const [starting, setStarting] = useState(false);
+  const [resuming, setResuming] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const [archivedView, setArchivedView] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
@@ -279,6 +280,24 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
       await loadSessions(archivedView);
     } catch (reason) {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  async function resumeSession() {
+    if (!selectedSession) return;
+    setResuming(true);
+    setLoadError("");
+    try {
+      await invoke("start_copilot_session", {
+        projectId: null,
+        task: "",
+        resumeSessionId: selectedSession.id,
+      });
+      setArchivedView(false);
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setResuming(false);
     }
   }
 
@@ -380,7 +399,10 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         <section className="session-detail-panel" aria-label="Selected agent session">
           <div className="detail-header">
             <div className="detail-title"><div className={`session-avatar avatar-${selectedSession.status}`}>{selectedSession.project.charAt(0)}</div><div><div className="detail-name-row"><h2>{selectedSession.task}</h2><SessionStatusBadge status={selectedSession.status} /></div><p>{selectedSession.project} <span>·</span> <code>{selectedSession.branch}</code></p></div></div>
-            <button className="secondary-button archive-button" onClick={() => void updateArchiveState()}>{archivedView ? "Unarchive session" : "Archive session"}</button>
+            <div className="detail-actions">
+              <button className="secondary-button archive-button" onClick={() => void updateArchiveState()} disabled={resuming}>{archivedView ? "Unarchive session" : "Archive session"}</button>
+              {selectedSession.provider === "copilot" && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
+            </div>
           </div>
           <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{selectedSession.elapsed}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
 
