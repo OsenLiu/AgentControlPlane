@@ -55,6 +55,18 @@ type TranscriptMessage = {
   timestamp: string;
 };
 
+function formatLocalTimestamp(value: string) {
+  const normalized = value.includes("T") || value.endsWith("Z")
+    ? value
+    : `${value.replace(" ", "T")}Z`;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
 const emptyToolSettings = (): ToolSettings => ({
   enabled: false,
 });
@@ -397,7 +409,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
                 <div className="session-list-copy">
                   <div className="session-list-title"><strong>{session.task}</strong>{session.managed && <span className="managed-tag">MANAGED</span>}</div>
                   <span className="session-project">{session.project} <code>{session.branch}</code></span>
-                  <div className="session-list-meta"><SessionStatusBadge status={session.status} /><time>{session.elapsed}</time></div>
+                  <div className="session-list-meta"><SessionStatusBadge status={session.status} /><time>{formatLocalTimestamp(session.elapsed)}</time></div>
                 </div>
                 <span className="session-chevron">›</span>
               </button>
@@ -415,14 +427,14 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
               {selectedSession.provider === "copilot" && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
             </div>
           </div>
-          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{selectedSession.elapsed}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
+          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
 
           <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
           <div className="transcript" style={{ "--transcript-font-size": `${transcriptFontSize}px` } as CSSProperties}>
-            {transcript.length === 0 && <div className="transcript-line active-line"><time>{selectedSession.elapsed}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
+            {transcript.length === 0 && <div className="transcript-line active-line"><time>{formatLocalTimestamp(selectedSession.elapsed)}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
             {transcript.map((message, index) => (
               <div className={`transcript-line ${index === transcript.length - 1 ? "active-line" : ""}`} key={`${message.timestamp}-${index}`}>
-                <time>{message.timestamp}</time>
+                <time>{formatLocalTimestamp(message.timestamp)}</time>
                 <div>
                   <span className={`transcript-label ${message.role === "user" ? "user-label" : "agent-label"}`}>{message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase()}</span>
                   <p>{message.content}</p>
