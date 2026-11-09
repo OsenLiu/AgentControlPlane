@@ -110,4 +110,57 @@ describe("App", () => {
     expect(screen.getByText("Read only")).toBeTruthy();
     expect(screen.getByText("Discovered running Copilot process")).toBeTruthy();
   });
+
+  it("archives a session and shows it in the archived session list", async () => {
+    const session = {
+      id: "session-to-archive",
+      project: "demo",
+      task: "Archive this session",
+      branch: "main",
+      provider: "copilot",
+      status: "completed",
+      step: "Finished",
+      elapsed: "2026-11-09 11:20:00",
+      tokens: "1.0k",
+      permissionMode: "unknown",
+      managed: true,
+      lastEvent: "Completed",
+    };
+    let archived = false;
+    invokeMock.mockImplementation(async (command, args) => {
+      const input = (args ?? {}) as { archived?: boolean };
+      if (command === "list_projects") return [];
+      if (command === "load_settings") return settings;
+      if (command === "list_agent_sessions") {
+        return input.archived ? (archived ? [session] : []) : (archived ? [] : [session]);
+      }
+      if (command === "get_session_transcript") return [];
+      if (command === "set_session_archived") {
+        archived = Boolean(input.archived);
+        return undefined;
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    expect((await screen.findAllByText("Archive this session")).length).toBe(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "Archive session" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_session_archived", {
+      sessionId: "session-to-archive",
+      archived: true,
+    }));
+
+    await screen.findByText("No agent sessions yet");
+    fireEvent.click(screen.getByRole("button", { name: "Archived sessions" }));
+    expect((await screen.findAllByText("Archive this session")).length).toBe(2);
+    expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions", { archived: true });
+
+    fireEvent.click(screen.getByRole("button", { name: "Unarchive session" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_session_archived", {
+      sessionId: "session-to-archive",
+      archived: false,
+    }));
+  });
 });

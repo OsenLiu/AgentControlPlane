@@ -48,6 +48,7 @@ struct AgentSession {
     permission_mode: String,
     managed: bool,
     last_event: String,
+    archived: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -190,6 +191,7 @@ fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSess
         permission_mode: row.get(9)?,
         managed: row.get::<_, String>(10)? == "managed",
         last_event: row.get(11)?,
+        archived: row.get::<_, i64>(12)? != 0,
     })
 }
 
@@ -480,6 +482,7 @@ fn list_agent_sessions_from_connection(
     connection: &Connection,
     project_id: Option<&str>,
     status: Option<&str>,
+    archived: Option<bool>,
 ) -> Result<Vec<AgentSession>, String> {
     if let Some(value) = status {
         validate_session_status(value)?;
@@ -489,17 +492,21 @@ fn list_agent_sessions_from_connection(
         .prepare(
             "SELECT s.id, p.name, s.task, s.branch, s.provider, s.status,
                     s.current_step, s.started_at, s.token_count,
-                    s.permission_mode, s.origin, s.last_event
+                    s.permission_mode, s.origin, s.last_event, s.archived
              FROM agent_sessions s
              JOIN projects p ON p.id = s.project_id
              WHERE (?1 IS NULL OR s.project_id = ?1)
                AND (?2 IS NULL OR s.status = ?2)
+               AND s.archived = COALESCE(?3, 0)
              ORDER BY COALESCE(s.last_seen_at, s.updated_at) DESC",
         )
         .map_err(|error| format!("Unable to read agent sessions: {error}"))?;
 
     statement
-        .query_map(params![project_id, status], agent_session_from_row)
+        .query_map(
+            params![project_id, status, archived.map(|value| i64::from(value))],
+            agent_session_from_row,
+        )
         .map_err(|error| format!("Unable to read agent sessions: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode agent session data: {error}"))
@@ -769,7 +776,8 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
         connection
             .execute(
                 "DELETE FROM agent_sessions
-                 WHERE project_id = ?1 AND provider = 'copilot' AND origin = 'observed'",
+                 WHERE project_id = ?1 AND provider = 'copilot'
+                   AND origin = 'observed' AND archived = 0",
                 [&project_id],
             )
             .map_err(|error| format!("Unable to clear stale Copilot observations: {error}"))?;
@@ -892,6 +900,7 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
 fn list_agent_sessions(
     project_id: Option<String>,
     status: Option<String>,
+    archived: Option<bool>,
     database: State<'_, Database>,
 ) -> Result<Vec<AgentSession>, String> {
     let connection = database
@@ -899,7 +908,31 @@ fn list_agent_sessions(
         .lock()
         .map_err(|_| "Agent session database is unavailable.".to_owned())?;
     import_copilot_sessions(&connection)?;
-    list_agent_sessions_from_connection(&connection, project_id.as_deref(), status.as_deref())
+    list_agent_sessions_from_connection(&connection, project_id.as_deref(), status.as_deref(), archived)
+}
+
+#[tauri::command]
+fn set_session_archived(
+    session_id: String,
+    archived: bool,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    let changed = connection
+        .execute(
+            "UPDATE agent_sessions
+             SET archived = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            params![session_id, i64::from(archived)],
+        )
+        .map_err(|error| format!("Unable to update agent session archive state: {error}"))?;
+    if changed == 0 {
+        return Err("Agent session was not found.".to_owned());
+    }
+    Ok(())
 }
 
 fn persist_copilot_observation(
@@ -1161,7 +1194,7 @@ fn start_copilot_session(
         .0
         .lock()
         .map_err(|_| "Agent session database is unavailable.".to_owned())?;
-    list_agent_sessions_from_connection(&connection, None, None)?
+    list_agent_sessions_from_connection(&connection, None, None, Some(false))?
         .into_iter()
         .find(|session| session.id == session_id)
         .ok_or_else(|| "Copilot session was started but could not be read back.".to_owned())
@@ -1266,6 +1299,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            last_seen_at TEXT,
            completed_at TEXT,
+           archived INTEGER NOT NULL DEFAULT 0,
            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            UNIQUE(provider, external_session_id)
@@ -1285,7 +1319,20 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            UNIQUE(session_id, sequence)
          );",
-    )
+    )?;
+    connection
+        .execute(
+            "ALTER TABLE agent_sessions ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .or_else(|error| {
+            if error.to_string().contains("duplicate column name: archived") {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
+    Ok(())
 }
 
 fn open_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error::Error>> {
@@ -1312,6 +1359,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_projects,
             list_agent_sessions,
+            set_session_archived,
             get_session_transcript,
             start_copilot_session,
             register_project,
@@ -1331,7 +1379,7 @@ mod tests {
         let connection = Connection::open_in_memory().expect("in-memory database");
         initialize_schema(&connection).expect("schema");
 
-        let sessions = list_agent_sessions_from_connection(&connection, None, None)
+        let sessions = list_agent_sessions_from_connection(&connection, None, None, None)
             .expect("session query");
 
         assert!(sessions.is_empty());
@@ -1361,7 +1409,7 @@ mod tests {
             )
             .expect("session");
 
-        let sessions = list_agent_sessions_from_connection(&connection, None, None)
+        let sessions = list_agent_sessions_from_connection(&connection, None, None, None)
             .expect("session query");
 
         assert_eq!(sessions.len(), 1);

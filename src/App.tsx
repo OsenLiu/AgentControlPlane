@@ -46,6 +46,7 @@ type AgentSession = {
   permissionMode: "Plan" | "Accept edits" | "Auto";
   managed: boolean;
   lastEvent: string;
+  archived: boolean;
 };
 
 type TranscriptMessage = {
@@ -198,6 +199,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   const [task, setTask] = useState("");
   const [starting, setStarting] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
+  const [archivedView, setArchivedView] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all" || session.status === filter;
@@ -206,14 +208,14 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   });
 
   useEffect(() => {
-    void loadSessions();
+    void loadSessions(archivedView);
     void invoke<Project[]>("list_projects").then((loaded) => {
       setProjects(loaded);
       setSelectedProjectId(loaded[0]?.id ?? "");
     }).catch((reason) => {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
     });
-  }, []);
+  }, [archivedView]);
 
   useEffect(() => {
     if (!selectedSession) {
@@ -236,10 +238,12 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
     return () => unsubscribe?.();
   }, [selectedSession?.id]);
 
-  async function loadSessions() {
+  async function loadSessions(showArchived = archivedView) {
     try {
       setLoadError("");
-      const loaded = await invoke<AgentSession[]>("list_agent_sessions");
+      const loaded = showArchived
+        ? await invoke<AgentSession[]>("list_agent_sessions", { archived: true })
+        : await invoke<AgentSession[]>("list_agent_sessions");
       setSessions(loaded);
       setSelectedId((current) => loaded.some((session) => session.id === current) ? current : loaded[0]?.id ?? "");
     } catch (reason) {
@@ -260,8 +264,22 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
 
   async function refreshSessions() {
     setRefreshing(true);
-    await loadSessions();
+    await loadSessions(archivedView);
     setRefreshing(false);
+  }
+
+  async function updateArchiveState() {
+    if (!selectedSession) return;
+    try {
+      setLoadError("");
+      await invoke("set_session_archived", {
+        sessionId: selectedSession.id,
+        archived: !archivedView,
+      });
+      await loadSessions(archivedView);
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    }
   }
 
   async function startSession(event: FormEvent<HTMLFormElement>) {
@@ -287,7 +305,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
     return <div className="sessions-page">
       <header className="sessions-header">
         <div><p className="eyebrow">SUPERVISOR / LIVE SESSIONS</p><h1>Agent sessions</h1><p className="subtitle">Inspect transcripts, answer questions, and keep delegated work moving.</p></div>
-        <div className="session-header-actions"><span className="connection-pill"><span /> Supervisor online</span><button className="secondary-button" onClick={() => void refreshSessions()} disabled={refreshing}><span className="refresh-glyph">↻</span> {refreshing ? "Refreshing…" : "Refresh"}</button></div>
+        <div className="session-header-actions"><span className="connection-pill"><span /> Supervisor online</span><button className="secondary-button" onClick={() => setArchivedView(!archivedView)}>{archivedView ? "Active sessions" : "Archived sessions"}</button><button className="secondary-button" onClick={() => void refreshSessions()} disabled={refreshing}><span className="refresh-glyph">↻</span> {refreshing ? "Refreshing…" : "Refresh"}</button></div>
       </header>
       <div className="empty-sessions-state">
         <h2>{loading ? "Loading agent sessions…" : "No agent sessions yet"}</h2>
@@ -315,7 +333,8 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         </div>
         <div className="session-header-actions">
           <span className="connection-pill"><span /> Supervisor online</span>
-          <button className="secondary-button" onClick={refreshSessions} disabled={refreshing}><span className="refresh-glyph">↻</span> {refreshing ? "Refreshing…" : "Refresh"}</button>
+          <button className="secondary-button" onClick={() => setArchivedView(!archivedView)}>{archivedView ? "Active sessions" : "Archived sessions"}</button>
+          <button className="secondary-button" onClick={() => void refreshSessions()} disabled={refreshing}><span className="refresh-glyph">↻</span> {refreshing ? "Refreshing…" : "Refresh"}</button>
         </div>
       </header>
 
@@ -361,7 +380,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         <section className="session-detail-panel" aria-label="Selected agent session">
           <div className="detail-header">
             <div className="detail-title"><div className={`session-avatar avatar-${selectedSession.status}`}>{selectedSession.project.charAt(0)}</div><div><div className="detail-name-row"><h2>{selectedSession.task}</h2><SessionStatusBadge status={selectedSession.status} /></div><p>{selectedSession.project} <span>·</span> <code>{selectedSession.branch}</code></p></div></div>
-            <button className="icon-button" aria-label="More session actions">•••</button>
+            <button className="secondary-button archive-button" onClick={() => void updateArchiveState()}>{archivedView ? "Unarchive session" : "Archive session"}</button>
           </div>
           <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{selectedSession.elapsed}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
 
