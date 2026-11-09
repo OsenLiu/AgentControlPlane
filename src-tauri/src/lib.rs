@@ -952,7 +952,9 @@ fn list_agent_sessions(
         .0
         .lock()
         .map_err(|_| "Agent session database is unavailable.".to_owned())?;
-    import_copilot_sessions(&connection)?;
+    if let Err(error) = import_copilot_sessions(&connection) {
+        eprintln!("Unable to discover Copilot sessions: {error}");
+    }
     list_agent_sessions_from_connection(&connection, project_id.as_deref(), status.as_deref(), archived)
 }
 
