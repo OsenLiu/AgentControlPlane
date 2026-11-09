@@ -91,6 +91,7 @@ struct SettingsInput {
     github_username: String,
     github_token: String,
     default_provider: String,
+    transcript_font_size: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +109,7 @@ struct Settings {
     github_username: String,
     github_token_configured: bool,
     default_provider: String,
+    transcript_font_size: u8,
 }
 
 #[derive(Debug)]
@@ -360,6 +362,16 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
             |row| row.get::<_, String>(0),
         )
         .unwrap_or_else(|_| "claudeCode".to_owned());
+    let transcript_font_size = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'transcript_font_size'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|size| (12..=24).contains(size))
+        .unwrap_or(16);
 
     Ok(Settings {
         copilot: read("copilot"),
@@ -368,6 +380,7 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
         github_username,
         github_token_configured: github_token_configured(),
         default_provider,
+        transcript_font_size,
     })
 }
 
@@ -378,6 +391,9 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
         "copilot" | "gemini" | "claudeCode"
     ) {
         return Err("Choose a supported default AI agent.".to_owned());
+    }
+    if !(12..=24).contains(&input.transcript_font_size) {
+        return Err("Transcript text size must be between 12px and 24px.".to_owned());
     }
 
     let github_token = input.github_token.trim().to_owned();
@@ -425,6 +441,13 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
             [&input.default_provider],
         )
         .map_err(|error| format!("Unable to save default provider: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO app_settings (key, value) VALUES ('transcript_font_size', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [input.transcript_font_size.to_string()],
+        )
+        .map_err(|error| format!("Unable to save transcript text size: {error}"))?;
     transaction
         .commit()
         .map_err(|error| format!("Unable to commit settings: {error}"))?;

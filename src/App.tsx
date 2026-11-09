@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { CSSProperties, FormEvent, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -26,6 +26,7 @@ type Settings = {
   githubUsername: string;
   githubTokenConfigured: boolean;
   defaultProvider: "copilot" | "gemini" | "claudeCode";
+  transcriptFontSize: number;
 };
 
 type SettingsForm = Settings & { githubToken: string };
@@ -64,6 +65,7 @@ const emptySettings = (): Settings => ({
   githubUsername: "",
   githubTokenConfigured: false,
   defaultProvider: "claudeCode",
+  transcriptFontSize: 16,
 });
 
 const navItems = [
@@ -137,6 +139,22 @@ function SettingsView({
         </div>
       </section>
       <section className="settings-section">
+        <div className="section-header"><div><h2>Transcript display</h2><span className="section-caption">Choose a comfortable size for live session output.</span></div></div>
+        <div className="transcript-settings-card">
+          <label className="transcript-size-control" htmlFor="transcript-font-size">
+            <span><strong>Live transcript text size</strong><small>Applies to the transcript in Agent sessions.</small></span>
+            <select
+              id="transcript-font-size"
+              className="settings-input transcript-size-select"
+              value={settings.transcriptFontSize}
+              onChange={(event) => setSettings({ ...settings, transcriptFontSize: Number(event.currentTarget.value) })}
+            >
+              {[12, 14, 16, 18, 20, 22, 24].map((size) => <option value={size} key={size}>{size}px</option>)}
+            </select>
+          </label>
+        </div>
+      </section>
+      <section className="settings-section">
         <div className="section-header"><div><h2>GitHub access</h2><span className="section-caption">Used for Actions, releases, repository analytics, and deep links.</span></div></div>
         <div className="github-card">
           <div className="github-heading"><div className="github-logo">GH</div><div><h3>GitHub account</h3><span>Tokens are stored only in the operating system credential vault.</span></div><span className={`setup-state ${settings.githubTokenConfigured ? "configured" : ""}`}><span /> {settings.githubTokenConfigured ? "Token saved" : "Token not set"}</span></div>
@@ -167,7 +185,7 @@ function SessionStatusBadge({ status }: { status: SessionStatus }) {
   );
 }
 
-function AgentSessionsView() {
+function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number }) {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [selectedId, setSelectedId] = useState("");
   const [filter, setFilter] = useState<"all" | SessionStatus>("all");
@@ -348,7 +366,7 @@ function AgentSessionsView() {
           <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{selectedSession.elapsed}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
 
           <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
-          <div className="transcript">
+          <div className="transcript" style={{ "--transcript-font-size": `${transcriptFontSize}px` } as CSSProperties}>
             {transcript.length === 0 && <div className="transcript-line active-line"><time>{selectedSession.elapsed}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
             {transcript.map((message, index) => (
               <div className={`transcript-line ${index === transcript.length - 1 ? "active-line" : ""}`} key={`${message.timestamp}-${index}`}>
@@ -406,7 +424,7 @@ function App() {
   async function loadSettings() {
     try {
       const loaded = await invoke<Settings>("load_settings");
-      setSettings({ ...loaded, githubToken: "" });
+      setSettings({ ...emptySettings(), ...loaded, transcriptFontSize: loaded.transcriptFontSize ?? 16, githubToken: "" });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -419,7 +437,7 @@ function App() {
     try {
       const { githubToken, ...input } = settings;
       const saved = await invoke<Settings>("save_settings", { input: { ...input, githubToken } });
-      setSettings({ ...saved, githubToken: "" });
+      setSettings({ ...emptySettings(), ...saved, transcriptFontSize: saved.transcriptFontSize ?? 16, githubToken: "" });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -505,7 +523,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
