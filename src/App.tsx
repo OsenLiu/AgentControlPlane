@@ -55,6 +55,18 @@ type TranscriptMessage = {
   timestamp: string;
 };
 
+function formatLocalTimestamp(value: string) {
+  const normalized = value.includes("T") || value.endsWith("Z")
+    ? value
+    : `${value.replace(" ", "T")}Z`;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
+
 const emptyToolSettings = (): ToolSettings => ({
   enabled: false,
 });
@@ -196,9 +208,10 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   const [refreshing, setRefreshing] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
-  const [task, setTask] = useState("");
+  const [task, setTask] = useState("Start a new Copilot session");
   const [starting, setStarting] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [launcherOpen, setLauncherOpen] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const [archivedView, setArchivedView] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
@@ -352,10 +365,20 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         </div>
         <div className="session-header-actions">
           <span className="connection-pill"><span /> Supervisor online</span>
+          <button className="primary-button" onClick={() => setLauncherOpen((open) => !open)}>Start Copilot session <span>↗</span></button>
           <button className="secondary-button" onClick={() => setArchivedView(!archivedView)}>{archivedView ? "Active sessions" : "Archived sessions"}</button>
           <button className="secondary-button" onClick={() => void refreshSessions()} disabled={refreshing}><span className="refresh-glyph">↻</span> {refreshing ? "Refreshing…" : "Refresh"}</button>
         </div>
       </header>
+      {launcherOpen && <form className="session-launch-card" onSubmit={startSession}>
+        <label className="field-label" htmlFor="session-project">PROJECT</label>
+        <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)} disabled={projects.length === 0}>
+          {projects.length === 0 ? <option value="">No projects connected</option> : projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
+        </select>
+        <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
+        <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
+        <button className="primary-button" type="submit" disabled={starting || projects.length === 0 || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
+      </form>}
 
       <section className="session-summary-grid" aria-label="Session summary">
         <article className="session-summary-card"><span className="summary-icon running-icon">◉</span><div><strong>{sessions.filter((session) => session.status === "running").length}</strong><span>Running now</span></div><small>Live output streaming</small></article>
@@ -386,7 +409,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
                 <div className="session-list-copy">
                   <div className="session-list-title"><strong>{session.task}</strong>{session.managed && <span className="managed-tag">MANAGED</span>}</div>
                   <span className="session-project">{session.project} <code>{session.branch}</code></span>
-                  <div className="session-list-meta"><SessionStatusBadge status={session.status} /><time>{session.elapsed}</time></div>
+                  <div className="session-list-meta"><SessionStatusBadge status={session.status} /><time>{formatLocalTimestamp(session.elapsed)}</time></div>
                 </div>
                 <span className="session-chevron">›</span>
               </button>
@@ -404,14 +427,14 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
               {selectedSession.provider === "copilot" && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
             </div>
           </div>
-          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{selectedSession.elapsed}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
+          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
 
           <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
           <div className="transcript" style={{ "--transcript-font-size": `${transcriptFontSize}px` } as CSSProperties}>
-            {transcript.length === 0 && <div className="transcript-line active-line"><time>{selectedSession.elapsed}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
+            {transcript.length === 0 && <div className="transcript-line active-line"><time>{formatLocalTimestamp(selectedSession.elapsed)}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
             {transcript.map((message, index) => (
               <div className={`transcript-line ${index === transcript.length - 1 ? "active-line" : ""}`} key={`${message.timestamp}-${index}`}>
-                <time>{message.timestamp}</time>
+                <time>{formatLocalTimestamp(message.timestamp)}</time>
                 <div>
                   <span className={`transcript-label ${message.role === "user" ? "user-label" : "agent-label"}`}>{message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase()}</span>
                   <p>{message.content}</p>
