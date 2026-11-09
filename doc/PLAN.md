@@ -2,7 +2,7 @@
 
 ## 1. Product goal
 
-Build a cross-platform desktop application for macOS, Linux, and Windows that manages Claude CLI agents across local projects. The application should make delegation, supervision, recovery, review, repository inspection, pipeline monitoring, and project analytics visible from one local dashboard.
+Build a cross-platform desktop application for macOS, Linux, and Windows that manages Copilot, Gemini, Claude Code CLI agents across local projects. The application should make delegation, supervision, recovery, review, repository inspection, pipeline monitoring, and project analytics visible from one local dashboard.
 
 The app must be local-first: project source code, transcripts, task state, and credentials remain on the user's machine unless a configured provider is contacted.
 
@@ -35,26 +35,22 @@ The selected dashboard direction is **Command Center** (`dashboard-concept-a-com
    - Ready backlog count across projects.
    - Pipeline health percentage with trend direction.
    - Clicking a card applies the corresponding dashboard filter.
-
 2. **Projects table**
    - Columns: project, branch/path, active agents, task progress, pipeline status, and Git dirty/clean state.
    - Show a compact secondary line for branch and local path.
    - Use a status dot plus text for pipeline and Git states.
    - Clicking a project opens its project workspace; clicking a task or agent opens the relevant detail view.
    - Support sorting and filtering without losing live updates.
-
 3. **Attention inbox card**
    - Show the highest-priority unresolved items directly on the dashboard.
    - Include review requests, failed pipelines, agent questions, permission requests, and exhausted retries.
    - Use severity indicators and relative timestamps.
    - **Open inbox** navigates to the cross-project queue; each row opens an in-place response/review action.
-
 4. **Live activity stream**
    - Stream structured events such as implementation steps, test progress, waiting questions, retries, and accepted runs.
    - Include project, task/session name, current step, and elapsed time.
    - Pause/resume live updates while the user is inspecting older activity.
    - Provide a link to the transcript, diff, or pipeline log associated with each event.
-
 5. **Pipeline trend card**
    - Plot recent pass/fail results for the selected rolling window.
    - Show passing and failed totals below the graph.
@@ -316,3 +312,4 @@ The following decisions were confirmed during design review:
 13. Guarantee ordered, at-least-once event delivery per entity, idempotent consumers, transactional persistence before event publication, and restart reconciliation.
 14. Enforce append-only domain history, configurable retention, opt-in diagnostics, unified redaction, bounded caches, explicit destructive-action confirmation, and application-wide as well as Project-level concurrency limits.
 15. Implement in the documented phase order and require each phase's exit criteria before advancing.
+

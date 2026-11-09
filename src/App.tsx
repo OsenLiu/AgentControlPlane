@@ -1,5 +1,6 @@
 import { FormEvent, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import "./App.css";
 
@@ -29,7 +30,7 @@ type Settings = {
 
 type SettingsForm = Settings & { githubToken: string };
 
-type SessionStatus = "starting" | "running" | "waiting" | "paused" | "completed" | "failed" | "orphaned" | "unknown";
+type SessionStatus = "starting" | "running" | "waiting" | "idle" | "paused" | "completed" | "failed" | "orphaned" | "unknown";
 
 type AgentSession = {
   id: string;
@@ -145,6 +146,7 @@ function SessionStatusBadge({ status }: { status: SessionStatus }) {
     starting: "Starting",
     running: "Running",
     waiting: "Waiting for you",
+    idle: "Not in use",
     paused: "Paused",
     completed: "Completed",
     failed: "Failed",
@@ -167,6 +169,10 @@ function AgentSessionsView() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [task, setTask] = useState("");
+  const [starting, setStarting] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all" || session.status === filter;
@@ -176,6 +182,22 @@ function AgentSessionsView() {
 
   useEffect(() => {
     void loadSessions();
+    void invoke<Project[]>("list_projects").then((loaded) => {
+      setProjects(loaded);
+      setSelectedProjectId(loaded[0]?.id ?? "");
+    }).catch((reason) => {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    });
+  }, []);
+
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    void listen<string>("agent-session-updated", () => {
+      void loadSessions();
+    }).then((unlisten) => {
+      unsubscribe = unlisten;
+    });
+    return () => unsubscribe?.();
   }, []);
 
   async function loadSessions() {
@@ -197,13 +219,44 @@ function AgentSessionsView() {
     setRefreshing(false);
   }
 
+  async function startSession(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedProjectId || !task.trim()) return;
+    setStarting(true);
+    setLoadError("");
+    try {
+      await invoke("start_copilot_session", {
+        projectId: selectedProjectId,
+        task: task.trim(),
+      });
+      setTask("");
+      await loadSessions();
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setStarting(false);
+    }
+  }
+
   if (!selectedSession) {
     return <div className="sessions-page">
       <header className="sessions-header">
         <div><p className="eyebrow">SUPERVISOR / LIVE SESSIONS</p><h1>Agent sessions</h1><p className="subtitle">Inspect transcripts, answer questions, and keep delegated work moving.</p></div>
         <div className="session-header-actions"><span className="connection-pill"><span /> Supervisor online</span><button className="secondary-button" onClick={() => void refreshSessions()} disabled={refreshing}><span className="refresh-glyph">↻</span> {refreshing ? "Refreshing…" : "Refresh"}</button></div>
       </header>
-      <div className="empty-sessions-state"><h2>{loading ? "Loading agent sessions…" : "No agent sessions yet"}</h2><p>{loadError || "The supervisor will show Copilot CLI sessions here after they are discovered or started."}</p></div>
+      <div className="empty-sessions-state">
+        <h2>{loading ? "Loading agent sessions…" : "No agent sessions yet"}</h2>
+        <p>{loadError || "The supervisor will show Copilot CLI sessions here after they are discovered or started."}</p>
+        {!loading && projects.length > 0 && <form className="session-launch-card" onSubmit={startSession}>
+          <label className="field-label" htmlFor="session-project">PROJECT</label>
+          <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)}>
+            {projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
+          </select>
+          <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
+          <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
+          <button className="primary-button" type="submit" disabled={starting || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
+        </form>}
+      </div>
     </div>;
   }
 
@@ -230,7 +283,7 @@ function AgentSessionsView() {
 
       <div className="session-toolbar">
         <div className="session-tabs" role="tablist" aria-label="Filter sessions">
-          {(["all", "running", "waiting", "paused", "failed"] as const).map((value) => (
+          {(["all", "running", "waiting", "idle", "paused", "failed"] as const).map((value) => (
             <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)} role="tab" aria-selected={filter === value}>
               {value === "all" ? "All sessions" : value.charAt(0).toUpperCase() + value.slice(1)}
               {value !== "all" && <span>{sessions.filter((session) => session.status === value).length}</span>}

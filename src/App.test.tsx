@@ -7,6 +7,10 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => vi.fn()),
+}));
+
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
 }));
@@ -25,6 +29,7 @@ const settings = {
 beforeEach(() => {
   invokeMock.mockImplementation(async (command) => {
     if (command === "list_projects") return [];
+    if (command === "list_agent_sessions") return [];
     if (command === "load_settings") return settings;
     throw new Error(`Unexpected command: ${command}`);
   });
@@ -68,16 +73,41 @@ describe("App", () => {
     expect(screen.queryByRole("dialog")).toBeNull();
   });
 
-  it("sends a reply for a waiting managed session", async () => {
+  it("loads the empty agent sessions state from the backend", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
-    fireEvent.click(screen.getByRole("button", { name: /add empty states to component gallery/i }));
 
-    const reply = screen.getByRole("textbox", { name: "Reply to agent" });
-    fireEvent.change(reply, { target: { value: "Use skeleton rows." } });
-    fireEvent.click(screen.getByRole("button", { name: /send reply/i }));
+    expect(await screen.findByText("No agent sessions yet")).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions");
+  });
 
-    expect(await screen.findByText("You replied: Use skeleton rows.")).toBeTruthy();
-    expect(screen.getByText("Processing your reply")).toBeTruthy();
+  it("renders a discovered Copilot session returned by the backend", async () => {
+    const session = {
+      id: "observed-copilot-abc",
+      project: "demo",
+      task: "Observed Copilot CLI session",
+      branch: "main",
+      provider: "copilot",
+      status: "running",
+      step: "Running outside Agent Control Plane",
+      elapsed: "2026-11-09 11:20:00",
+      tokens: "0.0k",
+      permissionMode: "unknown",
+      managed: false,
+      lastEvent: "Discovered running Copilot process",
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [];
+      if (command === "list_agent_sessions") return [session];
+      if (command === "load_settings") return settings;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+
+    expect((await screen.findAllByText("Observed Copilot CLI session")).length).toBe(2);
+    expect(screen.getByText("Read only")).toBeTruthy();
+    expect(screen.getByText("Discovered running Copilot process")).toBeTruthy();
   });
 });
