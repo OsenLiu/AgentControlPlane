@@ -196,9 +196,10 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   const [refreshing, setRefreshing] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
-  const [task, setTask] = useState("");
+  const [task, setTask] = useState("Start a new Copilot session");
   const [starting, setStarting] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [launcherOpen, setLauncherOpen] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const [archivedView, setArchivedView] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
@@ -352,10 +353,20 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         </div>
         <div className="session-header-actions">
           <span className="connection-pill"><span /> Supervisor online</span>
+          <button className="primary-button" onClick={() => setLauncherOpen((open) => !open)}>Start Copilot session <span>↗</span></button>
           <button className="secondary-button" onClick={() => setArchivedView(!archivedView)}>{archivedView ? "Active sessions" : "Archived sessions"}</button>
           <button className="secondary-button" onClick={() => void refreshSessions()} disabled={refreshing}><span className="refresh-glyph">↻</span> {refreshing ? "Refreshing…" : "Refresh"}</button>
         </div>
       </header>
+      {launcherOpen && <form className="session-launch-card" onSubmit={startSession}>
+        <label className="field-label" htmlFor="session-project">PROJECT</label>
+        <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)} disabled={projects.length === 0}>
+          {projects.length === 0 ? <option value="">No projects connected</option> : projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
+        </select>
+        <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
+        <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
+        <button className="primary-button" type="submit" disabled={starting || projects.length === 0 || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
+      </form>}
 
       <section className="session-summary-grid" aria-label="Session summary">
         <article className="session-summary-card"><span className="summary-icon running-icon">◉</span><div><strong>{sessions.filter((session) => session.status === "running").length}</strong><span>Running now</span></div><small>Live output streaming</small></article>
