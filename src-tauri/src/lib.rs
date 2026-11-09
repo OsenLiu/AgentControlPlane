@@ -50,7 +50,15 @@ struct AgentSession {
     last_event: String,
 }
 
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptMessage {
+    role: String,
+    content: String,
+    timestamp: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
 struct CopilotObservation {
     status: Option<String>,
     step: Option<String>,
@@ -535,6 +543,123 @@ fn copilot_session_store_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".copilot/session-store.db"))
 }
 
+fn transcript_messages_from_store(
+    store: &Connection,
+    external_session_id: &str,
+) -> Result<Vec<TranscriptMessage>, String> {
+    let mut statement = store
+        .prepare(
+            "SELECT turn_index, user_message, assistant_response, timestamp
+             FROM turns NOT INDEXED
+             WHERE session_id = ?1
+             ORDER BY turn_index DESC
+             LIMIT 20",
+        )
+        .map_err(|error| format!("Unable to query Copilot transcript: {error}"))?;
+    let mut messages = Vec::new();
+    let rows = statement
+        .query_map([external_session_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to read Copilot transcript: {error}"))?;
+
+    for row in rows {
+        let (_, user_message, assistant_response, timestamp) =
+            row.map_err(|error| format!("Unable to decode Copilot transcript: {error}"))?;
+        if let Some(content) = user_message.filter(|value| !value.trim().is_empty()) {
+            messages.push(TranscriptMessage {
+                role: "user".to_owned(),
+                content,
+                timestamp: timestamp.clone(),
+            });
+        }
+        if let Some(content) = assistant_response.filter(|value| !value.trim().is_empty()) {
+            messages.push(TranscriptMessage {
+                role: "assistant".to_owned(),
+                content,
+                timestamp,
+            });
+        }
+        if messages.len() >= 20 {
+            break;
+        }
+    }
+    messages.reverse();
+    Ok(messages)
+}
+
+#[tauri::command]
+fn get_session_transcript(
+    session_id: String,
+    database: State<'_, Database>,
+) -> Result<Vec<TranscriptMessage>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    let (provider, external_session_id): (String, Option<String>) = connection
+        .query_row(
+            "SELECT provider, external_session_id FROM agent_sessions WHERE id = ?1",
+            [&session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|error| format!("Unable to find agent session: {error}"))?;
+
+    if provider == "copilot" {
+        if let (Some(external_session_id), Some(store_path)) =
+            (external_session_id, copilot_session_store_path())
+        {
+            if store_path.exists() {
+                let store = Connection::open_with_flags(
+                    store_path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY,
+                )
+                .map_err(|error| format!("Unable to read Copilot session store: {error}"))?;
+                let messages = transcript_messages_from_store(&store, &external_session_id)?;
+                if !messages.is_empty() {
+                    return Ok(messages);
+                }
+            }
+        }
+    }
+
+    let mut statement = connection
+        .prepare(
+            "SELECT payload, observed_at
+             FROM session_events
+             WHERE session_id = ?1
+             ORDER BY sequence DESC
+             LIMIT 20",
+        )
+        .map_err(|error| format!("Unable to query session transcript: {error}"))?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Unable to read session transcript: {error}"))?;
+    let mut messages = Vec::new();
+    for row in rows {
+        let (payload, timestamp) =
+            row.map_err(|error| format!("Unable to decode session transcript: {error}"))?;
+        let observation: CopilotObservation = serde_json::from_str(&payload)
+            .map_err(|error| format!("Unable to decode transcript event: {error}"))?;
+        if let Some(content) = observation.last_event {
+            messages.push(TranscriptMessage {
+                role: "assistant".to_owned(),
+                content,
+                timestamp,
+            });
+        }
+    }
+    messages.reverse();
+    Ok(messages)
+}
+
 fn copilot_open_sessions_state_path() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("COPILOT_HOME") {
         return Some(PathBuf::from(path).join("open-sessions-state.json"));
@@ -634,33 +759,13 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
                           FROM assistant_usage_events usage
                           WHERE usage.session_id = sessions.id
                         ), 0)
-                        ,
-                        COALESCE(
-                          (
-                            SELECT NULLIF(trim(turns.assistant_response), '')
-                            FROM turns
-                            WHERE turns.session_id = sessions.id
-                            ORDER BY turns.turn_index DESC
-                            LIMIT 1
-                          ),
-                          (
-                            SELECT NULLIF(trim(turns.user_message), '')
-                            FROM turns
-                            WHERE turns.session_id = sessions.id
-                            ORDER BY turns.turn_index DESC
-                            LIMIT 1
-                          ),
-                          ?3
-                        )
                  FROM sessions
                  WHERE cwd = ?1
                  ORDER BY updated_at DESC",
             )
             .map_err(|error| format!("Unable to query Copilot sessions: {error}"))?;
         let rows = sessions
-            .query_map(
-                params![project_path.as_str(), project_branch.as_str(), ""],
-                |row| {
+            .query_map(params![project_path.as_str(), project_branch.as_str()], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -668,15 +773,19 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
-                    row.get::<_, String>(6)?,
                 ))
-                },
-            )
+            })
             .map_err(|error| format!("Unable to decode Copilot sessions: {error}"))?;
 
         for row in rows {
-            let (external_id, summary, branch, created_at, updated_at, token_count, imported_last_event) =
-                row.map_err(|error| format!("Unable to decode Copilot session: {error}"))?;
+            let (external_id, summary, branch, created_at, updated_at, token_count) =
+                match row {
+                    Ok(value) => value,
+                    Err(error) => {
+                        eprintln!("Unable to decode one Copilot session; skipping remaining discovered sessions: {error}");
+                        break;
+                    }
+                };
             let managed: bool = connection
                 .query_row(
                     "SELECT EXISTS(
@@ -696,14 +805,10 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
                 .map(|ids| ids.contains(&external_id))
                 .or_else(|| fallback_active_ids.as_ref().map(|ids| ids.contains(&external_id)))
                 .unwrap_or(false);
-            let last_event = if imported_last_event.is_empty() {
-                if active {
-                    "Copilot process is using this session".to_owned()
-                } else {
-                    "Available to resume in Copilot CLI".to_owned()
-                }
+            let last_event = if active {
+                "Copilot process is using this session"
             } else {
-                imported_last_event
+                "Available to resume in Copilot CLI"
             };
             let session_id = format!("copilot-{external_id}");
             connection
@@ -1184,6 +1289,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_projects,
             list_agent_sessions,
+            get_session_transcript,
             start_copilot_session,
             register_project,
             load_settings,

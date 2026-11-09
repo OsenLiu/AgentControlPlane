@@ -47,6 +47,12 @@ type AgentSession = {
   lastEvent: string;
 };
 
+type TranscriptMessage = {
+  role: "user" | "assistant";
+  content: string;
+  timestamp: string;
+};
+
 const emptyToolSettings = (): ToolSettings => ({
   enabled: false,
 });
@@ -173,6 +179,7 @@ function AgentSessionsView() {
   const [selectedProjectId, setSelectedProjectId] = useState("");
   const [task, setTask] = useState("");
   const [starting, setStarting] = useState(false);
+  const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all" || session.status === filter;
@@ -191,14 +198,25 @@ function AgentSessionsView() {
   }, []);
 
   useEffect(() => {
+    if (!selectedSession) {
+      setTranscript([]);
+      return;
+    }
+    void loadTranscript(selectedSession.id);
+  }, [selectedSession?.id]);
+
+  useEffect(() => {
     let unsubscribe: (() => void) | undefined;
-    void listen<string>("agent-session-updated", () => {
+    void listen<string>("agent-session-updated", (event) => {
       void loadSessions();
+      if (event.payload === selectedSession?.id) {
+        void loadTranscript(event.payload);
+      }
     }).then((unlisten) => {
       unsubscribe = unlisten;
     });
     return () => unsubscribe?.();
-  }, []);
+  }, [selectedSession?.id]);
 
   async function loadSessions() {
     try {
@@ -210,6 +228,15 @@ function AgentSessionsView() {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function loadTranscript(sessionId: string) {
+    try {
+      const loaded = await invoke<TranscriptMessage[]>("get_session_transcript", { sessionId });
+      setTranscript(loaded);
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
     }
   }
 
@@ -322,7 +349,17 @@ function AgentSessionsView() {
 
           <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
           <div className="transcript">
-            <div className="transcript-line active-line"><time>{selectedSession.elapsed}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>
+            {transcript.length === 0 && <div className="transcript-line active-line"><time>{selectedSession.elapsed}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
+            {transcript.map((message, index) => (
+              <div className={`transcript-line ${index === transcript.length - 1 ? "active-line" : ""}`} key={`${message.timestamp}-${index}`}>
+                <time>{message.timestamp}</time>
+                <div>
+                  <span className={`transcript-label ${message.role === "user" ? "user-label" : "agent-label"}`}>{message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase()}</span>
+                  <p>{message.content}</p>
+                  {index === transcript.length - 1 && selectedSession.status === "running" && <span className="typing-indicator"><i /><i /><i /> Working</span>}
+                </div>
+              </div>
+            ))}
           </div>
 
           <div className="control-panel">
