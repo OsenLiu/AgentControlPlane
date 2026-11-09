@@ -209,6 +209,22 @@ fn copilot_session_id() -> String {
     format!("copilot-{timestamp:x}")
 }
 
+fn copilot_content_text(content: &Value) -> Option<String> {
+    if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
+        return Some(text.to_owned());
+    }
+    if let Some(text) = content.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+        return Some(text.to_owned());
+    }
+    content.as_array().and_then(|parts| {
+        let text = parts
+            .iter()
+            .filter_map(copilot_content_text)
+            .collect::<String>();
+        (!text.is_empty()).then_some(text)
+    })
+}
+
 fn copilot_observation_from_line(line: &str) -> Result<Option<CopilotObservation>, String> {
     let message: Value = serde_json::from_str(line)
         .map_err(|error| format!("Copilot returned invalid ACP JSON: {error}"))?;
@@ -250,32 +266,28 @@ fn copilot_observation_from_line(line: &str) -> Result<Option<CopilotObservation
     let update_type = update["sessionUpdate"].as_str().unwrap_or_default();
     let observation = match update_type {
         "agent_message_chunk" => {
-            let text = update["content"]["text"].as_str().unwrap_or_default();
-            if text.is_empty() {
-                None
-            } else {
-                Some(CopilotObservation {
-                    status: Some("running".to_owned()),
-                    step: Some("Receiving Copilot response".to_owned()),
-                    last_event: Some(text.to_owned()),
-                })
-            }
+            copilot_content_text(&update["content"]).map(|text| CopilotObservation {
+                status: Some("running".to_owned()),
+                step: Some("Receiving Copilot response".to_owned()),
+                last_event: Some(text),
+            })
         }
         "tool_call" | "tool_call_update" => {
             let title = update["title"]
                 .as_str()
-                .or_else(|| update["content"]["text"].as_str())
-                .unwrap_or("Copilot is using a tool");
+                .map(str::to_owned)
+                .or_else(|| copilot_content_text(&update["content"]))
+                .unwrap_or_else(|| "Copilot is using a tool".to_owned());
             Some(CopilotObservation {
                 status: Some("running".to_owned()),
-                step: Some(title.to_owned()),
-                last_event: Some(title.to_owned()),
+                step: Some(title.clone()),
+                last_event: Some(title),
             })
         }
         "user_message_chunk" => Some(CopilotObservation {
             status: Some("running".to_owned()),
             step: Some("Processing prompt".to_owned()),
-            last_event: update["content"]["text"].as_str().map(str::to_owned),
+            last_event: copilot_content_text(&update["content"]),
         }),
         _ => None,
     };
@@ -451,15 +463,7 @@ fn list_agent_sessions_from_connection(
              JOIN projects p ON p.id = s.project_id
              WHERE (?1 IS NULL OR s.project_id = ?1)
                AND (?2 IS NULL OR s.status = ?2)
-             ORDER BY
-               CASE s.status
-                 WHEN 'waiting' THEN 0
-                 WHEN 'running' THEN 1
-                 WHEN 'starting' THEN 2
-                 WHEN 'paused' THEN 3
-                 ELSE 4
-               END,
-               s.updated_at DESC",
+             ORDER BY COALESCE(s.last_seen_at, s.updated_at) DESC",
         )
         .map_err(|error| format!("Unable to read agent sessions: {error}"))?;
 
@@ -630,13 +634,33 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
                           FROM assistant_usage_events usage
                           WHERE usage.session_id = sessions.id
                         ), 0)
+                        ,
+                        COALESCE(
+                          (
+                            SELECT NULLIF(trim(turns.assistant_response), '')
+                            FROM turns
+                            WHERE turns.session_id = sessions.id
+                            ORDER BY turns.turn_index DESC
+                            LIMIT 1
+                          ),
+                          (
+                            SELECT NULLIF(trim(turns.user_message), '')
+                            FROM turns
+                            WHERE turns.session_id = sessions.id
+                            ORDER BY turns.turn_index DESC
+                            LIMIT 1
+                          ),
+                          ?3
+                        )
                  FROM sessions
                  WHERE cwd = ?1
                  ORDER BY updated_at DESC",
             )
             .map_err(|error| format!("Unable to query Copilot sessions: {error}"))?;
         let rows = sessions
-            .query_map(params![project_path.as_str(), project_branch.as_str()], |row| {
+            .query_map(
+                params![project_path.as_str(), project_branch.as_str(), ""],
+                |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -644,12 +668,14 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
                     row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
-            })
+                },
+            )
             .map_err(|error| format!("Unable to decode Copilot sessions: {error}"))?;
 
         for row in rows {
-            let (external_id, summary, branch, created_at, updated_at, token_count) =
+            let (external_id, summary, branch, created_at, updated_at, token_count, imported_last_event) =
                 row.map_err(|error| format!("Unable to decode Copilot session: {error}"))?;
             let managed: bool = connection
                 .query_row(
@@ -670,6 +696,15 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
                 .map(|ids| ids.contains(&external_id))
                 .or_else(|| fallback_active_ids.as_ref().map(|ids| ids.contains(&external_id)))
                 .unwrap_or(false);
+            let last_event = if imported_last_event.is_empty() {
+                if active {
+                    "Copilot process is using this session".to_owned()
+                } else {
+                    "Available to resume in Copilot CLI".to_owned()
+                }
+            } else {
+                imported_last_event
+            };
             let session_id = format!("copilot-{external_id}");
             connection
                 .execute(
@@ -714,11 +749,7 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
                         },
                         if active { "In use" } else { "Not currently in use" },
                         token_count,
-                        if active {
-                            "Copilot process is using this session"
-                        } else {
-                            "Available to resume in Copilot CLI"
-                        },
+                        last_event,
                         created_at,
                         updated_at,
                     ],
@@ -1236,6 +1267,17 @@ mod tests {
                 last_event: Some("Checking the repository".to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn copilot_agent_message_array_content_is_mapped_to_running_observation() {
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":[{"type":"text","text":"Checking "},{"type":"text","text":"the repository"}]}}}"#;
+
+        let observation = copilot_observation_from_line(line)
+            .expect("valid ACP message")
+            .expect("agent message observation");
+
+        assert_eq!(observation.last_event.as_deref(), Some("Checking the repository"));
     }
 
     #[test]
