@@ -78,7 +78,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
 
     expect(await screen.findByText("No agent sessions yet")).toBeTruthy();
-    expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions");
+    expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions", { archived: false });
   });
 
   it("renders a discovered Copilot session returned by the backend", async () => {

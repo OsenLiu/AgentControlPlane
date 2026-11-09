@@ -242,9 +242,9 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   async function loadSessions(showArchived = archivedView) {
     try {
       setLoadError("");
-      const loaded = showArchived
-        ? await invoke<AgentSession[]>("list_agent_sessions", { archived: true })
-        : await invoke<AgentSession[]>("list_agent_sessions");
+      const loaded = await invoke<AgentSession[]>("list_agent_sessions", {
+        archived: showArchived,
+      });
       setSessions(loaded);
       setSelectedId((current) => loaded.some((session) => session.id === current) ? current : loaded[0]?.id ?? "");
     } catch (reason) {
