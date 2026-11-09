@@ -778,14 +778,6 @@ fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
         .map_err(|error| format!("Unable to decode projects for session discovery: {error}"))?;
 
     for (project_id, project_path, project_branch) in projects {
-        connection
-            .execute(
-                "DELETE FROM agent_sessions
-                 WHERE project_id = ?1 AND provider = 'copilot'
-                   AND origin = 'observed' AND archived = 0",
-                [&project_id],
-            )
-            .map_err(|error| format!("Unable to clear stale Copilot observations: {error}"))?;
         let mut sessions = store
             .prepare(
                 "SELECT id, COALESCE(summary, ''), COALESCE(branch, ?2),
