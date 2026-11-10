@@ -46,6 +46,131 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("load_settings");
   });
 
+  it("loads an empty Attention inbox from the backend", async () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /^Attention inbox/ }));
+
+    expect(await screen.findByText("You’re all caught up")).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions", { archived: false });
+  });
+
+  it("shows backend permissions, failures, and completed sessions and can answer a permission", async () => {
+    const sessions = [
+      {
+        id: "waiting-session",
+        project: "demo",
+        task: "Run the checks",
+        branch: "feat/checks",
+        provider: "copilot",
+        status: "waiting",
+        step: "Waiting for permission",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "0.0k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Run tests",
+        archived: false,
+        statusReason: "",
+        updatedAt: "2026-11-10 10:00:00",
+      },
+      {
+        id: "failed-session",
+        project: "demo",
+        task: "Build the app",
+        branch: "fix/build",
+        provider: "claudeCode",
+        status: "failed",
+        step: "Build failed",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "1.0k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Compiler exited with status 1",
+        archived: false,
+        statusReason: "Build command failed",
+        updatedAt: "2026-11-10 09:00:00",
+      },
+      {
+        id: "completed-session",
+        project: "demo",
+        task: "Update the docs",
+        branch: "docs/setup",
+        provider: "copilot",
+        status: "completed",
+        step: "Finished",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "1.2k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Prompt stopped: end_turn",
+        archived: false,
+        statusReason: "",
+        updatedAt: "2026-11-10 08:00:00",
+      },
+      {
+        id: "orphaned-session",
+        project: "demo",
+        task: "Resume the work",
+        branch: "feat/recovery",
+        provider: "copilot",
+        status: "orphaned",
+        step: "Reconnect required",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "0.5k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "",
+        archived: false,
+        statusReason: "Agent Control Plane restarted; reconnect the session to continue.",
+        updatedAt: "2026-11-10 07:00:00",
+      },
+    ];
+    let permissionPending = true;
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_projects") return [];
+      if (command === "load_settings") return settings;
+      if (command === "get_pending_session_permission") {
+        return permissionPending ? {
+          requestId: "permission-1",
+          title: "Run npm test",
+          options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }],
+        } : null;
+      }
+      if (command === "list_agent_sessions") {
+        if (!permissionPending) sessions[0].status = "running";
+        return sessions;
+      }
+      if (command === "respond_session_permission") {
+        expect(args).toEqual({ sessionId: "waiting-session", requestId: "permission-1", optionId: "allow-once" });
+        permissionPending = false;
+        sessions[0].status = "running";
+        return undefined;
+      }
+      if (command === "get_session_transcript") return [];
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /^Attention inbox/ }));
+
+    expect(await screen.findAllByText("Run npm test")).toHaveLength(2);
+    expect(screen.getByText("Session failed")).toBeTruthy();
+    expect(screen.getByText("Review completed session")).toBeTruthy();
+    expect(screen.getByText("Session needs reconnect")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
+
+    await waitFor(() => {
+      expect(screen.queryByText("Run npm test")).toBeNull();
+      expect(screen.getByRole("heading", { name: "Items to review 3" })).toBeTruthy();
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /Session failed/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open session" }));
+    expect(await screen.findByRole("heading", { name: "Agent sessions" })).toBeTruthy();
+    expect(await screen.findAllByText("Build the app")).toHaveLength(2);
+  });
+
   it("registers a local project from the add-project dialog", async () => {
     const project = {
       id: "/tmp/demo",

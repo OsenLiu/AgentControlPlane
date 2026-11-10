@@ -158,6 +158,8 @@ One cross-project queue containing:
 
 Each item must be answerable in place, show enough context to act, support filtering/sorting, and link back to the project, task, session, transcript, diff, or external pipeline run.
 
+The current local inbox derives live entries from persisted sessions: pending ACP permission requests, failed or orphaned sessions, and completed managed sessions awaiting review. Permission choices are handled in place; other entries open their session and can be archived. Agent questions, exhausted-retry workflows, and provider-level failures are not yet emitted as distinct inbox events by the backend and must not be inferred from unrelated session text or status.
+
 ### Agent sessions
 
 - List sessions created and persisted by Agent Control Plane; do not discover or import sessions by scanning Copilot/VS Code private databases or process arguments.

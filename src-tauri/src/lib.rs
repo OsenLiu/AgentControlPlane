@@ -77,6 +77,8 @@ struct AgentSession {
     managed: bool,
     last_event: String,
     archived: bool,
+    status_reason: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -209,6 +211,8 @@ fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSess
         managed: row.get::<_, String>(10)? == "managed",
         last_event: row.get(11)?,
         archived: row.get::<_, i64>(12)? != 0,
+        status_reason: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -843,7 +847,8 @@ fn list_agent_sessions_from_connection(
         .prepare(
             "SELECT s.id, p.name, s.task, s.branch, s.provider, s.status,
                     s.current_step, s.started_at, s.token_count,
-                    s.permission_mode, s.origin, s.last_event, s.archived
+                   s.permission_mode, s.origin, s.last_event, s.archived,
+                   s.status_reason, s.updated_at
              FROM agent_sessions s
              JOIN projects p ON p.id = s.project_id
              WHERE (?1 IS NULL OR s.project_id = ?1)
@@ -1923,6 +1928,40 @@ mod tests {
     }
 
     #[test]
+    fn startup_marks_interrupted_managed_sessions_as_orphaned() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("initial schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, path, branch, current_commit, git_state)
+                 VALUES ('project-1', 'Control Plane', '/tmp/control-plane', 'main', 'abc', 'clean')",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions
+                 (id, project_id, provider, task, branch, status, origin)
+                 VALUES ('interrupted-session', 'project-1', 'copilot', 'Run checks', 'main', 'waiting', 'managed')",
+                [],
+            )
+            .expect("interrupted session");
+
+        initialize_schema(&connection).expect("restart schema reconciliation");
+
+        let session = list_agent_sessions_from_connection(&connection, None, None, None)
+            .expect("session query")
+            .into_iter()
+            .next()
+            .expect("persisted session");
+        assert_eq!(session.status, "orphaned");
+        assert_eq!(
+            session.status_reason,
+            "Agent Control Plane restarted; reconnect the session to continue."
+        );
+    }
+
+    #[test]
     fn session_read_model_returns_persisted_copilot_session() {
         let connection = Connection::open_in_memory().expect("in-memory database");
         initialize_schema(&connection).expect("schema");
@@ -1953,6 +1992,8 @@ mod tests {
         assert_eq!(sessions[0].id, "session-1");
         assert_eq!(sessions[0].provider, "copilot");
         assert_eq!(sessions[0].status, "waiting");
+        assert_eq!(sessions[0].status_reason, "Agent asked a question");
+        assert!(!sessions[0].updated_at.is_empty());
         assert!(sessions[0].managed);
         assert_eq!(sessions[0].tokens, "12.8k");
     }
