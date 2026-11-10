@@ -224,6 +224,9 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   const [messageDraft, setMessageDraft] = useState("");
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [archivedView, setArchivedView] = useState(false);
+  const [renamingSession, setRenamingSession] = useState(false);
+  const [sessionNameDraft, setSessionNameDraft] = useState("");
+  const [savingSessionName, setSavingSessionName] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all" || session.status === filter;
@@ -324,6 +327,31 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
       await loadSessions(archivedView);
     } catch (reason) {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  function beginRenameSession() {
+    if (!selectedSession) return;
+    setSessionNameDraft(selectedSession.task);
+    setRenamingSession(true);
+  }
+
+  async function renameSession(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedSession || !sessionNameDraft.trim()) return;
+    setSavingSessionName(true);
+    setLoadError("");
+    try {
+      await invoke("rename_agent_session", {
+        sessionId: selectedSession.id,
+        name: sessionNameDraft.trim(),
+      });
+      setRenamingSession(false);
+      await loadSessions(archivedView);
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSavingSessionName(false);
     }
   }
 
@@ -506,10 +534,17 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
           <div className="detail-header">
             <div className="detail-title"><div className={`session-avatar avatar-${selectedSession.status}`}>{selectedSession.project.charAt(0)}</div><div><div className="detail-name-row"><h2>{selectedSession.task}</h2><SessionStatusBadge status={selectedSession.status} /></div><p>{selectedSession.project} <span>·</span> <code>{selectedSession.branch}</code></p></div></div>
             <div className="detail-actions">
+              <button className="secondary-button" onClick={beginRenameSession} disabled={savingSessionName}>Rename</button>
               <button className="secondary-button archive-button" onClick={() => void updateArchiveState()} disabled={resuming}>{archivedView ? "Unarchive session" : "Archive session"}</button>
               {selectedSession.managed && selectedSession.provider === "copilot" && ["completed", "failed", "orphaned"].includes(selectedSession.status) && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
             </div>
           </div>
+          {renamingSession && <form className="session-rename-form" onSubmit={renameSession}>
+            <label className="field-label" htmlFor="session-name">SESSION NAME</label>
+            <input id="session-name" className="settings-input" value={sessionNameDraft} onChange={(event) => setSessionNameDraft(event.currentTarget.value)} autoFocus maxLength={500} />
+            <button className="secondary-button" type="button" onClick={() => setRenamingSession(false)} disabled={savingSessionName}>Cancel</button>
+            <button className="primary-button" type="submit" disabled={savingSessionName || !sessionNameDraft.trim()}>{savingSessionName ? "Saving…" : "Save name"}</button>
+          </form>}
           <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
 
           <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
@@ -540,14 +575,14 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
               <input
                 value={messageDraft}
                 onChange={(event) => setMessageDraft(event.currentTarget.value)}
-                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting" || selectedSession.status === "waiting"}
-                placeholder={selectedSession.managed ? "Message Copilot…" : "This session is read only"}
+                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting"}
+                placeholder={selectedSession.managed ? selectedSession.status === "waiting" ? "Reply to Copilot…" : "Message Copilot…" : "This session is read only"}
                 aria-label="Message Copilot"
               />
               <button
                 className="primary-button"
                 type="submit"
-                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || !messageDraft.trim() || selectedSession.status === "running" || selectedSession.status === "starting" || selectedSession.status === "waiting"}
+                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || !messageDraft.trim() || selectedSession.status === "running" || selectedSession.status === "starting"}
               >
                 {sendingMessage ? "Sending…" : "Send"} <span>↗</span>
               </button>

@@ -379,6 +379,22 @@ fn permission_outcome(
     }
 }
 
+fn validate_session_message_status(
+    status: &str,
+    is_initial_prompt: bool,
+    has_pending_permission: bool,
+) -> Result<(), String> {
+    if has_pending_permission {
+        return Err(
+            "Respond to Copilot's pending permission request before sending a message.".to_owned(),
+        );
+    }
+    if matches!(status, "running" | "starting") && !is_initial_prompt {
+        return Err("Wait for Copilot to finish its current response.".to_owned());
+    }
+    Ok(())
+}
+
 fn acp_request(control: &SessionControl, method: &str, params: Value) -> Result<Value, String> {
     let id = control.next_request_id.fetch_add(1, Ordering::Relaxed);
     let (response_tx, response_rx) = mpsc::channel();
@@ -554,6 +570,11 @@ fn send_copilot_message(
     if message.len() > 16_000 {
         return Err("Messages must be 16,000 bytes or fewer.".to_owned());
     }
+    let has_pending_permission = !control
+        .permission_requests
+        .lock()
+        .map_err(|_| "Copilot permission state is unavailable.".to_owned())?
+        .is_empty();
     let assistant_message_id = {
         let connection = database
             .lock()
@@ -565,11 +586,7 @@ fn send_copilot_message(
                 |row| row.get(0),
             )
             .map_err(|error| format!("Unable to find managed agent session: {error}"))?;
-        if status == "waiting"
-            || (matches!(status.as_str(), "running" | "starting") && !is_initial_prompt)
-        {
-            return Err("Wait for Copilot to finish its current response.".to_owned());
-        }
+        validate_session_message_status(&status, is_initial_prompt, has_pending_permission)?;
         insert_session_message(&connection, session_id, "user", message)?;
         let assistant_message_id =
             insert_session_message(&connection, session_id, "assistant", "")?;
@@ -1071,6 +1088,38 @@ fn set_session_archived(
             params![session_id, i64::from(archived)],
         )
         .map_err(|error| format!("Unable to update agent session archive state: {error}"))?;
+    if changed == 0 {
+        return Err("Agent session was not found.".to_owned());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn rename_agent_session(
+    session_id: String,
+    name: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Session name cannot be empty.".to_owned());
+    }
+    if name.len() > 500 {
+        return Err("Session name must be 500 bytes or fewer.".to_owned());
+    }
+
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    let changed = connection
+        .execute(
+            "UPDATE agent_sessions
+             SET task = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            params![session_id, name],
+        )
+        .map_err(|error| format!("Unable to rename agent session: {error}"))?;
     if changed == 0 {
         return Err("Agent session was not found.".to_owned());
     }
@@ -1837,6 +1886,7 @@ pub fn run() {
             respond_session_permission,
             stop_agent_session,
             set_session_archived,
+            rename_agent_session,
             get_session_transcript,
             start_copilot_session,
             register_project,
@@ -2058,6 +2108,23 @@ mod tests {
             permission_outcome(&permission, None).expect("cancel choice"),
             serde_json::json!({ "outcome": "cancelled" })
         );
+    }
+
+    #[test]
+    fn waiting_session_accepts_a_message_unless_permission_is_pending() {
+        assert!(validate_session_message_status("waiting", false, false).is_ok());
+        assert!(
+            validate_session_message_status("waiting", false, true)
+                .expect_err("pending permission must be answered first")
+                .contains("pending permission request")
+        );
+        assert!(validate_session_message_status("running", false, false).is_err());
+    }
+
+    #[test]
+    fn session_names_must_not_be_empty() {
+        assert!("   ".trim().is_empty());
+        assert!("A useful session name".len() <= 500);
     }
 
     #[test]

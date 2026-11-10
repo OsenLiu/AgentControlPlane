@@ -257,6 +257,46 @@ describe("App", () => {
     expect(await screen.findByText("The session store is local.")).toBeTruthy();
   });
 
+  it("allows replying to a managed session waiting for user input", async () => {
+    const session = {
+      id: "waiting-session",
+      project: "demo",
+      task: "Choose an implementation",
+      branch: "main",
+      provider: "copilot",
+      status: "waiting",
+      step: "Waiting for your input",
+      elapsed: "2026-11-09 11:20:00",
+      tokens: "0.0k",
+      permissionMode: "plan",
+      managed: true,
+      lastEvent: "Which approach should I use?",
+      archived: false,
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [];
+      if (command === "load_settings") return settings;
+      if (command === "list_agent_sessions") return [session];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "get_session_transcript") return [];
+      if (command === "send_session_message") return undefined;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    const input = await screen.findByRole("textbox", { name: "Message Copilot" });
+
+    expect(input).toBeEnabled();
+    fireEvent.change(input, { target: { value: "Use the simpler approach." } });
+    fireEvent.click(screen.getByRole("button", { name: /Send/ }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("send_session_message", {
+      sessionId: "waiting-session",
+      message: "Use the simpler approach.",
+    }));
+  });
+
   it("stops a managed Copilot session", async () => {
     const session = {
       id: "managed-session",
