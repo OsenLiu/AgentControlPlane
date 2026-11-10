@@ -1,19 +1,51 @@
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex},
+    process::{Child, Command, Stdio},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, Sender},
+    },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
-#[cfg(test)]
-use serde_json::Value;
 use tauri::{Emitter, Manager, State};
 
 struct Database(Arc<Mutex<Connection>>);
+struct SessionProcesses(Arc<Mutex<HashMap<String, SessionControl>>>);
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PermissionOption {
+    option_id: String,
+    name: String,
+    kind: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingPermission {
+    request_id: String,
+    title: String,
+    options: Vec<PermissionOption>,
+}
+
+#[derive(Clone)]
+struct SessionControl {
+    input: Sender<String>,
+    pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
+    permission_requests: Arc<Mutex<HashMap<String, (Value, PendingPermission)>>>,
+    next_request_id: Arc<AtomicU64>,
+    stop_requested: Arc<std::sync::atomic::AtomicBool>,
+    child: Arc<Mutex<Child>>,
+    assistant_message_id: Arc<Mutex<Option<String>>>,
+}
 
 const GITHUB_CREDENTIAL_SERVICE: &str = "com.agentcontrolplane.desktop.github";
 const GITHUB_CREDENTIAL_USER: &str = "github-token";
@@ -60,16 +92,6 @@ struct CopilotObservation {
     status: Option<String>,
     step: Option<String>,
     last_event: Option<String>,
-}
-
-struct RunningProcess {
-    pid: u32,
-    command_line: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct CopilotOpenSessionState {
-    working: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -233,43 +255,6 @@ fn copilot_command() -> Command {
     Command::new(copilot_executable())
 }
 
-fn copilot_start_args(task: &str, resume_session_id: Option<&str>) -> Vec<String> {
-    let mut args = vec!["--interactive".to_owned(), task.to_owned()];
-    if let Some(session_id) = resume_session_id {
-        args.push("--resume".to_owned());
-        args.push(session_id.to_owned());
-    }
-    args
-}
-
-fn spawn_copilot_terminal(
-    project_path: &str,
-    args: &[String],
-) -> Result<std::process::Child, String> {
-    let executable = copilot_executable();
-    let terminals = [
-        ("gnome-terminal", vec!["--wait".to_owned(), format!("--working-directory={project_path}"), "--".to_owned()]),
-        ("konsole", vec!["--hold".to_owned(), "--workdir".to_owned(), project_path.to_owned(), "-e".to_owned()]),
-        ("xfce4-terminal", vec!["--working-directory".to_owned(), project_path.to_owned(), "--".to_owned()]),
-        ("xterm", vec!["-e".to_owned()]),
-    ];
-
-    let mut failures = Vec::new();
-    for (terminal, terminal_args) in terminals {
-        let mut command = Command::new(terminal);
-        command.args(terminal_args).arg(&executable).args(args);
-        match command.spawn() {
-            Ok(child) => return Ok(child),
-            Err(error) => failures.push(format!("{terminal}: {error}")),
-        }
-    }
-
-    Err(format!(
-        "Unable to open a terminal for Copilot. Tried: {}",
-        failures.join("; ")
-    ))
-}
-
 fn copilot_session_id() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -278,12 +263,15 @@ fn copilot_session_id() -> String {
     format!("copilot-{timestamp:x}")
 }
 
-#[cfg(test)]
 fn copilot_content_text(content: &Value) -> Option<String> {
     if let Some(text) = content.as_str().filter(|text| !text.is_empty()) {
         return Some(text.to_owned());
     }
-    if let Some(text) = content.get("text").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+    if let Some(text) = content
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
         return Some(text.to_owned());
     }
     content.as_array().and_then(|parts| {
@@ -295,7 +283,6 @@ fn copilot_content_text(content: &Value) -> Option<String> {
     })
 }
 
-#[cfg(test)]
 fn copilot_observation_from_line(line: &str) -> Result<Option<CopilotObservation>, String> {
     let message: Value = serde_json::from_str(line)
         .map_err(|error| format!("Copilot returned invalid ACP JSON: {error}"))?;
@@ -366,6 +353,247 @@ fn copilot_observation_from_line(line: &str) -> Result<Option<CopilotObservation
     Ok(observation)
 }
 
+fn send_acp_message(input: &Sender<String>, message: Value) -> Result<(), String> {
+    let encoded = serde_json::to_string(&message)
+        .map_err(|error| format!("Unable to encode Copilot protocol message: {error}"))?;
+    input
+        .send(encoded)
+        .map_err(|_| "Copilot session input is no longer available.".to_owned())
+}
+
+fn permission_outcome(
+    permission: &PendingPermission,
+    option_id: Option<&str>,
+) -> Result<Value, String> {
+    if let Some(option_id) = option_id {
+        if !permission
+            .options
+            .iter()
+            .any(|option| option.option_id == option_id)
+        {
+            return Err("Choose one of the permission options provided by Copilot.".to_owned());
+        }
+        Ok(serde_json::json!({ "outcome": "selected", "optionId": option_id }))
+    } else {
+        Ok(serde_json::json!({ "outcome": "cancelled" }))
+    }
+}
+
+fn acp_request(control: &SessionControl, method: &str, params: Value) -> Result<Value, String> {
+    let id = control.next_request_id.fetch_add(1, Ordering::Relaxed);
+    let (response_tx, response_rx) = mpsc::channel();
+    control
+        .pending
+        .lock()
+        .map_err(|_| "Copilot protocol state is unavailable.".to_owned())?
+        .insert(id, response_tx);
+    if let Err(error) = send_acp_message(
+        &control.input,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        }),
+    ) {
+        if let Ok(mut pending) = control.pending.lock() {
+            pending.remove(&id);
+        }
+        return Err(error);
+    }
+    let response = match response_rx.recv_timeout(Duration::from_secs(600)) {
+        Ok(response) => response,
+        Err(_) => {
+            if let Ok(mut pending) = control.pending.lock() {
+                pending.remove(&id);
+            }
+            return Err(format!("Copilot did not respond to {method} in time."));
+        }
+    };
+    if let Some(error) = response.get("error") {
+        return Err(error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("Copilot rejected the request.")
+            .to_owned());
+    }
+    response
+        .get("result")
+        .cloned()
+        .ok_or_else(|| format!("Copilot returned an invalid response to {method}."))
+}
+
+fn insert_session_message(
+    connection: &Connection,
+    session_id: &str,
+    role: &str,
+    content: &str,
+) -> Result<String, String> {
+    let sequence: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1
+             FROM session_messages WHERE session_id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to sequence transcript message: {error}"))?;
+    let message_id = copilot_session_id();
+    connection
+        .execute(
+            "INSERT INTO session_messages (id, session_id, sequence, role, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![message_id, session_id, sequence, role, content],
+        )
+        .map_err(|error| format!("Unable to save transcript message: {error}"))?;
+    Ok(message_id)
+}
+
+fn append_assistant_chunk(
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    message_id: &str,
+    content: &str,
+) -> Result<(), String> {
+    let connection = database
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    connection
+        .execute(
+            "UPDATE session_messages SET content = content || ?2
+             WHERE id = ?1 AND session_id = ?3 AND role = 'assistant'",
+            params![message_id, content, session_id],
+        )
+        .map_err(|error| format!("Unable to save Copilot response: {error}"))?;
+    connection
+        .execute(
+            "UPDATE agent_sessions
+             SET last_event = ?2, last_seen_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            params![session_id, content],
+        )
+        .map_err(|error| format!("Unable to update agent session: {error}"))?;
+    Ok(())
+}
+
+fn update_session_status(
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    status: &str,
+    step: &str,
+    reason: &str,
+) -> Result<(), String> {
+    let connection = database
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    connection
+        .execute(
+            "UPDATE agent_sessions
+             SET status = ?2, current_step = ?3, status_reason = ?4,
+                 last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP,
+                 completed_at = CASE WHEN ?2 IN ('completed', 'failed') THEN CURRENT_TIMESTAMP ELSE completed_at END
+             WHERE id = ?1",
+            params![session_id, status, step, reason],
+        )
+        .map_err(|error| format!("Unable to update agent session: {error}"))?;
+    Ok(())
+}
+
+fn send_copilot_message(
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    control: &SessionControl,
+    message: &str,
+    app: &tauri::AppHandle,
+    is_initial_prompt: bool,
+) -> Result<(), String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("Enter a message before sending it to Copilot.".to_owned());
+    }
+    if message.len() > 16_000 {
+        return Err("Messages must be 16,000 bytes or fewer.".to_owned());
+    }
+    let assistant_message_id = {
+        let connection = database
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM agent_sessions WHERE id = ?1 AND origin = 'managed'",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to find managed agent session: {error}"))?;
+        if status == "waiting"
+            || (matches!(status.as_str(), "running" | "starting") && !is_initial_prompt)
+        {
+            return Err("Wait for Copilot to finish its current response.".to_owned());
+        }
+        insert_session_message(&connection, session_id, "user", message)?;
+        let assistant_message_id =
+            insert_session_message(&connection, session_id, "assistant", "")?;
+        connection
+            .execute(
+                "UPDATE agent_sessions
+                 SET status = 'running', status_reason = '', current_step = 'Sending message',
+                     last_event = ?2, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                params![session_id, message],
+            )
+            .map_err(|error| format!("Unable to update agent session: {error}"))?;
+        assistant_message_id
+    };
+    *control
+        .assistant_message_id
+        .lock()
+        .map_err(|_| "Copilot transcript state is unavailable.".to_owned())? =
+        Some(assistant_message_id);
+    app.emit("agent-session-updated", session_id)
+        .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
+
+    let external_session_id: String = database
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?
+        .query_row(
+            "SELECT external_session_id FROM agent_sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to read Copilot protocol session ID: {error}"))?;
+    let result = acp_request(
+        control,
+        "session/prompt",
+        serde_json::json!({
+            "sessionId": external_session_id,
+            "prompt": [{ "type": "text", "text": message }]
+        }),
+    );
+    *control
+        .assistant_message_id
+        .lock()
+        .map_err(|_| "Copilot transcript state is unavailable.".to_owned())? = None;
+    match result {
+        Ok(_) => {
+            update_session_status(database, session_id, "idle", "Ready for your message", "")?;
+            app.emit("agent-session-updated", session_id)
+                .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
+            Ok(())
+        }
+        Err(error) => {
+            update_session_status(
+                database,
+                session_id,
+                "failed",
+                "Copilot request failed",
+                &error,
+            )?;
+            let _ = app.emit("agent-session-updated", session_id);
+            Err(error)
+        }
+    }
+}
+
 fn tool_settings_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolSettings> {
     Ok(ToolSettings {
         enabled: row.get(0)?,
@@ -373,15 +601,10 @@ fn tool_settings_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolSetti
 }
 
 fn default_tool_settings() -> ToolSettings {
-    ToolSettings {
-        enabled: false,
-    }
+    ToolSettings { enabled: false }
 }
 
-fn read_tool_settings(
-    connection: &Connection,
-    provider: &str,
-) -> Result<ToolSettings, String> {
+fn read_tool_settings(connection: &Connection, provider: &str) -> Result<ToolSettings, String> {
     connection
         .query_row(
             "SELECT enabled FROM tool_settings WHERE provider = ?1",
@@ -462,7 +685,9 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
         keyring::Entry::new(GITHUB_CREDENTIAL_SERVICE, GITHUB_CREDENTIAL_USER)
             .map_err(|error| format!("Unable to access the OS credential vault: {error}"))?
             .set_password(&github_token)
-            .map_err(|error| format!("Unable to save the GitHub token in the OS credential vault: {error}"))?;
+            .map_err(|error| {
+                format!("Unable to save the GitHub token in the OS credential vault: {error}")
+            })?;
     }
 
     let connection = database
@@ -571,111 +796,6 @@ fn list_agent_sessions_from_connection(
         .map_err(|error| format!("Unable to decode agent session data: {error}"))
 }
 
-fn copilot_external_session_id(arguments: &[String], pid: u32) -> String {
-    for (index, argument) in arguments.iter().enumerate() {
-        if let Some(value) = argument
-            .strip_prefix("--resume=")
-            .or_else(|| argument.strip_prefix("--session-id="))
-        {
-            return value.to_owned();
-        }
-        if matches!(argument.as_str(), "--resume" | "--session-id") {
-            if let Some(value) = arguments.get(index + 1) {
-                return value.to_owned();
-            }
-        }
-    }
-    format!("pid-{pid}")
-}
-
-fn running_processes() -> Result<Vec<RunningProcess>, String> {
-    let output = Command::new("ps")
-        .args(["-eo", "pid=,args="])
-        .output()
-        .map_err(|error| format!("Unable to inspect local processes: {error}"))?;
-    if !output.status.success() {
-        return Err("The operating system rejected process discovery.".to_owned());
-    }
-
-    let mut processes = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((pid_text, command_line)) = line.trim_start().split_once(char::is_whitespace)
-        else {
-            continue;
-        };
-        let Ok(pid) = pid_text.parse::<u32>() else {
-            continue;
-        };
-        let command_line = command_line.trim().to_owned();
-        if !command_line.to_lowercase().contains("copilot") {
-            continue;
-        }
-
-        processes.push(RunningProcess {
-            pid,
-            command_line,
-        });
-    }
-    Ok(processes)
-}
-
-fn copilot_session_store_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("COPILOT_HOME") {
-        return Some(PathBuf::from(path).join("session-store.db"));
-    }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".copilot/session-store.db"))
-}
-
-fn transcript_messages_from_store(
-    store: &Connection,
-    external_session_id: &str,
-) -> Result<Vec<TranscriptMessage>, String> {
-    let mut statement = store
-        .prepare(
-            "SELECT turn_index, user_message, assistant_response, timestamp
-             FROM turns NOT INDEXED
-             WHERE session_id = ?1
-             ORDER BY turn_index DESC
-             LIMIT 20",
-        )
-        .map_err(|error| format!("Unable to query Copilot transcript: {error}"))?;
-    let mut messages = Vec::new();
-    let rows = statement
-        .query_map([external_session_id], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })
-        .map_err(|error| format!("Unable to read Copilot transcript: {error}"))?;
-
-    for row in rows {
-        let (_, user_message, assistant_response, timestamp) =
-            row.map_err(|error| format!("Unable to decode Copilot transcript: {error}"))?;
-        if let Some(content) = user_message.filter(|value| !value.trim().is_empty()) {
-            messages.push(TranscriptMessage {
-                role: "user".to_owned(),
-                content,
-                timestamp: timestamp.clone(),
-            });
-        }
-        if let Some(content) = assistant_response.filter(|value| !value.trim().is_empty()) {
-            messages.push(TranscriptMessage {
-                role: "assistant".to_owned(),
-                content,
-                timestamp,
-            });
-        }
-        if messages.len() >= 20 {
-            break;
-        }
-    }
-    messages.reverse();
-    Ok(messages)
-}
-
 #[tauri::command]
 fn get_session_transcript(
     session_id: String,
@@ -685,260 +805,40 @@ fn get_session_transcript(
         .0
         .lock()
         .map_err(|_| "Agent session database is unavailable.".to_owned())?;
-    let (provider, external_session_id): (String, Option<String>) = connection
+    let exists: bool = connection
         .query_row(
-            "SELECT provider, external_session_id FROM agent_sessions WHERE id = ?1",
+            "SELECT EXISTS(SELECT 1 FROM agent_sessions WHERE id = ?1)",
             [&session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
-        .map_err(|error| format!("Unable to find agent session: {error}"))?;
-
-    if provider == "copilot" {
-        if let (Some(external_session_id), Some(store_path)) =
-            (external_session_id, copilot_session_store_path())
-        {
-            if store_path.exists() {
-                let store = Connection::open_with_flags(
-                    store_path,
-                    OpenFlags::SQLITE_OPEN_READ_ONLY,
-                )
-                .map_err(|error| format!("Unable to read Copilot session store: {error}"))?;
-                let messages = transcript_messages_from_store(&store, &external_session_id)?;
-                if !messages.is_empty() {
-                    return Ok(messages);
-                }
-            }
-        }
+        .map_err(|error| format!("Unable to verify agent session: {error}"))?;
+    if !exists {
+        return Err("Agent session was not found.".to_owned());
     }
-
     let mut statement = connection
         .prepare(
-            "SELECT payload, observed_at
-             FROM session_events
+            "SELECT role, content, created_at
+             FROM session_messages
              WHERE session_id = ?1
+               AND (role = 'user' OR content <> '')
              ORDER BY sequence DESC
-             LIMIT 20",
+             LIMIT 100",
         )
-        .map_err(|error| format!("Unable to query session transcript: {error}"))?;
+        .map_err(|error| format!("Unable to query local session transcript: {error}"))?;
     let rows = statement
         .query_map([session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok(TranscriptMessage {
+                role: row.get(0)?,
+                content: row.get(1)?,
+                timestamp: row.get(2)?,
+            })
         })
-        .map_err(|error| format!("Unable to read session transcript: {error}"))?;
-    let mut messages = Vec::new();
-    for row in rows {
-        let (payload, timestamp) =
-            row.map_err(|error| format!("Unable to decode session transcript: {error}"))?;
-        let observation: CopilotObservation = serde_json::from_str(&payload)
-            .map_err(|error| format!("Unable to decode transcript event: {error}"))?;
-        if let Some(content) = observation.last_event {
-            messages.push(TranscriptMessage {
-                role: "assistant".to_owned(),
-                content,
-                timestamp,
-            });
-        }
-    }
+        .map_err(|error| format!("Unable to read local session transcript: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to decode local session transcript: {error}"))?;
+    let mut messages = rows;
     messages.reverse();
     Ok(messages)
-}
-
-fn copilot_open_sessions_state_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("COPILOT_HOME") {
-        return Some(PathBuf::from(path).join("open-sessions-state.json"));
-    }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".copilot/open-sessions-state.json"))
-}
-
-fn copilot_working_session_ids(
-) -> Result<Option<std::collections::HashSet<String>>, String> {
-    let Some(path) = copilot_open_sessions_state_path() else {
-        return Ok(None);
-    };
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = fs::read_to_string(&path)
-        .map_err(|error| format!("Unable to read Copilot open-session state: {error}"))?;
-    Ok(Some(copilot_working_session_ids_from_json(&contents)?))
-}
-
-fn copilot_working_session_ids_from_json(
-    contents: &str,
-) -> Result<std::collections::HashSet<String>, String> {
-    let sessions: HashMap<String, CopilotOpenSessionState> =
-        serde_json::from_str(&contents)
-            .map_err(|error| format!("Unable to decode Copilot open-session state: {error}"))?;
-    Ok(sessions
-        .into_iter()
-        .filter_map(|(id, state)| state.working.then_some(id))
-        .collect())
-}
-
-fn active_copilot_session_ids() -> Result<std::collections::HashSet<String>, String> {
-    let mut ids = std::collections::HashSet::new();
-    for process in running_processes()? {
-        if process.command_line.contains("--acp")
-            || process.command_line.contains("sessions --")
-        {
-            continue;
-        }
-        let arguments = process
-            .command_line
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let external_id = copilot_external_session_id(&arguments, process.pid);
-        if !external_id.starts_with("pid-") {
-            ids.insert(external_id);
-        }
-    }
-    Ok(ids)
-}
-
-fn import_copilot_sessions(connection: &Connection) -> Result<(), String> {
-    let Some(store_path) = copilot_session_store_path() else {
-        return Ok(());
-    };
-    if !store_path.exists() {
-        return Ok(());
-    }
-    let store = Connection::open_with_flags(&store_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| format!("Unable to read Copilot session store: {error}"))?;
-    let working_ids = copilot_working_session_ids()?;
-    let fallback_active_ids = if working_ids.is_none() {
-        Some(active_copilot_session_ids()?)
-    } else {
-        None
-    };
-    let projects = connection
-        .prepare("SELECT id, path, branch FROM projects")
-        .map_err(|error| format!("Unable to read projects for session discovery: {error}"))?
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|error| format!("Unable to read projects for session discovery: {error}"))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("Unable to decode projects for session discovery: {error}"))?;
-
-    for (project_id, project_path, project_branch) in projects {
-        let mut sessions = store
-            .prepare(
-                "SELECT id, COALESCE(summary, ''), COALESCE(branch, ?2),
-                        COALESCE(created_at, ''), COALESCE(updated_at, ''),
-                        COALESCE((
-                          SELECT SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0))
-                          FROM assistant_usage_events usage
-                          WHERE usage.session_id = sessions.id
-                        ), 0)
-                 FROM sessions
-                 WHERE cwd = ?1
-                 ORDER BY updated_at DESC",
-            )
-            .map_err(|error| format!("Unable to query Copilot sessions: {error}"))?;
-        let rows = sessions
-            .query_map(params![project_path.as_str(), project_branch.as_str()], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            })
-            .map_err(|error| format!("Unable to decode Copilot sessions: {error}"))?;
-
-        for row in rows {
-            let (external_id, summary, branch, created_at, updated_at, token_count) =
-                match row {
-                    Ok(value) => value,
-                    Err(error) => {
-                        eprintln!("Unable to decode one Copilot session; skipping remaining discovered sessions: {error}");
-                        break;
-                    }
-                };
-            let managed: bool = connection
-                .query_row(
-                    "SELECT EXISTS(
-                       SELECT 1 FROM agent_sessions
-                       WHERE provider = 'copilot' AND external_session_id = ?1
-                         AND origin = 'managed'
-                     )",
-                    [&external_id],
-                    |value| value.get(0),
-                )
-                .map_err(|error| format!("Unable to inspect Copilot session ownership: {error}"))?;
-            if managed {
-                continue;
-            }
-            let active = working_ids
-                .as_ref()
-                .map(|ids| ids.contains(&external_id))
-                .or_else(|| fallback_active_ids.as_ref().map(|ids| ids.contains(&external_id)))
-                .unwrap_or(false);
-            let last_event = if active {
-                "Copilot process is using this session"
-            } else {
-                "Available to resume in Copilot CLI"
-            };
-            let session_id = format!("copilot-{external_id}");
-            connection
-                .execute(
-                    "INSERT INTO agent_sessions
-                     (id, project_id, provider, external_session_id, task, branch,
-                      status, status_reason, current_step, token_count,
-                      permission_mode, origin, last_event, started_at, last_seen_at)
-                     VALUES (?1, ?2, 'copilot', ?3, ?4, ?5, ?6, ?7, ?8, ?9,
-                             'unknown', 'observed', ?10, ?11, ?12)
-                     ON CONFLICT(provider, external_session_id) DO UPDATE SET
-                       project_id = excluded.project_id,
-                       task = excluded.task,
-                       branch = excluded.branch,
-                       status = excluded.status,
-                       status_reason = excluded.status_reason,
-                       current_step = excluded.current_step,
-                       token_count = excluded.token_count,
-                       last_event = excluded.last_event,
-                       started_at = excluded.started_at,
-                       last_seen_at = excluded.last_seen_at,
-                       updated_at = CURRENT_TIMESTAMP
-                     WHERE agent_sessions.origin = 'observed'",
-                    params![
-                        session_id,
-                        project_id,
-                        external_id,
-                        if summary.is_empty() {
-                            "(untitled Copilot session)"
-                        } else {
-                            &summary
-                        },
-                        if branch.is_empty() {
-                            project_branch.as_str()
-                        } else {
-                            branch.as_str()
-                        },
-                        if active { "running" } else { "idle" },
-                        if active {
-                            "Active Copilot process"
-                        } else {
-                            "Saved Copilot session"
-                        },
-                        if active { "In use" } else { "Not currently in use" },
-                        token_count,
-                        last_event,
-                        created_at,
-                        updated_at,
-                    ],
-                )
-                .map_err(|error| format!("Unable to persist Copilot session: {error}"))?;
-        }
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -952,10 +852,137 @@ fn list_agent_sessions(
         .0
         .lock()
         .map_err(|_| "Agent session database is unavailable.".to_owned())?;
-    if let Err(error) = import_copilot_sessions(&connection) {
-        eprintln!("Unable to discover Copilot sessions: {error}");
+    list_agent_sessions_from_connection(
+        &connection,
+        project_id.as_deref(),
+        status.as_deref(),
+        archived,
+    )
+}
+
+#[tauri::command]
+fn send_session_message(
+    session_id: String,
+    message: String,
+    database: State<'_, Database>,
+    processes: State<'_, SessionProcesses>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let control = processes
+        .0
+        .lock()
+        .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "This session is not connected to a managed Copilot process.".to_owned())?;
+    send_copilot_message(&database.0, &session_id, &control, &message, &app, false)
+}
+
+#[tauri::command]
+fn get_pending_session_permission(
+    session_id: String,
+    processes: State<'_, SessionProcesses>,
+) -> Result<Option<PendingPermission>, String> {
+    let active = processes
+        .0
+        .lock()
+        .map_err(|_| "Agent session process list is unavailable.".to_owned())?;
+    let Some(control) = active.get(&session_id) else {
+        return Ok(None);
+    };
+    Ok(control
+        .permission_requests
+        .lock()
+        .map_err(|_| "Copilot permission state is unavailable.".to_owned())?
+        .values()
+        .next()
+        .map(|(_, permission)| permission.clone()))
+}
+
+#[tauri::command]
+fn respond_session_permission(
+    session_id: String,
+    request_id: String,
+    option_id: Option<String>,
+    database: State<'_, Database>,
+    processes: State<'_, SessionProcesses>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let control = processes
+        .0
+        .lock()
+        .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "This session is not connected to Copilot.".to_owned())?;
+    let (protocol_id, permission) = control
+        .permission_requests
+        .lock()
+        .map_err(|_| "Copilot permission state is unavailable.".to_owned())?
+        .get(&request_id)
+        .cloned()
+        .ok_or_else(|| "This Copilot permission request is no longer active.".to_owned())?;
+    let outcome = permission_outcome(&permission, option_id.as_deref())?;
+    send_acp_message(
+        &control.input,
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": protocol_id,
+            "result": { "outcome": outcome }
+        }),
+    )?;
+    control
+        .permission_requests
+        .lock()
+        .map_err(|_| "Copilot permission state is unavailable.".to_owned())?
+        .remove(&request_id);
+    update_session_status(
+        &database.0,
+        &session_id,
+        "running",
+        "Copilot is continuing",
+        "",
+    )?;
+    app.emit("agent-session-updated", &session_id)
+        .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn stop_agent_session(
+    session_id: String,
+    database: State<'_, Database>,
+    processes: State<'_, SessionProcesses>,
+) -> Result<(), String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    let managed: bool = connection
+        .query_row(
+            "SELECT origin = 'managed' FROM agent_sessions WHERE id = ?1",
+            [&session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to find agent session: {error}"))?;
+    if !managed {
+        return Err("Only Agent Control Plane-managed sessions can be stopped.".to_owned());
     }
-    list_agent_sessions_from_connection(&connection, project_id.as_deref(), status.as_deref(), archived)
+    drop(connection);
+    let control = processes
+        .0
+        .lock()
+        .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "This session is not running in Agent Control Plane.".to_owned())?;
+    control.stop_requested.store(true, Ordering::Relaxed);
+    control
+        .child
+        .lock()
+        .map_err(|_| "Copilot process state is unavailable.".to_owned())?
+        .kill()
+        .map_err(|error| format!("Unable to stop Copilot session: {error}"))
 }
 
 #[tauri::command]
@@ -1028,15 +1055,245 @@ fn persist_copilot_observation(
     Ok(())
 }
 
+fn spawn_copilot_acp(
+    project_path: &str,
+    session_id: &str,
+    database: Arc<Mutex<Connection>>,
+    processes: Arc<Mutex<HashMap<String, SessionControl>>>,
+    app: tauri::AppHandle,
+) -> Result<SessionControl, String> {
+    let mut child = Command::new(copilot_executable())
+        .arg("--acp")
+        .current_dir(project_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Unable to start Copilot ACP: {error}"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Copilot did not provide an input stream.".to_owned())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Copilot did not provide an output stream.".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Copilot did not provide an error stream.".to_owned())?;
+    let child = Arc::new(Mutex::new(child));
+    let (input, input_rx) = mpsc::channel::<String>();
+    let control = SessionControl {
+        input,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        permission_requests: Arc::new(Mutex::new(HashMap::new())),
+        next_request_id: Arc::new(AtomicU64::new(1)),
+        stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        child: child.clone(),
+        assistant_message_id: Arc::new(Mutex::new(None)),
+    };
+
+    thread::spawn(move || {
+        let mut writer = std::io::BufWriter::new(stdin);
+        for message in input_rx {
+            if writeln!(writer, "{message}")
+                .and_then(|_| writer.flush())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            if line.is_err() {
+                break;
+            }
+        }
+    });
+
+    let reader_control = control.clone();
+    let reader_session_id = session_id.to_owned();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else {
+                break;
+            };
+            let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                let _ = update_session_status(
+                    &database,
+                    &reader_session_id,
+                    "failed",
+                    "Invalid Copilot protocol output",
+                    "Copilot returned invalid ACP JSON.",
+                );
+                let _ = app.emit("agent-session-updated", &reader_session_id);
+                continue;
+            };
+
+            if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+                let request_id = message["id"].to_string();
+                let options = message["params"]["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|option| {
+                        Some(PermissionOption {
+                            option_id: option.get("optionId")?.as_str()?.to_owned(),
+                            name: option.get("name")?.as_str()?.to_owned(),
+                            kind: option.get("kind")?.as_str()?.to_owned(),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let permission = PendingPermission {
+                    request_id: request_id.clone(),
+                    title: message["params"]["toolCall"]["title"]
+                        .as_str()
+                        .unwrap_or("Copilot requested tool permission")
+                        .to_owned(),
+                    options,
+                };
+                if let Ok(mut requests) = reader_control.permission_requests.lock() {
+                    requests.insert(request_id, (message["id"].clone(), permission.clone()));
+                }
+                let observation = CopilotObservation {
+                    status: Some("waiting".to_owned()),
+                    step: Some("Waiting for permission".to_owned()),
+                    last_event: Some(permission.title.clone()),
+                };
+                let _ = persist_copilot_observation(&database, &reader_session_id, &observation);
+                if permission.options.is_empty() {
+                    let _ = send_acp_message(
+                        &reader_control.input,
+                        serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": message["id"],
+                            "result": { "outcome": { "outcome": "cancelled" } }
+                        }),
+                    );
+                    if let Ok(mut requests) = reader_control.permission_requests.lock() {
+                        requests.remove(&permission.request_id);
+                    }
+                } else {
+                    let _ = app.emit(
+                        "agent-session-permission-requested",
+                        serde_json::json!({
+                            "sessionId": reader_session_id,
+                            "permission": permission
+                        }),
+                    );
+                }
+                let _ = app.emit("agent-session-updated", &reader_session_id);
+                continue;
+            }
+
+            if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                if let Ok(mut pending) = reader_control.pending.lock() {
+                    if let Some(sender) = pending.remove(&id) {
+                        let _ = sender.send(message);
+                    }
+                }
+                continue;
+            }
+
+            match copilot_observation_from_line(&line) {
+                Ok(Some(observation)) => {
+                    if message["params"]["update"]["sessionUpdate"].as_str()
+                        == Some("agent_message_chunk")
+                    {
+                        if let Some(content) =
+                            copilot_content_text(&message["params"]["update"]["content"])
+                        {
+                            if let Ok(message_id) = reader_control.assistant_message_id.lock() {
+                                if let Some(message_id) = message_id.as_deref() {
+                                    let _ = append_assistant_chunk(
+                                        &database,
+                                        &reader_session_id,
+                                        message_id,
+                                        &content,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let _ =
+                        persist_copilot_observation(&database, &reader_session_id, &observation);
+                    let _ = app.emit("agent-session-updated", &reader_session_id);
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = update_session_status(
+                        &database,
+                        &reader_session_id,
+                        "failed",
+                        "Copilot protocol error",
+                        &error,
+                    );
+                    let _ = app.emit("agent-session-updated", &reader_session_id);
+                }
+            }
+        }
+
+        if let Ok(mut pending) = reader_control.pending.lock() {
+            for (_, sender) in pending.drain() {
+                let _ = sender.send(serde_json::json!({
+                    "error": { "message": "Copilot ACP process exited before responding." }
+                }));
+            }
+        }
+        let success = child
+            .lock()
+            .map(|mut process| {
+                process
+                    .wait()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        let stopped = reader_control.stop_requested.load(Ordering::Relaxed);
+        let status = if success || stopped {
+            "completed"
+        } else {
+            "failed"
+        };
+        let reason = if stopped {
+            "Stopped by user."
+        } else if success {
+            "Copilot ACP session ended."
+        } else {
+            "Copilot ACP process exited unexpectedly."
+        };
+        let _ = update_session_status(&database, &reader_session_id, status, reason, reason);
+        if let Ok(mut active) = processes.lock() {
+            active.remove(&reader_session_id);
+        }
+        let _ = app.emit("agent-session-updated", &reader_session_id);
+    });
+
+    Ok(control)
+}
+
 #[tauri::command]
 fn start_copilot_session(
     project_id: Option<String>,
     task: String,
     resume_session_id: Option<String>,
     database: State<'_, Database>,
+    processes: State<'_, SessionProcesses>,
     app: tauri::AppHandle,
 ) -> Result<AgentSession, String> {
     let mut task = task.trim().to_owned();
+    if let Some(resume_session_id) = resume_session_id.as_deref() {
+        if processes
+            .0
+            .lock()
+            .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+            .contains_key(resume_session_id)
+        {
+            return Err("This Copilot session is already connected.".to_owned());
+        }
+    }
     let (project_id, project_path, branch, session_id, resume_external_id) = {
         let connection = database
             .0
@@ -1099,56 +1356,196 @@ fn start_copilot_session(
         });
     }
 
-    let args = copilot_start_args(&task, resume_external_id.as_deref());
-    let mut child = spawn_copilot_terminal(&project_path, &args)?;
-    let pid = child.id();
-
     {
         let connection = database
             .0
             .lock()
             .map_err(|_| "Agent session database is unavailable.".to_owned())?;
         if resume_external_id.is_some() {
-            connection
-                .execute(
-                    "UPDATE agent_sessions
+            connection.execute(
+                "UPDATE agent_sessions
                      SET project_id = ?2, task = ?3, branch = ?4, status = 'starting',
                          status_reason = '', current_step = 'Starting Copilot session',
-                         origin = 'managed', pid = ?5, archived = 0,
+                         origin = 'managed', archived = 0,
                          updated_at = CURRENT_TIMESTAMP
                      WHERE id = ?1",
-                    params![session_id, project_id, task, branch, pid],
-                )
+                params![session_id, project_id, task, branch],
+            )
         } else {
-            connection
-                .execute(
-                    "INSERT INTO agent_sessions
+            connection.execute(
+                "INSERT INTO agent_sessions
                      (id, project_id, provider, task, branch, status, status_reason,
-                      current_step, permission_mode, origin, pid, last_event)
+                      current_step, permission_mode, origin, last_event)
                      VALUES (?1, ?2, 'copilot', ?3, ?4, 'starting', '',
-                             'Starting Copilot session', 'plan', 'managed', ?5, '')",
-                    params![session_id, project_id, task, branch, pid],
-                )
+                             'Starting Copilot session', 'plan', 'managed', '')",
+                params![session_id, project_id, task, branch],
+            )
         }
-            .map_err(|error| format!("Unable to persist Copilot session: {error}"))?;
+        .map_err(|error| format!("Unable to persist Copilot session: {error}"))?;
     }
 
-    let database_ref = database.0.clone();
-    let completed_session_id = session_id.clone();
-    thread::spawn(move || {
-        let success = child.wait().map(|status| status.success()).unwrap_or(false);
-        let observation = CopilotObservation {
-            status: Some(if success { "completed" } else { "failed" }.to_owned()),
-            step: Some(if success { "Prompt completed" } else { "Copilot process exited" }.to_owned()),
-            last_event: Some(if success {
-                "Copilot terminal session completed"
-            } else {
-                "Copilot terminal session exited unexpectedly"
-            }.to_owned()),
-        };
-        let _ = persist_copilot_observation(&database_ref, &completed_session_id, &observation);
-        let _ = app.emit("agent-session-updated", &completed_session_id);
-    });
+    let processes_ref = processes.0.clone();
+    let control = match spawn_copilot_acp(
+        &project_path,
+        &session_id,
+        database.0.clone(),
+        processes_ref.clone(),
+        app.clone(),
+    ) {
+        Ok(control) => control,
+        Err(error) => {
+            update_session_status(
+                &database.0,
+                &session_id,
+                "failed",
+                "Unable to start Copilot ACP",
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
+    let initialization = acp_request(
+        &control,
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": 1,
+            "clientCapabilities": {},
+            "clientInfo": {
+                "name": "Agent Control Plane",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        }),
+    );
+    if let Err(error) = initialization {
+        let _ = control.child.lock().map(|mut process| process.kill());
+        update_session_status(
+            &database.0,
+            &session_id,
+            "failed",
+            "Copilot initialization failed",
+            &error,
+        )?;
+        return Err(error);
+    }
+
+    let session_result = if let Some(external_id) = resume_external_id.as_deref() {
+        acp_request(
+            &control,
+            "session/load",
+            serde_json::json!({
+                "cwd": project_path,
+                "sessionId": external_id,
+                "mcpServers": []
+            }),
+        )
+    } else {
+        acp_request(
+            &control,
+            "session/new",
+            serde_json::json!({
+                "cwd": project_path,
+                "mcpServers": []
+            }),
+        )
+    };
+    let session_result = match session_result {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = control.child.lock().map(|mut process| process.kill());
+            update_session_status(
+                &database.0,
+                &session_id,
+                "failed",
+                "Unable to load Copilot session",
+                &error,
+            )?;
+            return Err(error);
+        }
+    };
+    let external_id = session_result
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or(resume_external_id);
+    let Some(external_id) = external_id else {
+        let error = "Copilot did not return a session identifier.".to_owned();
+        let _ = control.child.lock().map(|mut process| process.kill());
+        update_session_status(
+            &database.0,
+            &session_id,
+            "failed",
+            "Invalid Copilot session response",
+            &error,
+        )?;
+        return Err(error);
+    };
+    {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        connection
+            .execute(
+                "UPDATE agent_sessions
+                 SET external_session_id = ?2, pid = ?3, status = ?4,
+                     current_step = ?5, status_reason = '',
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                params![
+                    session_id,
+                    external_id,
+                    control
+                        .child
+                        .lock()
+                        .map_err(|_| "Copilot process state is unavailable.".to_owned())?
+                        .id(),
+                    if resume_session_id.is_none() {
+                        "running"
+                    } else {
+                        "idle"
+                    },
+                    if resume_session_id.is_none() {
+                        "Sending initial prompt"
+                    } else {
+                        "Ready for your message"
+                    }
+                ],
+            )
+            .map_err(|error| format!("Unable to save Copilot protocol session ID: {error}"))?;
+    }
+    processes_ref
+        .lock()
+        .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+        .insert(session_id.clone(), control.clone());
+
+    if resume_session_id.is_none() {
+        let database_ref = database.0.clone();
+        let initial_control = control.clone();
+        let initial_session_id = session_id.clone();
+        let initial_task = task.clone();
+        let initial_app = app.clone();
+        thread::spawn(move || {
+            if let Err(error) = send_copilot_message(
+                &database_ref,
+                &initial_session_id,
+                &initial_control,
+                &initial_task,
+                &initial_app,
+                true,
+            ) {
+                let _ = update_session_status(
+                    &database_ref,
+                    &initial_session_id,
+                    "failed",
+                    "Unable to send initial prompt",
+                    &error,
+                );
+                let _ = initial_app.emit("agent-session-updated", &initial_session_id);
+            }
+        });
+    }
+    app.emit("agent-session-updated", &session_id)
+        .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
 
     let connection = database
         .0
@@ -1278,7 +1675,26 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            payload TEXT NOT NULL,
            observed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            UNIQUE(session_id, sequence)
+         );
+         CREATE TABLE IF NOT EXISTS session_messages (
+           id TEXT PRIMARY KEY NOT NULL,
+           session_id TEXT NOT NULL,
+           sequence INTEGER NOT NULL,
+           role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
+           content TEXT NOT NULL DEFAULT '',
+           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           UNIQUE(session_id, sequence)
          );",
+    )?;
+    connection.execute(
+        "UPDATE agent_sessions
+         SET status = 'orphaned',
+             status_reason = 'Agent Control Plane restarted; reconnect the session to continue.',
+             current_step = 'Reconnect required',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE origin = 'managed'
+           AND status IN ('starting', 'running', 'waiting', 'idle')",
+        [],
     )?;
     connection
         .execute(
@@ -1286,7 +1702,10 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             [],
         )
         .or_else(|error| {
-            if error.to_string().contains("duplicate column name: archived") {
+            if error
+                .to_string()
+                .contains("duplicate column name: archived")
+            {
                 Ok(0)
             } else {
                 Err(error)
@@ -1311,11 +1730,16 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             app.manage(open_database(app.handle())?);
+            app.manage(SessionProcesses(Arc::new(Mutex::new(HashMap::new()))));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             list_projects,
             list_agent_sessions,
+            send_session_message,
+            get_pending_session_permission,
+            respond_session_permission,
+            stop_agent_session,
             set_session_archived,
             get_session_transcript,
             start_copilot_session,
@@ -1378,6 +1802,45 @@ mod tests {
     }
 
     #[test]
+    fn transcript_messages_are_persisted_and_streamed_in_the_local_database() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        let user_id = insert_session_message(&connection, "session-1", "user", "Check the tests")
+            .expect("user message");
+        let assistant_id =
+            insert_session_message(&connection, "session-1", "assistant", "").expect("assistant");
+        assert_ne!(user_id, assistant_id);
+
+        let database = Arc::new(Mutex::new(connection));
+        append_assistant_chunk(&database, "session-1", &assistant_id, "All tests ")
+            .expect("first response chunk");
+        append_assistant_chunk(&database, "session-1", &assistant_id, "passed.")
+            .expect("second response chunk");
+
+        let connection = database.lock().expect("database lock");
+        let mut messages = connection
+            .prepare(
+                "SELECT role, content FROM session_messages
+                 WHERE session_id = ?1 ORDER BY sequence",
+            )
+            .expect("query");
+        let values = messages
+            .query_map(["session-1"], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("message values");
+        assert_eq!(
+            values,
+            vec![
+                ("user".to_owned(), "Check the tests".to_owned()),
+                ("assistant".to_owned(), "All tests passed.".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
     fn session_status_validation_rejects_unknown_states() {
         assert!(validate_session_status("running").is_ok());
         assert!(validate_session_status("waiting").is_ok());
@@ -1411,7 +1874,10 @@ mod tests {
             .expect("valid ACP message")
             .expect("agent message observation");
 
-        assert_eq!(observation.last_event.as_deref(), Some("Checking the repository"));
+        assert_eq!(
+            observation.last_event.as_deref(),
+            Some("Checking the repository")
+        );
     }
 
     #[test]
@@ -1427,47 +1893,30 @@ mod tests {
     }
 
     #[test]
+    fn permission_response_only_uses_provider_supplied_options() {
+        let permission = PendingPermission {
+            request_id: "7".to_owned(),
+            title: "Run tests".to_owned(),
+            options: vec![PermissionOption {
+                option_id: "allow_once".to_owned(),
+                name: "Allow once".to_owned(),
+                kind: "allow_once".to_owned(),
+            }],
+        };
+
+        assert_eq!(
+            permission_outcome(&permission, Some("allow_once")).expect("known choice"),
+            serde_json::json!({ "outcome": "selected", "optionId": "allow_once" })
+        );
+        assert!(permission_outcome(&permission, Some("allow_all")).is_err());
+        assert_eq!(
+            permission_outcome(&permission, None).expect("cancel choice"),
+            serde_json::json!({ "outcome": "cancelled" })
+        );
+    }
+
+    #[test]
     fn malformed_copilot_output_is_an_error() {
         assert!(copilot_observation_from_line("not-json").is_err());
     }
-
-    #[test]
-    fn copilot_session_id_prefers_resume_id_over_process_id() {
-        let arguments = vec![
-            "copilot".to_owned(),
-            "--yolo".to_owned(),
-            "--resume=abc-123".to_owned(),
-        ];
-
-        assert_eq!(
-            copilot_external_session_id(&arguments, 42),
-            "abc-123"
-        );
-        assert_eq!(
-            copilot_external_session_id(&["copilot".to_owned()], 42),
-            "pid-42"
-        );
-        assert_eq!(
-            copilot_external_session_id(
-                &["copilot".to_owned(), "--resume".to_owned(), "def-456".to_owned()],
-                42
-            ),
-            "def-456"
-        );
-    }
-
-    #[test]
-    fn copilot_open_session_state_only_marks_working_sessions() {
-        let working = copilot_working_session_ids_from_json(
-            r#"{
-                "working-session": {"schemaVersion": 1, "working": true},
-                "idle-session": {"schemaVersion": 1, "working": false}
-            }"#,
-        )
-        .expect("valid open-session state");
-
-        assert!(working.contains("working-session"));
-        assert!(!working.contains("idle-session"));
-    }
-
 }

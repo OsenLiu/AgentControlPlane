@@ -55,6 +55,12 @@ type TranscriptMessage = {
   timestamp: string;
 };
 
+type PermissionRequest = {
+  requestId: string;
+  title: string;
+  options: { optionId: string; name: string; kind: string }[];
+};
+
 function formatLocalTimestamp(value: string) {
   const normalized = value.includes("T") || value.endsWith("Z")
     ? value
@@ -183,7 +189,7 @@ function SessionStatusBadge({ status }: { status: SessionStatus }) {
     starting: "Starting",
     running: "Running",
     waiting: "Waiting for you",
-    idle: "Not in use",
+    idle: "Ready",
     paused: "Paused",
     completed: "Completed",
     failed: "Failed",
@@ -211,8 +217,12 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   const [task, setTask] = useState("Start a new Copilot session");
   const [starting, setStarting] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [sendingMessage, setSendingMessage] = useState(false);
+  const [stoppingSession, setStoppingSession] = useState(false);
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
+  const [messageDraft, setMessageDraft] = useState("");
+  const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [archivedView, setArchivedView] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
   const visibleSessions = sessions.filter((session) => {
@@ -241,6 +251,8 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
 
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
+    let unsubscribePermission: (() => void) | undefined;
+    setPermissionRequest(null);
     void listen<string>("agent-session-updated", (event) => {
       void loadSessions();
       if (event.payload === selectedSession?.id) {
@@ -249,7 +261,26 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
     }).then((unlisten) => {
       unsubscribe = unlisten;
     });
-    return () => unsubscribe?.();
+    void listen<{ sessionId: string; permission: PermissionRequest }>("agent-session-permission-requested", (event) => {
+      if (event.payload.sessionId === selectedSession?.id) {
+        setPermissionRequest(event.payload.permission);
+      }
+    }).then((unlisten) => {
+      unsubscribePermission = unlisten;
+    });
+    if (selectedSession) {
+      void invoke<PermissionRequest | null>("get_pending_session_permission", {
+        sessionId: selectedSession.id,
+      }).then(setPermissionRequest).catch((reason) => {
+        setLoadError(reason instanceof Error ? reason.message : String(reason));
+      });
+    } else {
+      setPermissionRequest(null);
+    }
+    return () => {
+      unsubscribe?.();
+      unsubscribePermission?.();
+    };
   }, [selectedSession?.id]);
 
   async function loadSessions(showArchived = archivedView) {
@@ -333,6 +364,56 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
     }
   }
 
+  async function sendMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedSession || !messageDraft.trim()) return;
+    setSendingMessage(true);
+    setLoadError("");
+    try {
+      await invoke("send_session_message", {
+        sessionId: selectedSession.id,
+        message: messageDraft,
+      });
+      setMessageDraft("");
+      await loadTranscript(selectedSession.id);
+      await loadSessions();
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+      await loadTranscript(selectedSession.id);
+    } finally {
+      setSendingMessage(false);
+    }
+  }
+
+  async function stopSession() {
+    if (!selectedSession) return;
+    setStoppingSession(true);
+    setLoadError("");
+    try {
+      await invoke("stop_agent_session", { sessionId: selectedSession.id });
+      await loadSessions();
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setStoppingSession(false);
+    }
+  }
+
+  async function respondToPermission(optionId: string | null) {
+    if (!selectedSession || !permissionRequest) return;
+    setLoadError("");
+    try {
+      await invoke("respond_session_permission", {
+        sessionId: selectedSession.id,
+        requestId: permissionRequest.requestId,
+        optionId,
+      });
+      setPermissionRequest(null);
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
   if (!selectedSession) {
     return <div className="sessions-page">
       <header className="sessions-header">
@@ -341,7 +422,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
       </header>
       <div className="empty-sessions-state">
         <h2>{loading ? "Loading agent sessions…" : "No agent sessions yet"}</h2>
-        <p>{loadError || "The supervisor will show Copilot CLI sessions here after they are discovered or started."}</p>
+        <p>{loadError || "Start a Copilot CLI session here to create a locally managed conversation."}</p>
         {!loading && projects.length > 0 && <form className="session-launch-card" onSubmit={startSession}>
           <label className="field-label" htmlFor="session-project">PROJECT</label>
           <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)}>
@@ -379,6 +460,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
         <button className="primary-button" type="submit" disabled={starting || projects.length === 0 || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
       </form>}
+      {loadError && <p className="session-error" role="alert">{loadError}</p>}
 
       <section className="session-summary-grid" aria-label="Session summary">
         <article className="session-summary-card"><span className="summary-icon running-icon">◉</span><div><strong>{sessions.filter((session) => session.status === "running").length}</strong><span>Running now</span></div><small>Live output streaming</small></article>
@@ -424,7 +506,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
             <div className="detail-title"><div className={`session-avatar avatar-${selectedSession.status}`}>{selectedSession.project.charAt(0)}</div><div><div className="detail-name-row"><h2>{selectedSession.task}</h2><SessionStatusBadge status={selectedSession.status} /></div><p>{selectedSession.project} <span>·</span> <code>{selectedSession.branch}</code></p></div></div>
             <div className="detail-actions">
               <button className="secondary-button archive-button" onClick={() => void updateArchiveState()} disabled={resuming}>{archivedView ? "Unarchive session" : "Archive session"}</button>
-              {selectedSession.provider === "copilot" && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
+              {selectedSession.managed && selectedSession.provider === "copilot" && ["completed", "failed", "orphaned"].includes(selectedSession.status) && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
             </div>
           </div>
           <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
@@ -445,10 +527,39 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
           </div>
 
           <div className="control-panel">
-            <div className="control-panel-heading"><div><h3>Supervisor controls</h3><span>Changes apply to the running process.</span></div><span className={`managed-state ${selectedSession.managed ? "managed" : ""}`}><span /> {selectedSession.managed ? "App managed" : "Read only"}</span></div>
-            <div className="permission-row"><span className="control-label">Permission mode</span><div className="permission-options">{(["Plan", "Accept edits", "Auto"] as const).map((mode) => <button key={mode} className={selectedSession.permissionMode.toLowerCase() === mode.toLowerCase() ? "selected" : ""} disabled>{mode}</button>)}</div></div>
-            <div className="reply-row"><input disabled placeholder="Supervisor commands will be enabled in the Copilot process slice" aria-label="Reply to agent" /><button className="primary-button" disabled>Send reply <span>↗</span></button></div>
-            <div className="control-actions"><button className="secondary-button" disabled>Ⅱ Pause session</button><button className="danger-button" disabled>Stop session</button></div>
+            <div className="control-panel-heading"><div><h3>Chat with Copilot</h3><span>Messages and responses are saved in Agent Control Plane.</span></div><span className={`managed-state ${selectedSession.managed ? "managed" : ""}`}><span /> {selectedSession.managed ? "App managed" : "Read only"}</span></div>
+            {permissionRequest && <div className="permission-request" role="group" aria-label="Copilot permission request">
+              <strong>{permissionRequest.title}</strong>
+              <span>Choose an option to let Copilot continue.</span>
+              <div>{permissionRequest.options.map((option) => <button key={option.optionId} className="secondary-button" onClick={() => void respondToPermission(option.optionId)}>{option.name}</button>)}
+                <button className="danger-button" onClick={() => void respondToPermission(null)}>Cancel request</button>
+              </div>
+            </div>}
+            <form className="reply-row" onSubmit={sendMessage}>
+              <input
+                value={messageDraft}
+                onChange={(event) => setMessageDraft(event.currentTarget.value)}
+                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting" || selectedSession.status === "waiting"}
+                placeholder={selectedSession.managed ? "Message Copilot…" : "This session is read only"}
+                aria-label="Message Copilot"
+              />
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || !messageDraft.trim() || selectedSession.status === "running" || selectedSession.status === "starting" || selectedSession.status === "waiting"}
+              >
+                {sendingMessage ? "Sending…" : "Send"} <span>↗</span>
+              </button>
+            </form>
+            <div className="control-actions">
+              <button
+                className="danger-button"
+                onClick={() => void stopSession()}
+                disabled={!selectedSession.managed || stoppingSession || ["completed", "orphaned"].includes(selectedSession.status)}
+              >
+                {stoppingSession ? "Stopping…" : "Stop session"}
+              </button>
+            </div>
           </div>
         </section>
       </div>
