@@ -133,13 +133,11 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .attention-kind-icon { display: grid; place-items: center; width: 30px; height: 30px; flex: 0 0 30px; border-radius: 8px; font-size: 12px; font-weight: 700; }
 .kind-permission { color: #eabe7b; background: #604626; }
 .kind-failure { color: #f18c9a; background: #633644; }
-.kind-review { color: #8fe0bc; background: #1c5144; }
 .attention-item-copy { display: block; min-width: 0; }
 .attention-item-label { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
 .attention-kind-label { color: #a7b3cd; font-size: 8px; font-weight: 700; letter-spacing: .9px; text-transform: uppercase; }
 .kind-label-permission { color: #e4b66d; }
 .kind-label-failure { color: #ed8794; }
-.kind-label-review { color: #70d7a8; }
 .priority-label { padding: 2px 5px; border-radius: 4px; color: #c4cada; background: #2a3650; font-size: 7px; font-weight: 600; text-transform: uppercase; }
 .priority-high { color: #f18b98; background: #703b4a55; }
 .priority-medium { color: #e4b66d; background: #76552d55; }

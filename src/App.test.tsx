@@ -54,7 +54,7 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions", { archived: false });
   });
 
-  it("shows backend permissions, failures, and completed sessions and can answer a permission", async () => {
+  it("shows pending permissions and failed sessions but excludes completed and orphaned sessions", async () => {
     const sessions = [
       {
         id: "waiting-session",
@@ -155,14 +155,15 @@ describe("App", () => {
 
     expect(await screen.findAllByText("Run npm test")).toHaveLength(2);
     expect(screen.getByText("Session failed")).toBeTruthy();
-    expect(screen.getByText("Review completed session")).toBeTruthy();
-    expect(screen.getByText("Session needs reconnect")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Items to review 2" })).toBeTruthy();
+    expect(screen.queryByText("Review completed session")).toBeNull();
+    expect(screen.queryByText("Session needs reconnect")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Allow once" }));
 
     await waitFor(() => {
       expect(screen.queryByText("Run npm test")).toBeNull();
-      expect(screen.getByRole("heading", { name: "Items to review 3" })).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Items to review 1" })).toBeTruthy();
     });
 
     fireEvent.click(screen.getByRole("button", { name: /Session failed/ }));
@@ -211,6 +212,7 @@ describe("App", () => {
   it("renders a read-only session returned by the local backend", async () => {
     const session = {
       id: "observed-copilot-abc",
+      externalSessionId: "sess_actual_42",
       project: "demo",
       task: "Observed Copilot CLI session",
       branch: "main",
@@ -237,6 +239,8 @@ describe("App", () => {
     expect((await screen.findAllByText("Observed Copilot CLI session")).length).toBe(2);
     expect(screen.getByText("Read only")).toBeTruthy();
     expect(screen.getByText("Locally persisted read-only session")).toBeTruthy();
+    expect(screen.getByText("sess_actual_42")).toBeTruthy();
+    expect(screen.queryByText("sess_8f31c2")).toBeNull();
   });
 
   it("archives a session and shows it in the archived session list", async () => {

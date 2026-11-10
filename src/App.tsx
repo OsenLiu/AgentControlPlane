@@ -63,7 +63,7 @@ type PermissionRequest = {
   options: { optionId: string; name: string; kind: string }[];
 };
 
-type AttentionKind = "permission" | "failure" | "review";
+type AttentionKind = "permission" | "failure";
 
 type AttentionItem = {
   id: string;
@@ -84,7 +84,6 @@ const attentionFilters: Array<{ label: string; kind: AttentionKind | "all" }> = 
   { label: "All items", kind: "all" },
   { label: "Permissions", kind: "permission" },
   { label: "Failures", kind: "failure" },
-  { label: "Reviews", kind: "review" },
 ];
 
 async function loadAttentionItemsFromBackend(): Promise<AttentionItem[]> {
@@ -131,35 +130,19 @@ async function loadAttentionItemsFromBackend(): Promise<AttentionItem[]> {
       }];
     }
 
-    if (session.status === "failed" || session.status === "orphaned") {
+    if (session.status === "failed") {
       return [{
-        id: `${session.id}:${session.status}`,
+        id: `${session.id}:failed`,
         sessionId: session.id,
         kind: "failure" as const,
         priority: "High" as const,
-        title: session.status === "failed" ? "Session failed" : "Session needs reconnect",
+        title: "Session failed",
         project: session.project,
         branch: session.branch,
         agent: session.provider,
         updatedAt: session.updatedAt,
         summary: session.statusReason || session.lastEvent || session.step,
         context: session.step,
-      }];
-    }
-
-    if (session.managed && session.status === "completed") {
-      return [{
-        id: `${session.id}:review`,
-        sessionId: session.id,
-        kind: "review" as const,
-        priority: "Medium" as const,
-        title: "Review completed session",
-        project: session.project,
-        branch: session.branch,
-        agent: session.provider,
-        updatedAt: session.updatedAt,
-        summary: session.task,
-        context: session.lastEvent || "The managed session has completed. Review its transcript before archiving it.",
       }];
     }
 
@@ -789,7 +772,7 @@ function AttentionInboxView({
         <div>
           <p className="eyebrow">WORKSPACE / REVIEW QUEUE</p>
           <h1>Attention inbox</h1>
-          <p className="subtitle">Review pending permissions, failed sessions, and completed work.</p>
+          <p className="subtitle">Review pending permissions and failed sessions that need your attention.</p>
         </div>
         <div className="attention-header-actions">
           <span className="attention-live-badge"><span /> Local session data</span>
@@ -891,7 +874,7 @@ function AttentionInboxView({
                   <>
                     <span>✓</span>
                     <strong>You’re all caught up</strong>
-                    <p>Pending permissions, failed sessions, and completed sessions awaiting review will appear here.</p>
+                    <p>Pending permissions and failed sessions will appear here.</p>
                   </>
                 ) : (
                   <>
@@ -915,7 +898,7 @@ function AttentionInboxView({
               <p className="attention-detail-summary">{selectedItem.summary}</p>
               <div className="attention-context">
                 <span className={`attention-kind-icon kind-${selectedItem.kind}`} aria-hidden="true">
-                  {selectedItem.kind === "permission" ? "⌘" : selectedItem.kind === "failure" ? "!" : "✓"}
+                  {selectedItem.kind === "permission" ? "⌘" : "!"}
                 </span>
                 <div>
                   <span>{selectedItem.kind === "permission" ? "Permission requested" : selectedItem.kind === "failure" ? "Session needs attention" : "Completed session"}</span>
@@ -963,7 +946,7 @@ function AttentionInboxView({
                     disabled={workingItemId === selectedItem.id}
                     onClick={() => void archiveItem(selectedItem)}
                   >
-                    {workingItemId === selectedItem.id ? "Archiving…" : selectedItem.kind === "review" ? "Archive reviewed session" : "Archive session"}
+                    {workingItemId === selectedItem.id ? "Archiving…" : "Archive session"}
                   </button>
                 )}
               </div>
@@ -1221,10 +1204,10 @@ function App() {
             <div className="inbox-card">
               {attentionLoading && attentionItems.length === 0 && <div className="empty-card">Loading attention items…</div>}
               {!attentionLoading && attentionError && attentionItems.length === 0 && <div className="empty-card">{attentionError}</div>}
-              {!attentionLoading && !attentionError && attentionItems.length === 0 && <div className="empty-card">You’re all caught up. New permissions, failures, and completed sessions will appear here.</div>}
+              {!attentionLoading && !attentionError && attentionItems.length === 0 && <div className="empty-card">You’re all caught up. New permissions and failed sessions will appear here.</div>}
               {attentionItems.slice(0, 4).map((item) => (
                 <button className="inbox-item" key={item.id} onClick={() => setActiveNav("Attention inbox")}>
-                  <span className={`inbox-icon ${item.kind === "failure" ? "failure" : item.kind === "review" ? "review" : "high"}`}>{item.kind === "permission" ? "⌘" : item.kind === "failure" ? "!" : "✓"}</span>
+                  <span className={`inbox-icon ${item.kind === "failure" ? "failure" : "high"}`}>{item.kind === "permission" ? "⌘" : "!"}</span>
                   <div><strong>{item.title}</strong><span>{item.project} · {providerLabel(item.agent)}</span></div>
                   <time>{formatLocalTimestamp(item.updatedAt)}</time>
                 </button>

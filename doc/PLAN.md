@@ -153,12 +153,11 @@ One cross-project queue containing:
 - Agent questions.
 - Permission requests.
 - Exhausted retries and failures.
-- Completed runs awaiting review.
 - Provider failures that require action.
 
 Each item must be answerable in place, show enough context to act, support filtering/sorting, and link back to the project, task, session, transcript, diff, or external pipeline run.
 
-The current local inbox derives live entries from persisted sessions: pending ACP permission requests, failed or orphaned sessions, and completed managed sessions awaiting review. Permission choices are handled in place; other entries open their session and can be archived. Agent questions, exhausted-retry workflows, and provider-level failures are not yet emitted as distinct inbox events by the backend and must not be inferred from unrelated session text or status.
+The current local inbox derives live entries from persisted sessions: pending ACP permission requests and failed sessions. Waiting sessions without an available permission request are also surfaced for inspection. Orphaned sessions and successful completions remain available in Agent sessions but are not inbox entries. Permission choices are handled in place; failures open their session and can be archived. Agent questions, exhausted-retry workflows, and provider-level failures are not yet emitted as distinct inbox events by the backend and must not be inferred from unrelated session text or status.
 
 ### Agent sessions
 
