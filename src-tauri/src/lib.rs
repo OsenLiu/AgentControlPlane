@@ -476,6 +476,46 @@ fn append_assistant_chunk(
     Ok(())
 }
 
+fn copilot_token_count_from_message(message: &Value) -> Option<i64> {
+    let update = &message["params"]["update"];
+    if update["sessionUpdate"].as_str() != Some("usage_update") {
+        return None;
+    }
+
+    let used = &update["used"];
+    let fields = [
+        "inputTokens",
+        "outputTokens",
+        "cacheReadInputTokens",
+        "cacheCreationInputTokens",
+    ];
+    let total = fields
+        .iter()
+        .filter_map(|field| used[*field].as_u64())
+        .fold(0_u64, u64::saturating_add);
+    i64::try_from(total).ok()
+}
+
+fn update_session_token_count(
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    token_count: i64,
+) -> Result<(), String> {
+    let connection = database
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    connection
+        .execute(
+            "UPDATE agent_sessions
+             SET token_count = ?2, last_seen_at = CURRENT_TIMESTAMP,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            params![session_id, token_count],
+        )
+        .map_err(|error| format!("Unable to update agent session token usage: {error}"))?;
+    Ok(())
+}
+
 fn update_session_status(
     database: &Arc<Mutex<Connection>>,
     session_id: &str,
@@ -792,7 +832,7 @@ fn list_agent_sessions_from_connection(
              WHERE (?1 IS NULL OR s.project_id = ?1)
                AND (?2 IS NULL OR s.status = ?2)
                AND s.archived = COALESCE(?3, 0)
-             ORDER BY COALESCE(s.last_seen_at, s.updated_at) DESC",
+             ORDER BY s.started_at DESC, s.updated_at DESC, s.id DESC",
         )
         .map_err(|error| format!("Unable to read agent sessions: {error}"))?;
 
@@ -1159,6 +1199,11 @@ fn spawn_copilot_acp(
                 let _ = app.emit("agent-session-updated", &reader_session_id);
                 continue;
             };
+
+            if let Some(token_count) = copilot_token_count_from_message(&message) {
+                let _ = update_session_token_count(&database, &reader_session_id, token_count);
+                let _ = app.emit("agent-session-updated", &reader_session_id);
+            }
 
             if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
                 let request_id = message["id"].to_string();
@@ -1860,6 +1905,45 @@ mod tests {
         assert_eq!(sessions[0].status, "waiting");
         assert!(sessions[0].managed);
         assert_eq!(sessions[0].tokens, "12.8k");
+    }
+
+    #[test]
+    fn archived_sessions_are_sorted_by_start_date_descending() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, path, branch, current_commit, git_state)
+                 VALUES ('project-1', 'Control Plane', '/tmp/control-plane', 'main', 'abc', 'clean')",
+                [],
+            )
+            .expect("project");
+        for (id, started_at) in [
+            ("older", "2026-11-08 10:00:00"),
+            ("newer", "2026-11-10 10:00:00"),
+            ("middle", "2026-11-09 10:00:00"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO agent_sessions
+                     (id, project_id, provider, task, branch, status, started_at, archived)
+                     VALUES (?1, 'project-1', 'copilot', ?1, 'main', 'completed', ?2, 1)",
+                    params![id, started_at],
+                )
+                .expect("session");
+        }
+
+        let sessions =
+            list_agent_sessions_from_connection(&connection, None, None, Some(true))
+                .expect("session query");
+
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["newer", "middle", "older"]
+        );
     }
 
     #[test]

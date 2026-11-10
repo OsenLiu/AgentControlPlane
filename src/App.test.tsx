@@ -183,13 +183,21 @@ describe("App", () => {
       managed: true,
       lastEvent: "Available to resume in Copilot CLI",
     };
+    let resumed = false;
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_projects") return [];
       if (command === "load_settings") return settings;
-      if (command === "list_agent_sessions") return [session];
+      if (command === "list_agent_sessions") return [{
+        ...session,
+        status: resumed ? "idle" : "completed",
+        step: resumed ? "Ready for your message" : "Finished",
+      }];
       if (command === "get_pending_session_permission") return null;
       if (command === "get_session_transcript") return [];
-      if (command === "start_copilot_session") return session;
+      if (command === "start_copilot_session") {
+        resumed = true;
+        return { ...session, status: "idle" };
+      }
       throw new Error(`Unexpected command: ${command}`);
     });
 
@@ -203,6 +211,7 @@ describe("App", () => {
       task: "",
       resumeSessionId: "session-to-resume",
     }));
+    expect(await screen.findByRole("button", { name: "Stop session" })).toBeEnabled();
   });
 
   it("sends a chat message to a managed Copilot session", async () => {

@@ -338,6 +338,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         resumeSessionId: selectedSession.id,
       });
       setArchivedView(false);
+      await loadSessions(false);
     } catch (reason) {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
     } finally {
