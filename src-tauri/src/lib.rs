@@ -849,7 +849,7 @@ fn list_agent_sessions_from_connection(
              WHERE (?1 IS NULL OR s.project_id = ?1)
                AND (?2 IS NULL OR s.status = ?2)
                AND s.archived = COALESCE(?3, 0)
-             ORDER BY s.started_at DESC, s.updated_at DESC, s.id DESC",
+             ORDER BY s.updated_at DESC, s.started_at DESC, s.id DESC",
         )
         .map_err(|error| format!("Unable to read agent sessions: {error}"))?;
 
@@ -1958,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_sessions_are_sorted_by_start_date_descending() {
+    fn archived_sessions_are_sorted_by_last_updated_descending() {
         let connection = Connection::open_in_memory().expect("in-memory database");
         initialize_schema(&connection).expect("schema");
         connection
@@ -1968,17 +1968,17 @@ mod tests {
                 [],
             )
             .expect("project");
-        for (id, started_at) in [
-            ("older", "2026-11-08 10:00:00"),
-            ("newer", "2026-11-10 10:00:00"),
-            ("middle", "2026-11-09 10:00:00"),
+        for (id, started_at, updated_at) in [
+            ("started-newest", "2026-11-10 10:00:00", "2026-11-08 10:00:00"),
+            ("updated-newest", "2026-11-08 10:00:00", "2026-11-10 10:00:00"),
+            ("middle", "2026-11-09 10:00:00", "2026-11-09 10:00:00"),
         ] {
             connection
                 .execute(
                     "INSERT INTO agent_sessions
-                     (id, project_id, provider, task, branch, status, started_at, archived)
-                     VALUES (?1, 'project-1', 'copilot', ?1, 'main', 'completed', ?2, 1)",
-                    params![id, started_at],
+                     (id, project_id, provider, task, branch, status, started_at, updated_at, archived)
+                     VALUES (?1, 'project-1', 'copilot', ?1, 'main', 'completed', ?2, ?3, 1)",
+                    params![id, started_at, updated_at],
                 )
                 .expect("session");
         }
@@ -1992,7 +1992,7 @@ mod tests {
                 .iter()
                 .map(|session| session.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["newer", "middle", "older"]
+            vec!["updated-newest", "middle", "started-newest"]
         );
     }
 
