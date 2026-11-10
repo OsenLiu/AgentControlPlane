@@ -35,6 +35,7 @@ type SessionStatus = "starting" | "running" | "waiting" | "idle" | "paused" | "c
 
 type AgentSession = {
   id: string;
+  externalSessionId: string | null;
   project: string;
   task: string;
   branch: string;
@@ -47,6 +48,8 @@ type AgentSession = {
   managed: boolean;
   lastEvent: string;
   archived: boolean;
+  statusReason: string;
+  updatedAt: string;
 };
 
 type TranscriptMessage = {
@@ -54,6 +57,108 @@ type TranscriptMessage = {
   content: string;
   timestamp: string;
 };
+
+type PermissionRequest = {
+  requestId: string;
+  title: string;
+  options: { optionId: string; name: string; kind: string }[];
+};
+
+type AttentionKind = "permission" | "failure";
+
+type AttentionItem = {
+  id: string;
+  sessionId: string;
+  kind: AttentionKind;
+  priority: "High" | "Medium" | "Low";
+  title: string;
+  project: string;
+  branch: string;
+  agent: string;
+  updatedAt: string;
+  summary: string;
+  context: string;
+  permissionRequest?: PermissionRequest;
+};
+
+const attentionFilters: Array<{ label: string; kind: AttentionKind | "all" }> = [
+  { label: "All items", kind: "all" },
+  { label: "Permissions", kind: "permission" },
+  { label: "Failures", kind: "failure" },
+];
+
+async function loadAttentionItemsFromBackend(): Promise<AttentionItem[]> {
+  const sessions = await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
+  const waitingSessions = sessions.filter((session) => session.status === "waiting");
+  const permissionResults = await Promise.all(waitingSessions.map(async (session) => [
+    session.id,
+    await invoke<PermissionRequest | null>("get_pending_session_permission", { sessionId: session.id }),
+  ] as const));
+  const permissions = new Map(permissionResults.filter(([, permission]) => permission !== null));
+
+  return sessions.flatMap((session): AttentionItem[] => {
+    const permissionRequest = permissions.get(session.id) ?? undefined;
+    if (permissionRequest) {
+      return [{
+        id: `${session.id}:permission:${permissionRequest.requestId}`,
+        sessionId: session.id,
+        kind: "permission" as const,
+        priority: "High" as const,
+        title: permissionRequest.title,
+        project: session.project,
+        branch: session.branch,
+        agent: session.provider,
+        updatedAt: session.updatedAt,
+        summary: session.task,
+        context: `${permissionRequest.options.length} permission option${permissionRequest.options.length === 1 ? "" : "s"} available.`,
+        permissionRequest,
+      }];
+    }
+
+    if (session.status === "waiting") {
+      return [{
+        id: `${session.id}:waiting`,
+        sessionId: session.id,
+        kind: "failure" as const,
+        priority: "High" as const,
+        title: "Session is waiting",
+        project: session.project,
+        branch: session.branch,
+        agent: session.provider,
+        updatedAt: session.updatedAt,
+        summary: session.statusReason || session.lastEvent || session.step,
+        context: "The session is waiting, but its active permission request is unavailable. Open the session to inspect it.",
+      }];
+    }
+
+    if (session.status === "failed") {
+      return [{
+        id: `${session.id}:failed`,
+        sessionId: session.id,
+        kind: "failure" as const,
+        priority: "High" as const,
+        title: "Session failed",
+        project: session.project,
+        branch: session.branch,
+        agent: session.provider,
+        updatedAt: session.updatedAt,
+        summary: session.statusReason || session.lastEvent || session.step,
+        context: session.step,
+      }];
+    }
+
+    return [];
+  });
+}
+
+function providerLabel(provider: string) {
+  switch (provider) {
+    case "copilot": return "GitHub Copilot";
+    case "claudeCode": return "Claude Code";
+    case "gemini": return "Gemini CLI";
+    default: return provider;
+  }
+}
 
 function formatLocalTimestamp(value: string) {
   const normalized = value.includes("T") || value.endsWith("Z")
@@ -183,7 +288,7 @@ function SessionStatusBadge({ status }: { status: SessionStatus }) {
     starting: "Starting",
     running: "Running",
     waiting: "Waiting for you",
-    idle: "Not in use",
+    idle: "Ready",
     paused: "Paused",
     completed: "Completed",
     failed: "Failed",
@@ -198,9 +303,9 @@ function SessionStatusBadge({ status }: { status: SessionStatus }) {
   );
 }
 
-function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number }) {
+function AgentSessionsView({ transcriptFontSize, initialSessionId }: { transcriptFontSize: number; initialSessionId?: string }) {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
-  const [selectedId, setSelectedId] = useState("");
+  const [selectedId, setSelectedId] = useState(initialSessionId ?? "");
   const [filter, setFilter] = useState<"all" | SessionStatus>("all");
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(true);
@@ -211,9 +316,16 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   const [task, setTask] = useState("Start a new Copilot session");
   const [starting, setStarting] = useState(false);
   const [resuming, setResuming] = useState(false);
+  const [sendingMessage, setSendingMessage] = useState(false);
+  const [stoppingSession, setStoppingSession] = useState(false);
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
+  const [messageDraft, setMessageDraft] = useState("");
+  const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [archivedView, setArchivedView] = useState(false);
+  const [renamingSession, setRenamingSession] = useState(false);
+  const [sessionNameDraft, setSessionNameDraft] = useState("");
+  const [savingSessionName, setSavingSessionName] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all" || session.status === filter;
@@ -241,6 +353,8 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
 
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
+    let unsubscribePermission: (() => void) | undefined;
+    setPermissionRequest(null);
     void listen<string>("agent-session-updated", (event) => {
       void loadSessions();
       if (event.payload === selectedSession?.id) {
@@ -249,7 +363,26 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
     }).then((unlisten) => {
       unsubscribe = unlisten;
     });
-    return () => unsubscribe?.();
+    void listen<{ sessionId: string; permission: PermissionRequest }>("agent-session-permission-requested", (event) => {
+      if (event.payload.sessionId === selectedSession?.id) {
+        setPermissionRequest(event.payload.permission);
+      }
+    }).then((unlisten) => {
+      unsubscribePermission = unlisten;
+    });
+    if (selectedSession) {
+      void invoke<PermissionRequest | null>("get_pending_session_permission", {
+        sessionId: selectedSession.id,
+      }).then(setPermissionRequest).catch((reason) => {
+        setLoadError(reason instanceof Error ? reason.message : String(reason));
+      });
+    } else {
+      setPermissionRequest(null);
+    }
+    return () => {
+      unsubscribe?.();
+      unsubscribePermission?.();
+    };
   }, [selectedSession?.id]);
 
   async function loadSessions(showArchived = archivedView) {
@@ -259,7 +392,11 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         archived: showArchived,
       });
       setSessions(loaded);
-      setSelectedId((current) => loaded.some((session) => session.id === current) ? current : loaded[0]?.id ?? "");
+      setSelectedId((current) => {
+        if (loaded.some((session) => session.id === current)) return current;
+        if (initialSessionId && loaded.some((session) => session.id === initialSessionId)) return initialSessionId;
+        return loaded[0]?.id ?? "";
+      });
     } catch (reason) {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -296,6 +433,31 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
     }
   }
 
+  function beginRenameSession() {
+    if (!selectedSession) return;
+    setSessionNameDraft(selectedSession.task);
+    setRenamingSession(true);
+  }
+
+  async function renameSession(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedSession || !sessionNameDraft.trim()) return;
+    setSavingSessionName(true);
+    setLoadError("");
+    try {
+      await invoke("rename_agent_session", {
+        sessionId: selectedSession.id,
+        name: sessionNameDraft.trim(),
+      });
+      setRenamingSession(false);
+      await loadSessions(archivedView);
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSavingSessionName(false);
+    }
+  }
+
   async function resumeSession() {
     if (!selectedSession) return;
     setResuming(true);
@@ -307,6 +469,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         resumeSessionId: selectedSession.id,
       });
       setArchivedView(false);
+      await loadSessions(false);
     } catch (reason) {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -333,6 +496,56 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
     }
   }
 
+  async function sendMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedSession || !messageDraft.trim()) return;
+    setSendingMessage(true);
+    setLoadError("");
+    try {
+      await invoke("send_session_message", {
+        sessionId: selectedSession.id,
+        message: messageDraft,
+      });
+      setMessageDraft("");
+      await loadTranscript(selectedSession.id);
+      await loadSessions();
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+      await loadTranscript(selectedSession.id);
+    } finally {
+      setSendingMessage(false);
+    }
+  }
+
+  async function stopSession() {
+    if (!selectedSession) return;
+    setStoppingSession(true);
+    setLoadError("");
+    try {
+      await invoke("stop_agent_session", { sessionId: selectedSession.id });
+      await loadSessions();
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setStoppingSession(false);
+    }
+  }
+
+  async function respondToPermission(optionId: string | null) {
+    if (!selectedSession || !permissionRequest) return;
+    setLoadError("");
+    try {
+      await invoke("respond_session_permission", {
+        sessionId: selectedSession.id,
+        requestId: permissionRequest.requestId,
+        optionId,
+      });
+      setPermissionRequest(null);
+    } catch (reason) {
+      setLoadError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
   if (!selectedSession) {
     return <div className="sessions-page">
       <header className="sessions-header">
@@ -341,7 +554,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
       </header>
       <div className="empty-sessions-state">
         <h2>{loading ? "Loading agent sessions…" : "No agent sessions yet"}</h2>
-        <p>{loadError || "The supervisor will show Copilot CLI sessions here after they are discovered or started."}</p>
+        <p>{loadError || "Start a Copilot CLI session here to create a locally managed conversation."}</p>
         {!loading && projects.length > 0 && <form className="session-launch-card" onSubmit={startSession}>
           <label className="field-label" htmlFor="session-project">PROJECT</label>
           <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)}>
@@ -379,6 +592,7 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
         <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
         <button className="primary-button" type="submit" disabled={starting || projects.length === 0 || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
       </form>}
+      {loadError && <p className="session-error" role="alert">{loadError}</p>}
 
       <section className="session-summary-grid" aria-label="Session summary">
         <article className="session-summary-card"><span className="summary-icon running-icon">◉</span><div><strong>{sessions.filter((session) => session.status === "running").length}</strong><span>Running now</span></div><small>Live output streaming</small></article>
@@ -423,11 +637,18 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
           <div className="detail-header">
             <div className="detail-title"><div className={`session-avatar avatar-${selectedSession.status}`}>{selectedSession.project.charAt(0)}</div><div><div className="detail-name-row"><h2>{selectedSession.task}</h2><SessionStatusBadge status={selectedSession.status} /></div><p>{selectedSession.project} <span>·</span> <code>{selectedSession.branch}</code></p></div></div>
             <div className="detail-actions">
+              <button className="secondary-button" onClick={beginRenameSession} disabled={savingSessionName}>Rename</button>
               <button className="secondary-button archive-button" onClick={() => void updateArchiveState()} disabled={resuming}>{archivedView ? "Unarchive session" : "Archive session"}</button>
-              {selectedSession.provider === "copilot" && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
+              {selectedSession.managed && selectedSession.provider === "copilot" && ["completed", "failed", "orphaned"].includes(selectedSession.status) && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
             </div>
           </div>
-          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono">sess_8f31c2</strong></div></div>
+          {renamingSession && <form className="session-rename-form" onSubmit={renameSession}>
+            <label className="field-label" htmlFor="session-name">SESSION NAME</label>
+            <input id="session-name" className="settings-input" value={sessionNameDraft} onChange={(event) => setSessionNameDraft(event.currentTarget.value)} autoFocus maxLength={500} />
+            <button className="secondary-button" type="button" onClick={() => setRenamingSession(false)} disabled={savingSessionName}>Cancel</button>
+            <button className="primary-button" type="submit" disabled={savingSessionName || !sessionNameDraft.trim()}>{savingSessionName ? "Saving…" : "Save name"}</button>
+          </form>}
+          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono" title={selectedSession.externalSessionId ?? selectedSession.id}>{selectedSession.externalSessionId || selectedSession.id}</strong></div></div>
 
           <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
           <div className="transcript" style={{ "--transcript-font-size": `${transcriptFontSize}px` } as CSSProperties}>
@@ -445,10 +666,40 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
           </div>
 
           <div className="control-panel">
-            <div className="control-panel-heading"><div><h3>Supervisor controls</h3><span>Changes apply to the running process.</span></div><span className={`managed-state ${selectedSession.managed ? "managed" : ""}`}><span /> {selectedSession.managed ? "App managed" : "Read only"}</span></div>
-            <div className="permission-row"><span className="control-label">Permission mode</span><div className="permission-options">{(["Plan", "Accept edits", "Auto"] as const).map((mode) => <button key={mode} className={selectedSession.permissionMode.toLowerCase() === mode.toLowerCase() ? "selected" : ""} disabled>{mode}</button>)}</div></div>
-            <div className="reply-row"><input disabled placeholder="Supervisor commands will be enabled in the Copilot process slice" aria-label="Reply to agent" /><button className="primary-button" disabled>Send reply <span>↗</span></button></div>
-            <div className="control-actions"><button className="secondary-button" disabled>Ⅱ Pause session</button><button className="danger-button" disabled>Stop session</button></div>
+            <div className="control-panel-heading"><div><h3>Chat with Copilot</h3><span>Messages and responses are saved in Agent Control Plane.</span></div><span className={`managed-state ${selectedSession.managed ? "managed" : ""}`}><span /> {selectedSession.managed ? "App managed" : "Read only"}</span></div>
+            {permissionRequest && <div className="permission-request" role="group" aria-label="Copilot permission request">
+              <strong>{permissionRequest.title}</strong>
+              <span>Choose an option to let Copilot continue.</span>
+              <div>{permissionRequest.options.map((option) => <button key={option.optionId} className="secondary-button" onClick={() => void respondToPermission(option.optionId)}>{option.name}</button>)}
+                <button className="danger-button" onClick={() => void respondToPermission(null)}>Cancel request</button>
+              </div>
+            </div>}
+            <form className="reply-row" onSubmit={sendMessage}>
+              <input
+                value={messageDraft}
+                onChange={(event) => setMessageDraft(event.currentTarget.value)}
+                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting"}
+                placeholder={selectedSession.managed ? selectedSession.status === "waiting" ? "Reply to Copilot…" : "Message Copilot…" : "This session is read only"}
+                aria-label="Message Copilot"
+              />
+              <button
+                className="primary-button"
+                type="submit"
+                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || !messageDraft.trim() || selectedSession.status === "running" || selectedSession.status === "starting"}
+              >
+                {sendingMessage ? "Sending…" : "Send"} <span>↗</span>
+              </button>
+            </form>
+            <div className="control-actions">
+              <button
+                className="danger-button stop-session-button"
+                type="button"
+                onClick={() => void stopSession()}
+                disabled={!selectedSession.managed || stoppingSession || ["completed", "orphaned"].includes(selectedSession.status)}
+              >
+                {stoppingSession ? "Stopping…" : "Stop session"}
+              </button>
+            </div>
           </div>
         </section>
       </div>
@@ -456,8 +707,265 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
   );
 }
 
+function AttentionInboxView({
+  items,
+  loading,
+  error,
+  onRefresh,
+  onOpenSession,
+}: {
+  items: AttentionItem[];
+  loading: boolean;
+  error: string;
+  onRefresh: () => Promise<void>;
+  onOpenSession: (sessionId: string) => void;
+}) {
+  const [filter, setFilter] = useState<AttentionKind | "all">("all");
+  const [query, setQuery] = useState("");
+  const [selectedId, setSelectedId] = useState("");
+  const [actionError, setActionError] = useState("");
+  const [workingItemId, setWorkingItemId] = useState("");
+  const visibleItems = items.filter((item) => {
+    const matchesFilter = filter === "all" || item.kind === filter;
+    const searchable = `${item.title} ${item.project} ${item.branch} ${item.agent} ${item.summary}`.toLowerCase();
+    return matchesFilter && searchable.includes(query.toLowerCase());
+  });
+  const selectedItem = visibleItems.find((item) => item.id === selectedId) ?? visibleItems[0];
+  const priorityCount = items.filter((item) => item.priority === "High").length;
+  const decisionCount = items.filter((item) => item.kind === "permission").length;
+  const projectCount = new Set(items.map((item) => item.project)).size;
+  const selectedFilterLabel = attentionFilters.find((item) => item.kind === filter)?.label.toLowerCase();
+
+  async function respondToPermission(item: AttentionItem, optionId: string | null) {
+    if (!item.permissionRequest) return;
+    setWorkingItemId(item.id);
+    setActionError("");
+    try {
+      await invoke("respond_session_permission", {
+        sessionId: item.sessionId,
+        requestId: item.permissionRequest.requestId,
+        optionId,
+      });
+      await onRefresh();
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setWorkingItemId("");
+    }
+  }
+
+  async function archiveItem(item: AttentionItem) {
+    setWorkingItemId(item.id);
+    setActionError("");
+    try {
+      await invoke("set_session_archived", { sessionId: item.sessionId, archived: true });
+      await onRefresh();
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setWorkingItemId("");
+    }
+  }
+
+  return (
+    <div className="attention-page">
+      <header className="attention-header">
+        <div>
+          <p className="eyebrow">WORKSPACE / REVIEW QUEUE</p>
+          <h1>Attention inbox</h1>
+          <p className="subtitle">Review pending permissions and failed sessions that need your attention.</p>
+        </div>
+        <div className="attention-header-actions">
+          <span className="attention-live-badge"><span /> Local session data</span>
+          <button className="secondary-button" type="button" onClick={() => void onRefresh()} disabled={loading}>
+            <span className="refresh-glyph">↻</span> {loading ? "Refreshing…" : "Refresh"}
+          </button>
+        </div>
+      </header>
+
+      <div className="attention-stats" aria-label="Attention inbox summary">
+        <article className="attention-stat">
+          <span className="attention-stat-icon purple">◈</span>
+          <div><strong>{String(items.length).padStart(2, "0")}</strong><span>Open items</span></div>
+        </article>
+        <article className="attention-stat">
+          <span className="attention-stat-icon red">!</span>
+          <div><strong>{String(priorityCount).padStart(2, "0")}</strong><span>High priority</span></div>
+        </article>
+        <article className="attention-stat">
+          <span className="attention-stat-icon amber">◷</span>
+          <div><strong>{String(decisionCount).padStart(2, "0")}</strong><span>Permissions pending</span></div>
+        </article>
+        <article className="attention-stat">
+          <span className="attention-stat-icon blue">▣</span>
+          <div><strong>{String(projectCount).padStart(2, "0")}</strong><span>Projects involved</span></div>
+        </article>
+      </div>
+
+      <section className="attention-queue" aria-label="Attention queue">
+        <div className="attention-toolbar">
+          <div>
+            <p className="eyebrow">YOUR QUEUE</p>
+            <h2>Items to review <span className="queue-count">{visibleItems.length}</span></h2>
+          </div>
+          <label className="attention-search">
+            <span aria-hidden="true">⌕</span>
+            <input
+              aria-label="Search attention items"
+              placeholder="Search items"
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+            />
+            {query && <button type="button" aria-label="Clear search" onClick={() => setQuery("")}>×</button>}
+          </label>
+        </div>
+
+        {error && <div className="attention-error" role="alert">{error}</div>}
+        {actionError && <div className="attention-error" role="alert">{actionError}</div>}
+
+        <div className="attention-filters" role="group" aria-label="Filter attention items">
+          {attentionFilters.map(({ label, kind }) => (
+            <button
+              className={`attention-filter ${filter === kind ? "active" : ""}`}
+              key={kind}
+              type="button"
+              aria-pressed={filter === kind}
+              onClick={() => setFilter(kind)}
+            >
+              {label}
+              {kind !== "all" && <span>{items.filter((item) => item.kind === kind).length}</span>}
+              {kind === "all" && <span>{items.length}</span>}
+            </button>
+          ))}
+          <span className="attention-sort">Sorted by last updated ↓</span>
+        </div>
+
+        <div className="attention-workspace">
+          <div className="attention-list" role="region" aria-label="Attention items">
+            {visibleItems.map((item) => (
+              <button
+                className={`attention-item ${selectedItem?.id === item.id ? "selected" : ""}`}
+                key={item.id}
+                type="button"
+                aria-pressed={selectedItem?.id === item.id}
+                onClick={() => setSelectedId(item.id)}
+              >
+                <span className={`attention-kind-icon kind-${item.kind}`} aria-hidden="true">
+                  {item.kind === "permission" ? "⌘" : item.kind === "failure" ? "!" : "✓"}
+                </span>
+                <span className="attention-item-copy">
+                  <span className="attention-item-label">
+                    <span className={`attention-kind-label kind-label-${item.kind}`}>{item.kind}</span>
+                    <span className={`priority-label priority-${item.priority.toLowerCase()}`}>{item.priority}</span>
+                  </span>
+                  <strong>{item.title}</strong>
+                  <span className="attention-item-project">{item.project} <i>·</i> {providerLabel(item.agent)}</span>
+                  <span className="attention-item-summary">{item.summary}</span>
+                  <span className="attention-item-time">{formatLocalTimestamp(item.updatedAt)}<span>·</span><code>{item.branch}</code></span>
+                </span>
+                <span className="attention-item-chevron" aria-hidden="true">›</span>
+              </button>
+            ))}
+            {loading && visibleItems.length === 0 && (
+              <div className="attention-empty"><strong>Loading attention items…</strong></div>
+            )}
+            {!loading && visibleItems.length === 0 && (
+              <div className="attention-empty">
+                {items.length === 0 && !query && filter === "all" ? (
+                  <>
+                    <span>✓</span>
+                    <strong>You’re all caught up</strong>
+                    <p>Pending permissions and failed sessions will appear here.</p>
+                  </>
+                ) : (
+                  <>
+                    <span>⌕</span>
+                    <strong>No {query ? "matching" : selectedFilterLabel} items</strong>
+                    <p>Try another filter or search term.</p>
+                    <button type="button" onClick={() => { setFilter("all"); setQuery(""); }}>Clear filters</button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
+          {selectedItem ? (
+            <article className="attention-detail">
+              <div className="attention-detail-top">
+                <span className={`attention-kind-label kind-label-${selectedItem.kind}`}>{selectedItem.kind}</span>
+                <span className="attention-priority-note">{selectedItem.priority} priority</span>
+              </div>
+              <h3>{selectedItem.title}</h3>
+              <p className="attention-detail-summary">{selectedItem.summary}</p>
+              <div className="attention-context">
+                <span className={`attention-kind-icon kind-${selectedItem.kind}`} aria-hidden="true">
+                  {selectedItem.kind === "permission" ? "⌘" : "!"}
+                </span>
+                <div>
+                  <span>{selectedItem.kind === "permission" ? "Permission requested" : selectedItem.kind === "failure" ? "Session needs attention" : "Completed session"}</span>
+                  <p>{selectedItem.context}</p>
+                </div>
+              </div>
+              <dl className="attention-metadata">
+                <div><dt>PROJECT</dt><dd>{selectedItem.project}</dd></div>
+                <div><dt>BRANCH</dt><dd><code>{selectedItem.branch}</code></dd></div>
+                <div><dt>AGENT</dt><dd>{providerLabel(selectedItem.agent)}</dd></div>
+                <div><dt>LAST UPDATED</dt><dd>{formatLocalTimestamp(selectedItem.updatedAt)}</dd></div>
+              </dl>
+              {selectedItem.permissionRequest && (
+                <div className="attention-permission-options">
+                  <strong>Choose a permission response</strong>
+                  {selectedItem.permissionRequest.options.map((option) => (
+                    <button
+                      className="secondary-button"
+                      key={option.optionId}
+                      type="button"
+                      disabled={workingItemId === selectedItem.id}
+                      onClick={() => void respondToPermission(selectedItem, option.optionId)}
+                    >
+                      {option.name}
+                    </button>
+                  ))}
+                  <button
+                    className="attention-deny-button"
+                    type="button"
+                    disabled={workingItemId === selectedItem.id}
+                    onClick={() => void respondToPermission(selectedItem, null)}
+                  >
+                    {workingItemId === selectedItem.id ? "Responding…" : "Deny request"}
+                  </button>
+                </div>
+              )}
+              <div className="attention-actions">
+                <button className="primary-button" type="button" onClick={() => onOpenSession(selectedItem.sessionId)}>
+                  Open session
+                </button>
+                {selectedItem.kind !== "permission" && (
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    disabled={workingItemId === selectedItem.id}
+                    onClick={() => void archiveItem(selectedItem)}
+                  >
+                    {workingItemId === selectedItem.id ? "Archiving…" : "Archive session"}
+                  </button>
+                )}
+              </div>
+            </article>
+          ) : (
+            <div className="attention-detail-empty">
+              {loading ? "Loading session context…" : "Select an item to see its session context."}
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function App() {
   const [activeNav, setActiveNav] = useState("Dashboard");
+  const [sessionToOpen, setSessionToOpen] = useState("");
   const [showAddProject, setShowAddProject] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectPath, setProjectPath] = useState("");
@@ -467,6 +975,9 @@ function App() {
   const [error, setError] = useState("");
   const [settings, setSettings] = useState<SettingsForm>({ ...emptySettings(), githubToken: "" });
   const [savingSettings, setSavingSettings] = useState(false);
+  const [attentionItems, setAttentionItems] = useState<AttentionItem[]>([]);
+  const [attentionLoading, setAttentionLoading] = useState(true);
+  const [attentionError, setAttentionError] = useState("");
 
   async function loadProjects() {
     setLoadingProjects(true);
@@ -480,9 +991,42 @@ function App() {
     }
   }
 
+  async function refreshAttentionItems() {
+    setAttentionLoading(true);
+    setAttentionError("");
+    try {
+      setAttentionItems(await loadAttentionItemsFromBackend());
+    } catch (reason) {
+      setAttentionError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setAttentionLoading(false);
+    }
+  }
+
   useEffect(() => {
     void loadProjects();
     void loadSettings();
+  }, []);
+
+  useEffect(() => {
+    void refreshAttentionItems();
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    void listen<string>("agent-session-updated", () => {
+      void refreshAttentionItems();
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+      } else {
+        unsubscribe = unlisten;
+      }
+    }).catch((reason) => {
+      setAttentionError(reason instanceof Error ? reason.message : String(reason));
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
   }, []);
 
   async function loadSettings() {
@@ -545,6 +1089,13 @@ function App() {
     }
   }
 
+  function openAttentionSession(sessionId: string) {
+    setSessionToOpen(sessionId);
+    setActiveNav("Agent sessions");
+  }
+
+  const urgentAttentionCount = attentionItems.filter((item) => item.priority === "High").length;
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -566,7 +1117,7 @@ function App() {
             >
               <span className="nav-icon" aria-hidden="true">{icon}</span>
               <span>{label}</span>
-              {label === "Attention inbox" && <span className="nav-count">4</span>}
+              {label === "Attention inbox" && attentionItems.length > 0 && <span className="nav-count">{attentionItems.length}</span>}
             </button>
           ))}
         </nav>
@@ -587,7 +1138,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
@@ -608,9 +1159,9 @@ function App() {
           </article>
           <article className="summary-card">
             <div className="card-heading"><span>NEEDS ATTENTION</span><span className="card-icon amber">!</span></div>
-            <strong className="metric">4</strong>
-            <div className="metric-meta">2 high priority items</div>
-            <div className="severity-bar"><i /><i /><i className="muted" /><i className="muted" /></div>
+            <strong className="metric">{attentionItems.length}</strong>
+            <div className="metric-meta">{urgentAttentionCount} high priority item{urgentAttentionCount === 1 ? "" : "s"}</div>
+            <div className="severity-bar">{attentionItems.slice(0, 4).map((item) => <i key={item.id} />)}{attentionItems.length === 0 && <i className="muted" />}</div>
           </article>
           <article className="summary-card">
             <div className="card-heading"><span>READY BACKLOG</span><span className="card-icon blue">≡</span></div>
@@ -650,10 +1201,19 @@ function App() {
 
         <div className="lower-grid">
           <section className="section-block">
-            <div className="section-header"><div><h2>Attention inbox</h2><span className="section-caption">Items that need your decision</span></div><button className="text-button">Open inbox <span>→</span></button></div>
-              <div className="inbox-card">
-                <div className="empty-card">The attention inbox will become active when supervised runs are available.</div>
-              </div>
+            <div className="section-header"><div><h2>Attention inbox</h2><span className="section-caption">Items that need your decision</span></div><button className="text-button" onClick={() => setActiveNav("Attention inbox")}>Open inbox <span>→</span></button></div>
+            <div className="inbox-card">
+              {attentionLoading && attentionItems.length === 0 && <div className="empty-card">Loading attention items…</div>}
+              {!attentionLoading && attentionError && attentionItems.length === 0 && <div className="empty-card">{attentionError}</div>}
+              {!attentionLoading && !attentionError && attentionItems.length === 0 && <div className="empty-card">You’re all caught up. New permissions and failed sessions will appear here.</div>}
+              {attentionItems.slice(0, 4).map((item) => (
+                <button className="inbox-item" key={item.id} onClick={() => setActiveNav("Attention inbox")}>
+                  <span className={`inbox-icon ${item.kind === "failure" ? "failure" : "high"}`}>{item.kind === "permission" ? "⌘" : "!"}</span>
+                  <div><strong>{item.title}</strong><span>{item.project} · {providerLabel(item.agent)}</span></div>
+                  <time>{formatLocalTimestamp(item.updatedAt)}</time>
+                </button>
+              ))}
+            </div>
           </section>
           <section className="section-block activity-section">
             <div className="section-header"><div><h2>Live activity</h2><span className="section-caption live-caption"><span /> Streaming now</span></div><button className="text-button">View transcript <span>→</span></button></div>

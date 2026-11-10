@@ -84,7 +84,7 @@ The selected dashboard direction is **Command Center** (`dashboard-concept-a-com
 
 1. **Project registry** — tracks projects, repository roots, branch state, settings, and provider configuration.
 2. **Task orchestrator** — owns backlog selection, delegation, run loops, budgets, recovery, review gates, and looping mode.
-3. **Session manager** — starts and discovers Claude CLI sessions, captures stdout/stderr/transcripts, detects waiting states, and sends replies or permission-mode changes.
+3. **Session manager** — starts app-managed provider sessions over supported protocols, captures structured events/transcripts, handles chat and permission requests, and owns restart reconciliation.
 4. **Repository service** — reads git status, branches, commits, refs, diffs, and file contents.
 5. **Pipeline service** — runs provider adapters with polling, ETags, backoff, normalized statuses, logs, and notification events.
 6. **Analytics service** — executes pluggable widgets and stores encrypted provider credentials through the OS credential vault.
@@ -94,9 +94,10 @@ The selected dashboard direction is **Command Center** (`dashboard-concept-a-com
 
 Use SQLite in the platform application-data directory with migrations and WAL mode. Store large or sensitive content separately where appropriate:
 
-- SQLite: projects, tasks, runs, sessions, events, provider state, widget definitions, review decisions.
+- SQLite: projects, tasks, runs, app-managed agent sessions, ordered session messages/events, provider state, widget definitions, and review decisions.
 - Local files: transcript chunks and cached pipeline logs, indexed by database metadata.
 - OS credential vault: GitHub/Vercel/API bearer tokens and other secrets; store only opaque credential references in SQLite.
+- Agent Control Plane is the sole source of truth for its session list and transcript. It must not read or write Copilot CLI's session database or VS Code's session/database files. Provider interaction uses a documented CLI protocol; provider-internal storage is not an application dependency.
 
 ## 4. Core domain model
 
@@ -106,7 +107,7 @@ The initial schema should include:
 - `tasks`: project, title, purpose, acceptance criteria, priority, state, auto-approve flag, retry policy, budgets.
 - `task_runs`: task, Claude session, attempt number, lifecycle state, started/completed timestamps, step/token usage, failure reason.
 - `run_steps`: run, step name, status, timestamps, output summary, token usage.
-- `agent_sessions`: project, external Claude session identifier, process metadata, permission mode, status, transcript location.
+- `agent_sessions`: project, provider protocol session identifier, process metadata, permission mode, status, and transcript metadata.
 - `inbox_items`: project, source type, related entity, question/request payload, status, response, timestamps.
 - `reviews`: run, decision (`accepted`, `changes_requested`), feedback, reviewer, timestamp.
 - `pipeline_providers`: project, provider type, configuration reference, enabled state.
@@ -152,18 +153,20 @@ One cross-project queue containing:
 - Agent questions.
 - Permission requests.
 - Exhausted retries and failures.
-- Completed runs awaiting review.
 - Provider failures that require action.
 
 Each item must be answerable in place, show enough context to act, support filtering/sorting, and link back to the project, task, session, transcript, diff, or external pipeline run.
 
+The current local inbox derives live entries from persisted sessions: pending ACP permission requests and failed sessions. Waiting sessions without an available permission request are also surfaced for inspection. Orphaned sessions and successful completions remain available in Agent sessions but are not inbox entries. Permission choices are handled in place; failures open their session and can be archived. Agent questions, exhausted-retry workflows, and provider-level failures are not yet emitted as distinct inbox events by the backend and must not be inferred from unrelated session text or status.
+
 ### Agent sessions
 
-- Discover app-managed and existing Claude CLI sessions associated with a project.
-- Display live transcript, process status, current step, permission mode, and resource usage.
-- Allow replies only when the session is in a known waiting state.
-- Allow permission mode changes (`plan`, `accept edits`, `auto`) through the supervisor.
-- Clearly distinguish sessions managed by the app from sessions observed read-only.
+- List sessions created and persisted by Agent Control Plane; do not discover or import sessions by scanning Copilot/VS Code private databases or process arguments.
+- Display the locally persisted transcript alongside live process status, current step, permission requests, and resource usage.
+- Provide an in-app chat surface that sends follow-up prompts through Copilot's Agent Client Protocol (ACP) connection and persists both user and assistant messages in Agent Control Plane SQLite.
+- Surface ACP tool-permission requests in the app and require an explicit user choice. Never silently approve a tool request.
+- Allow the user to stop app-managed sessions. Reconnect persisted sessions through the provider protocol when supported; mark disconnected runtime state explicitly.
+- Keep provider-specific transport details in the Rust adapter; the React UI reads session/message data only through typed commands and events.
 
 ### Diff viewer
 
@@ -285,7 +288,9 @@ Refresh widgets independently, cache successful results, show stale/error states
 - [ ] Every delegated task has purpose, acceptance criteria, budgets, retry policy, and an auditable lifecycle.
 - [ ] Agent questions, permission requests, failures, and reviews appear in one actionable inbox.
 - [ ] Looping mode delegates the next task but never silently answers questions or exhausted failures.
-- [ ] Session transcripts update live and permission modes are visible and controllable.
+- [ ] Session transcripts update live, in-app chat works, and provider permission requests are visible and controllable.
+- [ ] Agent sessions and chat transcripts are sourced exclusively from Agent Control Plane SQLite; Copilot and VS Code private session stores are never opened.
+- [ ] Users can send in-app follow-up messages, answer ACP permission requests, stop managed sessions, and see messages persisted after restart.
 - [ ] Diffs support working tree, ref-to-ref, grouped, syntax-highlighted, unified, and side-by-side views.
 - [ ] GitHub Actions and Vercel use the same normalized pipeline UI and support logs/deep links.
 - [ ] Analytics widgets are pluggable; built-in widgets and generic JSON metrics work per project.
@@ -312,4 +317,4 @@ The following decisions were confirmed during design review:
 13. Guarantee ordered, at-least-once event delivery per entity, idempotent consumers, transactional persistence before event publication, and restart reconciliation.
 14. Enforce append-only domain history, configurable retention, opt-in diagnostics, unified redaction, bounded caches, explicit destructive-action confirmation, and application-wide as well as Project-level concurrency limits.
 15. Implement in the documented phase order and require each phase's exit criteria before advancing.
-
+16. Keep Agent Control Plane session identity, history, and transcript in its own SQLite database; integrate with providers through supported protocols instead of reading provider or VS Code private databases.

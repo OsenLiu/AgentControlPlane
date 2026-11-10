@@ -2,38 +2,43 @@
 
 ## Goal
 
-Replace the current session demo data with a local-first session manager that
-shows real AI CLI sessions. The UI must distinguish persisted history from
-live process state and must never invent a running, waiting, paused, or failed
-status.
+Replace the current session demo data with a local-first session manager for
+sessions started by Agent Control Plane. The app owns the session list and
+transcript in its SQLite database; it must never import sessions from or read
+Copilot CLI or VS Code private session databases. The UI distinguishes
+persisted history from live process state and never invents a running, waiting,
+paused, or failed status.
 
 The first implementation targets GitHub Copilot CLI. Gemini CLI and Claude
 Code CLI remain supported providers in the application settings, but are
 implemented after the Copilot vertical slice proves the session lifecycle.
-The first release supports sessions started by Agent Control Plane and sessions
-discovered in configured local projects. Discovered sessions are read-only
-until the supervisor can prove that it owns the process and understands the
-provider's input protocol.
+The first release supports app-managed GitHub Copilot CLI sessions through its
+Agent Client Protocol (ACP) interface. Sessions started outside Agent Control
+Plane are not discovered or imported. Gemini CLI and Claude Code CLI can be
+added behind the provider boundary after the Copilot chat lifecycle is proven.
 
 ## Source of truth
 
 There are three kinds of data:
 
-1. **SQLite is the durable record.** It stores session identity, project
-   association, provider, lifecycle transitions, process metadata, transcript
-   location, permission mode, and the last known observation.
-2. **The OS process table and supervisor are runtime truth.** A session is
-   `running`, `waiting`, `paused`, or `failed` only after the supervisor
-   observes the corresponding process/output condition.
-3. **The CLI adapter is protocol truth.** Each provider adapter parses the
-   provider's supported structured output and knows how to send a reply or
-   permission-mode command. The UI never parses CLI output and never executes a
-   CLI directly.
+1. **Agent Control Plane SQLite is the durable record and transcript source.**
+   It stores its own session identity, project association, provider protocol
+   session ID, lifecycle transitions, process metadata, ordered user/assistant
+   messages, permission requests, and the last known observation. The app does
+   not open or query the Copilot CLI session database or VS Code databases.
+2. **The managed child process and supervisor are runtime truth.** A session
+   is `running`, `waiting`, `paused`, or `failed` only after the supervisor
+   observes the corresponding ACP/process condition.
+3. **The CLI adapter is protocol truth.** The Copilot adapter speaks ACP over
+   the managed process's standard input/output, sends chat prompts, streams
+   message updates, and routes permission requests to explicit UI decisions.
+   The UI never parses CLI output and never executes a CLI directly.
 
-On startup, runtime truth is reconciled against SQLite. A persisted process
-that no longer exists becomes `orphaned`/`failed` with a reason; a discovered
-process without a matching record is recorded as `observed` and read-only.
-The UI shows the last known record while reconciliation is in progress.
+On startup, sessions that were active in the previous process are marked
+`orphaned` with a reason and can be reconnected through ACP's session-loading
+operation when supported. The UI shows the last known local record while the
+provider process is unavailable. No provider/VS Code database or process scan
+is used to repopulate the session list.
 
 ## Domain model
 
@@ -45,7 +50,7 @@ Add these SQLite tables through an idempotent migration:
 - `project_id` — foreign-key-like reference to `projects.id`
 - `provider` — `claude_code`, `gemini`, or `copilot`
 - `external_session_id` — provider session identifier, nullable
-- `origin` — `managed` or `observed`
+- `origin` — `managed` for sessions created by Agent Control Plane
 - `status` — `starting`, `running`, `waiting`, `paused`, `completed`,
   `failed`, `orphaned`, or `unknown`
 - `status_reason` — explicit reason for every non-normal state
@@ -57,8 +62,9 @@ Add these SQLite tables through an idempotent migration:
 - `started_at`, `last_seen_at`, `completed_at`
 - `created_at`, `updated_at`
 
-Use a unique constraint on `(provider, external_session_id)` when the external
-ID exists. Never use a PID alone as identity because PIDs can be reused.
+Use a unique constraint on `(provider, external_session_id)` when the provider
+protocol session ID exists. Never use a PID alone as identity because PIDs can
+be reused.
 
 ### `session_events`
 
@@ -70,6 +76,17 @@ Append-only evidence for status and transcript updates:
 - structured JSON payload
 - `observed_at`
 
+### `session_messages`
+
+The app-owned conversation transcript:
+
+- `id`, `session_id`, monotonic `sequence`
+- `role` (`user` or `assistant`)
+- message content and creation timestamp
+
+Assistant streaming chunks update the current assistant message in this table;
+the transcript command reads only these local rows.
+
 ### `session_commands`
 
 Audit requests sent from the UI to a managed session:
@@ -79,8 +96,8 @@ Audit requests sent from the UI to a managed session:
 - `status` (`queued`, `sent`, `rejected`, `failed`)
 - `error`, `created_at`, `completed_at`
 
-Large transcript content stays in bounded local files. SQLite stores the path
-and indexed metadata, not unbounded output.
+Transcript messages stay in Agent Control Plane SQLite and are bounded by
+message-size and retention limits.
 
 ## Rust implementation
 
@@ -98,16 +115,18 @@ Define a Rust trait similar to:
 
 ```text
 AgentProvider
-  discover(project) -> Vec<ObservedSession>
   command_spec(session, task) -> CommandSpec
-  parse_output(bytes) -> Vec<ProviderEvent>
-  send_reply(session, text) -> Result
-  set_permission_mode(session, mode) -> Result
+  start(project) -> ManagedSession
+  send_message(session, text) -> Result
+  respond_to_permission(session, request_id, option_id) -> Result
+  stop(session) -> Result
 ```
 
 The first adapter is `CopilotProvider`. Gemini and Claude Code use the same
 interface later; their provider-specific protocol work must not leak into the
-database schema or React data model.
+database schema or React data model. For Copilot, use its supported ACP
+stdio protocol; do not query or import data from `~/.copilot/session-store.db`,
+Copilot session-state files, or VS Code's internal session stores.
 
 Each adapter must:
 
@@ -133,8 +152,8 @@ Add a managed supervisor held in Tauri state:
 - enforce project and application concurrency limits;
 - terminate only processes owned by the app and matching the recorded process
   start identity;
-- reconcile persisted managed sessions and discover externally started sessions
-  after app startup;
+- mark previously active managed sessions orphaned at startup and reconnect
+  only through the stored provider protocol session ID;
 - mark stale sessions with an explicit reason instead of deleting them.
 
 Use an event channel from Rust to React. The UI should not poll the process
@@ -148,17 +167,18 @@ Commands:
 - `list_agent_sessions(project_id?, status?)`
 - `get_agent_session(id)`
 - `reconcile_agent_sessions()`
-- `send_session_reply(id, text)`
-- `set_session_permission_mode(id, mode)`
-- `pause_agent_session(id)`
+- `send_session_message(id, text)`
+- `get_pending_session_permission(id)`
+- `respond_session_permission(id, request_id, option_id?)`
 - `stop_agent_session(id)`
-- `get_session_transcript(id, cursor?)`
+- `get_session_transcript(id)` — returns a bounded recent window backed exclusively by
+  `session_messages` in Agent Control Plane SQLite.
 
 Events:
 
 - `agent-session-updated`
 - `agent-session-event`
-- `agent-session-reconciliation`
+- `agent-session-permission-requested`
 
 Every mutating command must verify that the session is managed, the process
 identity is still valid, and the requested transition is allowed. Return a
@@ -171,7 +191,6 @@ Replace the hardcoded `agentSessions` constant with:
 
 - an initial `list_agent_sessions` invocation;
 - a loading state that preserves prior records during refresh;
-- a reconciliation banner when runtime state is not confirmed;
 - event listeners for session updates and transcript events;
 - explicit empty, stale, read-only, failed, and unavailable states.
 
@@ -179,25 +198,29 @@ The page keeps the current design but derives all counts, badges, timestamps,
 current step, token usage, transcript lines, and control availability from
 the command/event responses.
 
-Control behavior:
+Interaction behavior:
 
-- replies are enabled only for a managed session in `waiting`;
-- permission controls are enabled only for providers supporting that command;
-- pause/stop show pending state until Rust confirms the transition;
-- read-only and orphaned sessions expose inspection links but no mutation
-  controls;
-- transcript loading is cursor-based and bounded.
+- chat is enabled for connected managed sessions when no prompt or permission
+  request is in flight;
+- ACP permission requests show the provider-supplied choices and require an
+  explicit user decision; do not auto-approve;
+- stop shows pending state until Rust confirms the process exit;
+- orphaned sessions expose a reconnect action only when the stored provider
+  protocol session ID can be loaded;
+- transcript loading returns a bounded recent window.
 
 ## Delivery order
 
 ### Slice 1 — persisted read model
 
 - Add migrations and Rust models.
-- Add `list_agent_sessions`, `get_agent_session`, and transcript retrieval.
+- Add `list_agent_sessions` and transcript retrieval from Agent Control Plane
+  SQLite only.
 - Replace frontend demo records with database-backed loading.
 - Show an honest empty state when no sessions exist.
 
-**Exit:** the page contains zero hardcoded session records and survives restart.
+**Exit:** the page contains zero hardcoded session records, preserves its own
+transcript after restart, and never imports provider/VS Code session history.
 
 ### Slice 2 — managed Copilot CLI process
 
@@ -213,27 +236,32 @@ Control behavior:
 **Exit:** a locally launched managed Copilot session appears with real process
 status, output, exit reason, and persisted history.
 
-### Slice 3 — Copilot supervised controls
+### Slice 3 — Copilot chat and supervised controls
 
-- Implement Copilot waiting-state detection from structured events.
-- Implement Copilot replies, supported permission-mode changes, pause, and stop.
-- Add command audit records and pending/error UI states.
+- Implement in-app Copilot chat with streaming user/assistant transcript
+  messages.
+- Surface ACP permission requests and validate explicit user-selected options.
+- Implement stopping managed sessions and pending/error UI states.
 
-**Exit:** a user can safely answer a real waiting session and see the confirmed
-result in the transcript.
+**Exit:** a user can chat with Copilot, approve or reject provider-supplied
+permission choices, stop the session, and see the persisted transcript.
 
 ### Slice 4 — discovery and additional providers
 
-- Discover existing Copilot sessions where identity can be established.
+- Do not discover/import external Copilot sessions or read Copilot/VS Code
+  private session databases.
 - Add Gemini CLI and Claude Code CLI adapters behind the same interface.
-- Keep unsupported or ambiguous sessions read-only.
+- Keep unsupported provider interactions unavailable with an explicit reason.
 
-**Exit:** provider-specific behavior does not leak into the React data model.
+**Exit:** provider-specific behavior does not leak into the React data model,
+and the app's session list and transcript remain independent of provider/VS
+Code database layouts.
 
 ## Testing and acceptance
 
-- Unit-test migrations, state-transition rules, PID/start-time validation,
-  redaction, event ordering, and the Copilot adapter parser.
+- Unit-test migrations, state-transition rules, transcript ordering and
+  streaming, permission-choice validation, redaction, and the Copilot ACP
+  message parser.
 - Integration-test process start, stdout/stderr capture, exit/crash handling,
   command rejection, and restart reconciliation.
 - Test Copilot malformed output, missing executable, unsupported version,
@@ -241,5 +269,7 @@ result in the transcript.
   provider-unavailable states.
 - Verify the frontend has no session fixture constant and all session data
   enters through Tauri commands/events.
+- Verify session listing/transcript commands query only Agent Control Plane
+  SQLite and the code never opens Copilot CLI or VS Code session databases.
 - Verify secrets, full tokens, and raw authorization headers never reach
   SQLite events, frontend events, logs, or transcript files.

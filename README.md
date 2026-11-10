@@ -1,11 +1,15 @@
 # Agent Control Plane
 
-Local-first desktop supervision for Claude CLI agents across projects.
+Local-first desktop supervision for AI CLI agents across projects.
 
 The current foundation is a Tauri 2 desktop shell with a React/TypeScript
 Command Center dashboard. The Rust core will own process supervision,
 filesystem/Git operations, persistence, provider adapters, and typed
 frontend commands/events.
+
+Agent Control Plane stores its session list and chat transcripts in its own
+SQLite database. Copilot CLI interaction uses its supported Agent Client
+Protocol; the app does not open Copilot CLI or VS Code private session stores.
 
 ## Development
 
