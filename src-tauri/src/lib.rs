@@ -65,6 +65,7 @@ struct Project {
 #[serde(rename_all = "camelCase")]
 struct AgentSession {
     id: String,
+    external_session_id: Option<String>,
     project: String,
     task: String,
     branch: String,
@@ -213,6 +214,7 @@ fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSess
         archived: row.get::<_, i64>(12)? != 0,
         status_reason: row.get(13)?,
         updated_at: row.get(14)?,
+        external_session_id: row.get(15)?,
     })
 }
 
@@ -848,7 +850,7 @@ fn list_agent_sessions_from_connection(
             "SELECT s.id, p.name, s.task, s.branch, s.provider, s.status,
                     s.current_step, s.started_at, s.token_count,
                    s.permission_mode, s.origin, s.last_event, s.archived,
-                   s.status_reason, s.updated_at
+                   s.status_reason, s.updated_at, s.external_session_id
              FROM agent_sessions s
              JOIN projects p ON p.id = s.project_id
              WHERE (?1 IS NULL OR s.project_id = ?1)
@@ -1975,9 +1977,9 @@ mod tests {
         connection
             .execute(
                 "INSERT INTO agent_sessions
-                 (id, project_id, provider, task, branch, status, status_reason,
+                 (id, project_id, provider, external_session_id, task, branch, status, status_reason,
                   current_step, token_count, permission_mode, origin, last_event)
-                 VALUES ('session-1', 'project-1', 'copilot', 'Implement sessions',
+                 VALUES ('session-1', 'project-1', 'copilot', 'sess_external_1', 'Implement sessions',
                          'feat/sessions', 'waiting', 'Agent asked a question',
                          'Waiting for your answer', 12800, 'plan', 'managed',
                          'Which provider should be used?')",
@@ -1990,6 +1992,10 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "session-1");
+        assert_eq!(
+            sessions[0].external_session_id.as_deref(),
+            Some("sess_external_1")
+        );
         assert_eq!(sessions[0].provider, "copilot");
         assert_eq!(sessions[0].status, "waiting");
         assert_eq!(sessions[0].status_reason, "Agent asked a question");
