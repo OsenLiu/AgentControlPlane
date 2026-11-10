@@ -594,6 +594,16 @@ fn send_copilot_message(
     }
 }
 
+async fn run_agent_operation<F, T>(operation: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|error| format!("Agent operation failed in the background: {error}"))?
+}
+
 fn tool_settings_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ToolSettings> {
     Ok(ToolSettings {
         enabled: row.get(0)?,
@@ -861,21 +871,28 @@ fn list_agent_sessions(
 }
 
 #[tauri::command]
-fn send_session_message(
+async fn send_session_message(
     session_id: String,
     message: String,
     database: State<'_, Database>,
     processes: State<'_, SessionProcesses>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let control = processes
-        .0
-        .lock()
-        .map_err(|_| "Agent session process list is unavailable.".to_owned())?
-        .get(&session_id)
-        .cloned()
-        .ok_or_else(|| "This session is not connected to a managed Copilot process.".to_owned())?;
-    send_copilot_message(&database.0, &session_id, &control, &message, &app, false)
+    let database = Database(database.0.clone());
+    let processes = SessionProcesses(processes.0.clone());
+    run_agent_operation(move || {
+        let control = processes
+            .0
+            .lock()
+            .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+            .get(&session_id)
+            .cloned()
+            .ok_or_else(|| {
+                "This session is not connected to a managed Copilot process.".to_owned()
+            })?;
+        send_copilot_message(&database.0, &session_id, &control, &message, &app, false)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -953,6 +970,7 @@ fn stop_agent_session(
     session_id: String,
     database: State<'_, Database>,
     processes: State<'_, SessionProcesses>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let connection = database
         .0
@@ -982,7 +1000,17 @@ fn stop_agent_session(
         .lock()
         .map_err(|_| "Copilot process state is unavailable.".to_owned())?
         .kill()
-        .map_err(|error| format!("Unable to stop Copilot session: {error}"))
+        .map_err(|error| format!("Unable to stop Copilot session: {error}"))?;
+    update_session_status(
+        &database.0,
+        &session_id,
+        "completed",
+        "Stopped by user.",
+        "Stopped by user.",
+    )?;
+    app.emit("agent-session-updated", &session_id)
+        .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -1275,12 +1303,35 @@ fn spawn_copilot_acp(
 }
 
 #[tauri::command]
-fn start_copilot_session(
+async fn start_copilot_session(
     project_id: Option<String>,
     task: String,
     resume_session_id: Option<String>,
     database: State<'_, Database>,
     processes: State<'_, SessionProcesses>,
+    app: tauri::AppHandle,
+) -> Result<AgentSession, String> {
+    let database = Database(database.0.clone());
+    let processes = SessionProcesses(processes.0.clone());
+    run_agent_operation(move || {
+        start_copilot_session_blocking(
+            project_id,
+            task,
+            resume_session_id,
+            database,
+            processes,
+            app,
+        )
+    })
+    .await
+}
+
+fn start_copilot_session_blocking(
+    project_id: Option<String>,
+    task: String,
+    resume_session_id: Option<String>,
+    database: Database,
+    processes: SessionProcesses,
     app: tauri::AppHandle,
 ) -> Result<AgentSession, String> {
     let mut task = task.trim().to_owned();
@@ -1754,6 +1805,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blocking_agent_operations_run_off_the_calling_thread() {
+        let calling_thread = thread::current().id();
+        let operation_thread =
+            tauri::async_runtime::block_on(run_agent_operation(|| Ok(thread::current().id())))
+                .expect("background agent operation");
+
+        assert_ne!(operation_thread, calling_thread);
+    }
 
     #[test]
     fn new_database_has_an_empty_session_read_model() {

@@ -247,4 +247,42 @@ describe("App", () => {
     }));
     expect(await screen.findByText("The session store is local.")).toBeTruthy();
   });
+
+  it("stops a managed Copilot session", async () => {
+    const session = {
+      id: "managed-session",
+      project: "demo",
+      task: "Stop this session",
+      branch: "main",
+      provider: "copilot",
+      status: "running",
+      step: "Working",
+      elapsed: "2026-11-09 11:20:00",
+      tokens: "0.0k",
+      permissionMode: "plan",
+      managed: true,
+      lastEvent: "Working",
+      archived: false,
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [];
+      if (command === "load_settings") return settings;
+      if (command === "list_agent_sessions") return [session];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "get_session_transcript") return [];
+      if (command === "stop_agent_session") return undefined;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    expect(await screen.findByRole("button", { name: "Stop session" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Stop session" }));
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("stop_agent_session", {
+        sessionId: "managed-session",
+      });
+    });
+  });
 });

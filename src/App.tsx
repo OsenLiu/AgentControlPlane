@@ -553,7 +553,8 @@ function AgentSessionsView({ transcriptFontSize }: { transcriptFontSize: number 
             </form>
             <div className="control-actions">
               <button
-                className="danger-button"
+                className="danger-button stop-session-button"
+                type="button"
                 onClick={() => void stopSession()}
                 disabled={!selectedSession.managed || stoppingSession || ["completed", "orphaned"].includes(selectedSession.status)}
               >
