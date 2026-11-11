@@ -963,6 +963,152 @@ function AttentionInboxView({
   );
 }
 
+function ProjectsView({
+  projects,
+  loading,
+  onAddProject,
+  onRefresh,
+}: {
+  projects: Project[];
+  loading: boolean;
+  onAddProject: () => void;
+  onRefresh: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | "changed" | "clean">("all");
+  const changedCount = projects.filter((project) => project.gitState === "dirty").length;
+  const cleanCount = projects.length - changedCount;
+  const branchCount = new Set(projects.map((project) => project.branch).filter(Boolean)).size;
+  const normalizedQuery = query.trim().toLowerCase();
+  const visibleProjects = projects.filter((project) => {
+    const matchesFilter = filter === "all" || project.gitState === (filter === "changed" ? "dirty" : "clean");
+    const searchable = `${project.name} ${project.path} ${project.branch} ${project.currentCommit}`.toLowerCase();
+    return matchesFilter && searchable.includes(normalizedQuery);
+  });
+
+  return (
+    <div className="projects-page">
+      <header className="projects-page-header">
+        <div>
+          <p className="eyebrow">WORKSPACE / REPOSITORIES</p>
+          <h1>Your projects</h1>
+          <p className="subtitle">Local Git checkouts connected to Agent Control Plane.</p>
+        </div>
+        <div className="projects-header-actions">
+          <span className="projects-local-badge"><span aria-hidden="true" /> Stored on this device</span>
+          <button className="secondary-button projects-refresh-button" type="button" onClick={onRefresh} disabled={loading}>
+            <span aria-hidden="true">↻</span> {loading ? "Refreshing…" : "Refresh"}
+          </button>
+          <button className="primary-button" type="button" onClick={onAddProject}>
+            <span aria-hidden="true">+</span> Add project
+          </button>
+        </div>
+      </header>
+
+      <section className="projects-overview" aria-label="Project repository summary">
+        <article className="projects-overview-card">
+          <span className="projects-overview-icon overview-total" aria-hidden="true">⌘</span>
+          <div><strong>{projects.length}</strong><span>Connected repositories</span></div>
+        </article>
+        <article className="projects-overview-card">
+          <span className="projects-overview-icon overview-clean" aria-hidden="true">✓</span>
+          <div><strong>{cleanCount}</strong><span>Clean working trees</span></div>
+        </article>
+        <article className="projects-overview-card">
+          <span className="projects-overview-icon overview-changed" aria-hidden="true">≋</span>
+          <div><strong>{changedCount}</strong><span>With local changes</span></div>
+        </article>
+        <article className="projects-overview-card">
+          <span className="projects-overview-icon overview-branches" aria-hidden="true">⑂</span>
+          <div><strong>{branchCount}</strong><span>Active branches</span></div>
+        </article>
+      </section>
+
+      <section className="projects-directory" aria-labelledby="projects-directory-title">
+        <div className="projects-directory-heading">
+          <div>
+            <p className="eyebrow">LOCAL REGISTRY</p>
+            <h2 id="projects-directory-title">Repositories <span>{projects.length}</span></h2>
+          </div>
+          <label className="projects-search">
+            <span aria-hidden="true">⌕</span>
+            <input
+              type="search"
+              aria-label="Search projects"
+              placeholder="Search name, path, branch…"
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+            />
+            {query && <button type="button" aria-label="Clear project search" onClick={() => setQuery("")}>×</button>}
+          </label>
+        </div>
+
+        <div className="projects-filter-bar" role="group" aria-label="Filter projects by Git state">
+          {([
+            ["all", "All projects", projects.length],
+            ["changed", "Changes", changedCount],
+            ["clean", "Clean", cleanCount],
+          ] as const).map(([value, label, count]) => (
+            <button
+              className={`projects-filter ${filter === value ? "active" : ""}`}
+              key={value}
+              type="button"
+              aria-pressed={filter === value}
+              onClick={() => setFilter(value)}
+            >
+              {label}<span>{count}</span>
+            </button>
+          ))}
+          <span className="projects-filter-context">Sorted by name</span>
+        </div>
+
+        {loading && projects.length === 0 ? (
+          <div className="projects-empty-state" role="status">Loading local repositories…</div>
+        ) : projects.length === 0 ? (
+          <div className="projects-empty-state projects-empty-onboarding">
+            <span className="projects-empty-icon" aria-hidden="true">⌘</span>
+            <h3>No projects connected yet</h3>
+            <p>Add a local Git checkout to keep its branch and working-tree status in one place.</p>
+            <button className="primary-button" type="button" onClick={onAddProject}><span aria-hidden="true">+</span> Add your first project</button>
+          </div>
+        ) : visibleProjects.length === 0 ? (
+          <div className="projects-empty-state">
+            <h3>No matching projects</h3>
+            <p>Try a different search or Git state filter.</p>
+            <button className="text-button" type="button" onClick={() => { setQuery(""); setFilter("all"); }}>Clear search and filters</button>
+          </div>
+        ) : (
+          <div className="projects-card-grid">
+            {visibleProjects.map((project) => (
+              <article className="project-directory-card" key={project.id}>
+                <div className="project-directory-card-top">
+                  <span className="project-directory-avatar" aria-hidden="true">{project.name.charAt(0).toUpperCase()}</span>
+                  <span className={`project-state-badge ${project.gitState}`}>
+                    <span aria-hidden="true" />
+                    {project.gitState === "clean" ? "Working tree clean" : "Uncommitted changes"}
+                  </span>
+                </div>
+                <h3 title={project.name}>{project.name}</h3>
+                <p className="project-directory-path" title={project.path}>{project.path}</p>
+                <div className="project-directory-meta">
+                  <div>
+                    <span>BRANCH</span>
+                    <code title={project.branch}>{project.branch || "No branch"}</code>
+                  </div>
+                  <div>
+                    <span>LAST COMMIT</span>
+                    <code title={project.currentCommit}>{project.currentCommit ? project.currentCommit.slice(0, 7) : "—"}</code>
+                  </div>
+                </div>
+              </article>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function App() {
   const [activeNav, setActiveNav] = useState("Dashboard");
   const [sessionToOpen, setSessionToOpen] = useState("");
@@ -1138,7 +1284,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Projects" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onRefresh={() => void loadProjects()} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
@@ -1180,7 +1326,7 @@ function App() {
         <section className="section-block projects-section">
           <div className="section-header">
             <div><h2>Projects</h2><span className="section-caption">Live workspace overview</span></div>
-            <button className="text-button">View all projects <span>→</span></button>
+            <button className="text-button" onClick={() => setActiveNav("Projects")}>View all projects <span>→</span></button>
           </div>
           <div className="table-card">
             <div className="table-row table-head"><span>PROJECT</span><span>ACTIVE AGENTS</span><span>PROGRESS</span><span>PIPELINE</span><span>GIT STATE</span><span /></div>

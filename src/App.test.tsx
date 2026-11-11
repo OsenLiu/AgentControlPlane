@@ -46,6 +46,53 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("load_settings");
   });
 
+  it("opens the project directory and filters repositories by search and Git state", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [
+        {
+          id: "/work/agent-control-plane",
+          name: "agent-control-plane",
+          path: "/work/agent-control-plane",
+          branch: "main",
+          currentCommit: "a1b2c3d4",
+          gitState: "clean",
+        },
+        {
+          id: "/work/website",
+          name: "website",
+          path: "/work/website",
+          branch: "feature/refresh",
+          currentCommit: "e5f6a7b8",
+          gitState: "dirty",
+        },
+      ];
+      if (command === "list_agent_sessions") return [];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "load_settings") return settings;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /View all projects/ }));
+
+    expect(await screen.findByRole("heading", { name: "Your projects" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /Repositories 2/ })).toBeTruthy();
+    expect(screen.getByText("/work/agent-control-plane")).toBeTruthy();
+    expect(screen.getByText("a1b2c3d")).toBeTruthy();
+    expect(screen.getByText("Uncommitted changes")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /Changes/ }));
+    expect(screen.queryByRole("heading", { name: "agent-control-plane" })).toBeNull();
+    expect(screen.getByRole("heading", { name: "website" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /All projects/ }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search projects" }), {
+      target: { value: "feature/refresh" },
+    });
+    expect(screen.getByRole("heading", { name: "website" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "agent-control-plane" })).toBeNull();
+  });
+
   it("loads an empty Attention inbox from the backend", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /^Attention inbox/ }));
