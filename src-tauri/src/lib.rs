@@ -17,7 +17,16 @@ use std::{
 };
 use tauri::{Emitter, Manager, State};
 
-struct Database(Arc<Mutex<Connection>>);
+mod project_features;
+
+use project_features::{
+    TerminalManager, close_project_terminal, create_project_task, create_project_terminal,
+    delete_project_task, get_project_dependencies, get_project_diff, get_project_pipelines,
+    link_project_task_session, list_project_skills, list_project_tasks, list_project_terminals,
+    resize_project_terminal, set_project_task_status, write_project_terminal,
+};
+
+struct Database(pub(crate) Arc<Mutex<Connection>>);
 struct SessionProcesses(Arc<Mutex<HashMap<String, SessionControl>>>);
 
 #[derive(Clone, Debug, Serialize)]
@@ -47,8 +56,8 @@ struct SessionControl {
     assistant_message_id: Arc<Mutex<Option<String>>>,
 }
 
-const GITHUB_CREDENTIAL_SERVICE: &str = "com.agentcontrolplane.desktop.github";
-const GITHUB_CREDENTIAL_USER: &str = "github-token";
+pub(crate) const GITHUB_CREDENTIAL_SERVICE: &str = "com.agentcontrolplane.desktop.github";
+pub(crate) const GITHUB_CREDENTIAL_USER: &str = "github-token";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1863,6 +1872,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
                 Err(error)
             }
         })?;
+    project_features::initialize_schema(connection)?;
     Ok(())
 }
 
@@ -1883,6 +1893,7 @@ pub fn run() {
         .setup(|app| {
             app.manage(open_database(app.handle())?);
             app.manage(SessionProcesses(Arc::new(Mutex::new(HashMap::new()))));
+            app.manage(TerminalManager::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1897,6 +1908,20 @@ pub fn run() {
             get_session_transcript,
             start_copilot_session,
             register_project,
+            list_project_tasks,
+            create_project_task,
+            set_project_task_status,
+            link_project_task_session,
+            delete_project_task,
+            get_project_diff,
+            get_project_dependencies,
+            list_project_skills,
+            get_project_pipelines,
+            list_project_terminals,
+            create_project_terminal,
+            write_project_terminal,
+            resize_project_terminal,
+            close_project_terminal,
             load_settings,
             save_settings
         ])
@@ -2016,8 +2041,16 @@ mod tests {
             )
             .expect("project");
         for (id, started_at, updated_at) in [
-            ("started-newest", "2026-11-10 10:00:00", "2026-11-08 10:00:00"),
-            ("updated-newest", "2026-11-08 10:00:00", "2026-11-10 10:00:00"),
+            (
+                "started-newest",
+                "2026-11-10 10:00:00",
+                "2026-11-08 10:00:00",
+            ),
+            (
+                "updated-newest",
+                "2026-11-08 10:00:00",
+                "2026-11-10 10:00:00",
+            ),
             ("middle", "2026-11-09 10:00:00", "2026-11-09 10:00:00"),
         ] {
             connection
@@ -2030,9 +2063,8 @@ mod tests {
                 .expect("session");
         }
 
-        let sessions =
-            list_agent_sessions_from_connection(&connection, None, None, Some(true))
-                .expect("session query");
+        let sessions = list_agent_sessions_from_connection(&connection, None, None, Some(true))
+            .expect("session query");
 
         assert_eq!(
             sessions

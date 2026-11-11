@@ -2,6 +2,14 @@ import { CSSProperties, FormEvent, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import {
+  ProjectDependenciesTab,
+  ProjectDiffsTab,
+  ProjectPipelinesTab,
+  ProjectSkillsTab,
+  ProjectTasksTab,
+  ProjectTerminalsTab,
+} from "./project/ProjectFeatureTabs";
 import "./App.css";
 
 type Status = "healthy" | "running" | "waiting" | "failed";
@@ -1139,33 +1147,6 @@ function ProjectsView({
   );
 }
 
-const unavailableProjectSections: Record<Exclude<ProjectSection, "sessions">, { title: string; description: string }> = {
-  tasks: {
-    title: "Project tasks are not available yet",
-    description: "This area will hold the project backlog, task details, and supervised agent runs.",
-  },
-  diffs: {
-    title: "Diff review is not available yet",
-    description: "A project diff viewer and review workflow are planned for a later release.",
-  },
-  terminals: {
-    title: "Project terminals are not available yet",
-    description: "Terminal sessions will be scoped to this repository when terminal support is added.",
-  },
-  pipelines: {
-    title: "Pipeline integrations are not connected",
-    description: "Connect a CI provider in a future release to view runs, logs, and build status here.",
-  },
-  dependencies: {
-    title: "Dependency insights are not available yet",
-    description: "Project dependency and update information will appear here when that integration is available.",
-  },
-  skills: {
-    title: "Project skills are not available yet",
-    description: "Project-specific agent skills will be discoverable and manageable from this section.",
-  },
-};
-
 function ProjectWorkspaceView({
   project,
   transcriptFontSize,
@@ -1211,12 +1192,14 @@ function ProjectWorkspaceView({
           <AgentSessionsView transcriptFontSize={transcriptFontSize} projectId={project.id} />
         </div>
       ) : (
-        <section className="project-module-placeholder" aria-labelledby="project-module-title">
-          <span className="project-module-label">{activeSection.toUpperCase()}</span>
-          <h2 id="project-module-title">{unavailableProjectSections[activeSection].title}</h2>
-          <p>{unavailableProjectSections[activeSection].description}</p>
-          <span className="project-module-status">Not connected in this build</span>
-        </section>
+        <div className="project-section-content">
+          {activeSection === "tasks" && <ProjectTasksTab project={project} />}
+          {activeSection === "diffs" && <ProjectDiffsTab project={project} />}
+          {activeSection === "terminals" && <ProjectTerminalsTab project={project} />}
+          {activeSection === "pipelines" && <ProjectPipelinesTab project={project} />}
+          {activeSection === "dependencies" && <ProjectDependenciesTab project={project} />}
+          {activeSection === "skills" && <ProjectSkillsTab project={project} />}
+        </div>
       )}
     </div>
   );

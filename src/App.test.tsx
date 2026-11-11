@@ -15,6 +15,10 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: vi.fn(),
 }));
 
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(),
+}));
+
 const invokeMock = vi.mocked(invoke);
 
 const settings = {
@@ -32,6 +36,17 @@ beforeEach(() => {
     if (command === "list_agent_sessions") return [];
     if (command === "get_pending_session_permission") return null;
     if (command === "load_settings") return settings;
+    if (command === "list_project_tasks") return [];
+    if (command === "get_project_diff") return { branch: "main", changedFiles: [], diff: "", truncated: false };
+    if (command === "list_project_terminals") return [];
+    if (command === "get_project_pipelines") return {
+      repository: null,
+      configured: false,
+      error: "GitHub Actions are available for projects with a GitHub origin remote.",
+      runs: [],
+    };
+    if (command === "get_project_dependencies") return { manifests: [], dependencies: [], errors: [] };
+    if (command === "list_project_skills") return { global: [], project: [], errors: [] };
     throw new Error(`Unexpected command: ${command}`);
   });
 
@@ -69,6 +84,17 @@ describe("App", () => {
       if (command === "list_agent_sessions") return [];
       if (command === "get_pending_session_permission") return null;
       if (command === "load_settings") return settings;
+      if (command === "list_project_tasks") return [];
+      if (command === "get_project_diff") return { branch: "feature/refresh", changedFiles: [], diff: "", truncated: false };
+      if (command === "list_project_terminals") return [];
+      if (command === "get_project_pipelines") return {
+        repository: null,
+        configured: false,
+        error: "GitHub Actions are available for projects with a GitHub origin remote.",
+        runs: [],
+      };
+      if (command === "get_project_dependencies") return { manifests: [], dependencies: [], errors: [] };
+      if (command === "list_project_skills") return { global: [], project: [], errors: [] };
       throw new Error(`Unexpected command: ${command}`);
     });
 
@@ -95,6 +121,8 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Open workspace" }));
     expect(await screen.findByRole("heading", { name: "website" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "website", current: "page" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "No tasks yet" })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("list_project_tasks", { projectId: "/work/website" });
     for (const section of ["Tasks", "Diffs", "Sessions", "Terminals", "Pipelines", "Dependencies", "Skills"]) {
       expect(screen.getByRole("button", { name: section })).toBeTruthy();
     }
@@ -107,7 +135,94 @@ describe("App", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "Pipelines" }));
-    expect(screen.getByRole("heading", { name: "Pipeline integrations are not connected" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "No GitHub repository connected" })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("get_project_pipelines", { projectId: "/work/website" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Diffs" }));
+    expect(await screen.findByRole("heading", { name: "Working tree is clean" })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("get_project_diff", { projectId: "/work/website" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Terminals" }));
+    expect(await screen.findByRole("heading", { name: "No terminal sessions" })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("list_project_terminals", { projectId: "/work/website" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Dependencies" }));
+    expect(await screen.findByRole("heading", { name: "No supported manifests found" })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("get_project_dependencies", { projectId: "/work/website" });
+
+    fireEvent.click(screen.getByRole("button", { name: "Skills" }));
+    expect(await screen.findByRole("heading", { name: "No skills discovered" })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("list_project_skills", { projectId: "/work/website" });
+  });
+
+  it("creates a project task and links it to a new Copilot session", async () => {
+    const project = {
+      id: "/work/website",
+      name: "website",
+      path: "/work/website",
+      branch: "main",
+      currentCommit: "a1b2c3d4",
+      gitState: "clean" as const,
+    };
+    let task: {
+      id: string;
+      projectId: string;
+      title: string;
+      description: string;
+      status: "backlog" | "in_progress" | "done";
+      sessionId: string | null;
+      createdAt: string;
+      updatedAt: string;
+    } | null = null;
+
+    invokeMock.mockImplementation(async (command, args) => {
+      const payload = args as Record<string, string>;
+      if (command === "list_projects") return [project];
+      if (command === "list_agent_sessions") return [];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "load_settings") return settings;
+      if (command === "list_project_tasks") return task ? [task] : [];
+      if (command === "create_project_task") {
+        task = {
+          id: "task-1",
+          projectId: payload.projectId,
+          title: payload.title,
+          description: payload.description,
+          status: "backlog",
+          sessionId: null,
+          createdAt: "2026-01-01",
+          updatedAt: "2026-01-01",
+        };
+        return task;
+      }
+      if (command === "start_copilot_session") return { id: "session-1" };
+      if (command === "link_project_task_session") {
+        if (task) task = { ...task, status: "in_progress", sessionId: payload.sessionId };
+        return undefined;
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /View all projects/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open workspace" }));
+
+    fireEvent.change(await screen.findByLabelText("Task title"), { target: { value: "Ship onboarding flow" } });
+    fireEvent.change(screen.getByLabelText("Brief"), { target: { value: "Add the welcome screens." } });
+    fireEvent.click(screen.getByRole("button", { name: "Add task" }));
+
+    expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Start session" }));
+    expect(await screen.findByText("Linked session · session-")).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("start_copilot_session", {
+      projectId: "/work/website",
+      task: "Ship onboarding flow\n\nAdd the welcome screens.",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("link_project_task_session", {
+      projectId: "/work/website",
+      taskId: "task-1",
+      sessionId: "session-1",
+    });
   });
 
   it("loads an empty Attention inbox from the backend", async () => {

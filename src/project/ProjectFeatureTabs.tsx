@@ -1,0 +1,1006 @@
+import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import type { Terminal as XTerm } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
+
+type ProjectReference = {
+  id: string;
+  name: string;
+};
+
+type ProjectTask = {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+  status: "backlog" | "in_progress" | "done";
+  sessionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ProjectDiff = {
+  branch: string;
+  changedFiles: string[];
+  diff: string;
+  truncated: boolean;
+};
+
+type DiffFile = {
+  path: string;
+  content: string;
+};
+
+type ProjectDependency = {
+  name: string;
+  version: string;
+  kind: string;
+  manifest: string;
+};
+
+type ProjectDependencies = {
+  manifests: string[];
+  dependencies: ProjectDependency[];
+  errors: string[];
+};
+
+type ProjectSkill = {
+  name: string;
+  description: string;
+  folderName: string;
+  source: "global" | "project";
+  content: string;
+  warning: string | null;
+  shadowed: boolean;
+};
+
+type ProjectSkills = {
+  global: ProjectSkill[];
+  project: ProjectSkill[];
+  errors: string[];
+};
+
+type PipelineRun = {
+  id: string;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  branch: string;
+  url: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ProjectPipelines = {
+  repository: string | null;
+  configured: boolean;
+  error: string | null;
+  runs: PipelineRun[];
+};
+
+type TerminalSnapshot = {
+  id: string;
+  projectId: string;
+  title: string;
+  createdAt: string;
+  alive: boolean;
+  exitCode: number | null;
+  buffer: string;
+  bufferEndOffset: number;
+};
+
+type TerminalOutputEvent = {
+  terminalId: string;
+  projectId: string;
+  chunk: string;
+  endOffset: number;
+};
+
+type TerminalExitEvent = {
+  terminalId: string;
+  projectId: string;
+  exitCode: number | null;
+};
+
+function messageFromError(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function FeatureFrame({
+  eyebrow,
+  title,
+  description,
+  action,
+  children,
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="project-feature" aria-label={title}>
+      <header className="project-feature-header">
+        <div>
+          <p className="project-feature-eyebrow">{eyebrow}</p>
+          <h2>{title}</h2>
+          <p>{description}</p>
+        </div>
+        {action}
+      </header>
+      {children}
+    </section>
+  );
+}
+
+function Feedback({ error }: { error: string }) {
+  return error ? <p className="project-feature-error" role="alert">{error}</p> : null;
+}
+
+export function ProjectTasksTab({ project }: { project: ProjectReference }) {
+  const [tasks, setTasks] = useState<ProjectTask[]>([]);
+  const [title, setTitle] = useState("");
+  const [description, setDescription] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState("");
+  const [startingTaskId, setStartingTaskId] = useState("");
+
+  const loadTasks = useCallback(async () => {
+    setError("");
+    try {
+      setTasks(await invoke<ProjectTask[]>("list_project_tasks", { projectId: project.id }));
+    } catch (loadError) {
+      setError(messageFromError(loadError));
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    void loadTasks();
+  }, [loadTasks]);
+
+  async function createTask(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setError("");
+    try {
+      await invoke<ProjectTask>("create_project_task", {
+        projectId: project.id,
+        title,
+        description,
+      });
+      setTitle("");
+      setDescription("");
+      await loadTasks();
+    } catch (saveError) {
+      setError(messageFromError(saveError));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function setTaskStatus(task: ProjectTask, status: ProjectTask["status"]) {
+    setError("");
+    try {
+      await invoke("set_project_task_status", {
+        projectId: project.id,
+        taskId: task.id,
+        status,
+      });
+      await loadTasks();
+    } catch (updateError) {
+      setError(messageFromError(updateError));
+    }
+  }
+
+  async function startTask(task: ProjectTask) {
+    setStartingTaskId(task.id);
+    setError("");
+    try {
+      const session = await invoke<{ id: string }>("start_copilot_session", {
+        projectId: project.id,
+        task: `${task.title}\n\n${task.description}`.trim(),
+      });
+      await invoke("link_project_task_session", {
+        projectId: project.id,
+        taskId: task.id,
+        sessionId: session.id,
+      });
+      await loadTasks();
+    } catch (startError) {
+      setError(messageFromError(startError));
+    } finally {
+      setStartingTaskId("");
+    }
+  }
+
+  async function deleteTask(task: ProjectTask) {
+    setError("");
+    try {
+      await invoke("delete_project_task", { projectId: project.id, taskId: task.id });
+      setConfirmDeleteId("");
+      await loadTasks();
+    } catch (deleteError) {
+      setError(messageFromError(deleteError));
+    }
+  }
+
+  return (
+    <FeatureFrame
+      eyebrow="PROJECT BACKLOG"
+      title="Tasks"
+      description="Keep the project backlog close to its repository and delegate a task to a Copilot session."
+      action={<button className="project-feature-button" type="button" onClick={() => void loadTasks()} disabled={loading}>Refresh</button>}
+    >
+      <Feedback error={error} />
+      <form className="project-task-form" onSubmit={(event) => void createTask(event)}>
+        <label>
+          Task title
+          <input
+            required
+            maxLength={200}
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            placeholder="What needs to be done?"
+          />
+        </label>
+        <label>
+          Brief
+          <textarea
+            maxLength={20_000}
+            rows={2}
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            placeholder="Add context or acceptance notes"
+          />
+        </label>
+        <button className="project-feature-primary" type="submit" disabled={saving || !title.trim()}>
+          {saving ? "Adding…" : "Add task"}
+        </button>
+      </form>
+
+      {loading && tasks.length === 0 ? (
+        <p className="project-feature-state" role="status">Loading project tasks…</p>
+      ) : tasks.length === 0 ? (
+        <div className="project-feature-empty">
+          <span className="project-feature-empty-mark" aria-hidden="true">✓</span>
+          <h3>No tasks yet</h3>
+          <p>Add the first task to this project backlog.</p>
+        </div>
+      ) : (
+        <div className="project-task-list">
+          {tasks.map((task) => (
+            <article className={`project-task-card ${task.status}`} key={task.id}>
+              <div className="project-task-main">
+                <span className={`project-task-status ${task.status}`}>{task.status.replace("_", " ")}</span>
+                <h3>{task.title}</h3>
+                {task.description && <p>{task.description}</p>}
+                {task.sessionId && <span className="project-task-session">Linked session · {task.sessionId.slice(0, 8)}</span>}
+              </div>
+              <div className="project-task-actions">
+                {task.status !== "done" ? (
+                  <>
+                    {task.status === "backlog" && (
+                      <button
+                        className="project-feature-button"
+                        type="button"
+                        disabled={startingTaskId === task.id}
+                        onClick={() => void startTask(task)}
+                      >
+                        {startingTaskId === task.id ? "Starting…" : "Start session"}
+                      </button>
+                    )}
+                    <button className="project-feature-button" type="button" onClick={() => void setTaskStatus(task, "done")}>Mark done</button>
+                  </>
+                ) : (
+                  <button className="project-feature-button" type="button" onClick={() => void setTaskStatus(task, "backlog")}>Reopen</button>
+                )}
+                {confirmDeleteId === task.id ? (
+                  <span className="project-task-confirm">
+                    <button className="project-feature-danger" type="button" onClick={() => void deleteTask(task)}>Delete</button>
+                    <button className="project-feature-button" type="button" onClick={() => setConfirmDeleteId("")}>Cancel</button>
+                  </span>
+                ) : (
+                  <button className="project-feature-quiet" type="button" onClick={() => setConfirmDeleteId(task.id)}>Delete</button>
+                )}
+              </div>
+            </article>
+          ))}
+        </div>
+      )}
+    </FeatureFrame>
+  );
+}
+
+function parseDiffFiles(diff: string): DiffFile[] {
+  const sections = diff.split(/(?=^diff --git )/m).filter((section) => section.trim());
+  if (sections.length === 0 && diff.trim()) return [{ path: "Working tree diff", content: diff }];
+  return sections.map((content) => {
+    const header = content.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+    return { path: header?.[2] ?? "Changed file", content };
+  });
+}
+
+export function ProjectDiffsTab({ project }: { project: ProjectReference }) {
+  const [snapshot, setSnapshot] = useState<ProjectDiff | null>(null);
+  const [selectedPath, setSelectedPath] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const loadDiff = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      const result = await invoke<ProjectDiff>("get_project_diff", { projectId: project.id });
+      setSnapshot(result);
+      const files = parseDiffFiles(result.diff);
+      setSelectedPath((current) => files.some((file) => file.path === current) ? current : files[0]?.path ?? "");
+    } catch (loadError) {
+      setError(messageFromError(loadError));
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    void loadDiff();
+  }, [loadDiff]);
+
+  const files = parseDiffFiles(snapshot?.diff ?? "");
+  const selectedFile = files.find((file) => file.path === selectedPath);
+
+  return (
+    <FeatureFrame
+      eyebrow="WORKING TREE"
+      title="Diffs"
+      description={snapshot?.branch ? `Review uncommitted changes on ${snapshot.branch}.` : "Review uncommitted changes in this repository."}
+      action={<button className="project-feature-button" type="button" onClick={() => void loadDiff()} disabled={loading}>Refresh diff</button>}
+    >
+      <Feedback error={error} />
+      {loading && !snapshot ? (
+        <p className="project-feature-state" role="status">Reading Git changes…</p>
+      ) : !snapshot || (snapshot.changedFiles.length === 0 && !snapshot.diff) ? (
+        <div className="project-feature-empty">
+          <span className="project-feature-empty-mark" aria-hidden="true">✓</span>
+          <h3>Working tree is clean</h3>
+          <p>Uncommitted changes will appear here for review.</p>
+        </div>
+      ) : (
+        <>
+          {snapshot.truncated && <p className="project-feature-warning" role="status">The diff is large; only the first 2 MB are shown.</p>}
+          <div className="project-diff-layout">
+            <aside className="project-diff-files" aria-label="Changed files">
+              <div className="project-diff-files-heading">
+                <strong>Changed files</strong><span>{snapshot.changedFiles.length}</span>
+              </div>
+              {files.length ? files.map((file) => (
+                <button
+                  type="button"
+                  className={selectedPath === file.path ? "active" : ""}
+                  key={file.path}
+                  onClick={() => setSelectedPath(file.path)}
+                  title={file.path}
+                >
+                  <span aria-hidden="true">▤</span>{file.path}
+                </button>
+              )) : snapshot.changedFiles.map((file) => (
+                <div className="project-diff-unavailable-file" key={file}>{file}</div>
+              ))}
+            </aside>
+            <pre className="project-diff-content" aria-label="Unified diff">
+              {selectedFile?.content ?? "Select a changed file to inspect its diff."}
+            </pre>
+          </div>
+        </>
+      )}
+    </FeatureFrame>
+  );
+}
+
+function ProjectTerminalPane({
+  projectId,
+  terminal,
+  onReady,
+  onData,
+  onResize,
+  onError,
+}: {
+  projectId: string;
+  terminal: TerminalSnapshot;
+  onReady: (id: string, instance: XTerm | null, endOffset: number) => void;
+  onData: (id: string, data: string) => void;
+  onResize: (id: string, cols: number, rows: number) => void;
+  onError: (error: string) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const onReadyRef = useRef(onReady);
+  const onDataRef = useRef(onData);
+  const onResizeRef = useRef(onResize);
+  const onErrorRef = useRef(onError);
+  onReadyRef.current = onReady;
+  onDataRef.current = onData;
+  onResizeRef.current = onResize;
+  onErrorRef.current = onError;
+
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+    let disposed = false;
+    let instance: XTerm | undefined;
+    let dataSubscription: { dispose: () => void } | undefined;
+    let resizeObserver: ResizeObserver | undefined;
+    let resizeFrame = 0;
+
+    void Promise.all([
+      import("@xterm/xterm"),
+      import("@xterm/addon-fit"),
+    ]).then(([terminalModule, fitModule]) => {
+      if (disposed) return;
+      instance = new terminalModule.Terminal({
+        cursorBlink: true,
+        fontFamily: '"JetBrains Mono", "Cascadia Code", monospace',
+        fontSize: 11,
+        scrollback: 5000,
+        screenReaderMode: true,
+        theme: {
+          background: "#080e18",
+          foreground: "#c6d3e7",
+          cursor: "#b7aaff",
+          selectionBackground: "#514487",
+          black: "#111827",
+          red: "#e47b8a",
+          green: "#68c99a",
+          yellow: "#e0bd69",
+          blue: "#8399ed",
+          magenta: "#b39bff",
+          cyan: "#75c9d3",
+          white: "#dce4f3",
+          brightBlack: "#65738e",
+          brightRed: "#ff9ba8",
+          brightGreen: "#90e5b7",
+          brightYellow: "#f4d98d",
+          brightBlue: "#a7b7ff",
+          brightMagenta: "#d1baff",
+          brightCyan: "#9ce3e7",
+          brightWhite: "#ffffff",
+        },
+      });
+      const fit = new fitModule.FitAddon();
+      instance.loadAddon(fit);
+      instance.open(container);
+      fit.fit();
+      instance.write(terminal.buffer);
+      instance.focus();
+      onReadyRef.current(terminal.id, instance, terminal.bufferEndOffset);
+      dataSubscription = instance.onData((data) => onDataRef.current(terminal.id, data));
+      resizeObserver = new ResizeObserver(() => {
+        cancelAnimationFrame(resizeFrame);
+        resizeFrame = requestAnimationFrame(() => {
+          fit.fit();
+          if (instance) onResizeRef.current(terminal.id, instance.cols, instance.rows);
+        });
+      });
+      resizeObserver.observe(container);
+    }).catch((error: unknown) => {
+      if (!disposed) onErrorRef.current(messageFromError(error));
+    });
+
+    return () => {
+      disposed = true;
+      cancelAnimationFrame(resizeFrame);
+      resizeObserver?.disconnect();
+      dataSubscription?.dispose();
+      if (instance) {
+        onReadyRef.current(terminal.id, null, terminal.bufferEndOffset);
+        instance.dispose();
+      }
+    };
+  }, [terminal.id]);
+
+  return <div ref={containerRef} className="project-terminal-output" role="application" aria-label={`${terminal.title} terminal for ${projectId}`} />;
+}
+
+export function ProjectTerminalsTab({ project }: { project: ProjectReference }) {
+  const [terminals, setTerminals] = useState<TerminalSnapshot[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState("");
+  const [pendingDeleteId, setPendingDeleteId] = useState("");
+  const pendingOutput = useRef(new Map<string, TerminalOutputEvent[]>());
+  const terminalInstances = useRef(new Map<string, { instance: XTerm; endOffset: number }>());
+  const inputQueues = useRef(new Map<string, Promise<void>>());
+
+  const loadTerminals = useCallback(async () => {
+    try {
+      const snapshots = await invoke<TerminalSnapshot[]>("list_project_terminals", { projectId: project.id });
+      setTerminals((current) => snapshots.map((snapshot) => {
+        const previous = current.find((terminal) => terminal.id === snapshot.id);
+        if (previous && previous.bufferEndOffset > snapshot.bufferEndOffset) return previous;
+        const queued = pendingOutput.current.get(snapshot.id) ?? [];
+        const newer = queued.filter((event) => event.endOffset > snapshot.bufferEndOffset);
+        pendingOutput.current.delete(snapshot.id);
+        return newer.reduce(
+          (terminal, event) => ({
+            ...terminal,
+            buffer: `${terminal.buffer}${event.chunk}`.slice(-200_000),
+            bufferEndOffset: event.endOffset,
+          }),
+          snapshot,
+        );
+      }));
+      setSelectedId((current) => current && snapshots.some((terminal) => terminal.id === current)
+        ? current
+        : snapshots[0]?.id ?? "");
+    } catch (loadError) {
+      setError(messageFromError(loadError));
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const subscribe = async () => {
+      try {
+        const unlistenOutput = await listen<TerminalOutputEvent>("project-terminal-output", (event) => {
+          if (event.payload.projectId !== project.id) return;
+          const mounted = terminalInstances.current.get(event.payload.terminalId);
+          if (mounted && event.payload.endOffset > mounted.endOffset) {
+            mounted.instance.write(event.payload.chunk);
+            mounted.endOffset = event.payload.endOffset;
+          } else if (!mounted) {
+            const queued = pendingOutput.current.get(event.payload.terminalId) ?? [];
+            queued.push(event.payload);
+            pendingOutput.current.set(event.payload.terminalId, queued.slice(-100));
+          }
+          setTerminals((current) => {
+            const terminal = current.find((item) => item.id === event.payload.terminalId);
+            if (!terminal) return current;
+            if (event.payload.endOffset <= terminal.bufferEndOffset) return current;
+            return current.map((item) => item.id === terminal.id ? {
+              ...item,
+              buffer: `${item.buffer}${event.payload.chunk}`.slice(-200_000),
+              bufferEndOffset: event.payload.endOffset,
+            } : item);
+          });
+        });
+        if (disposed) unlistenOutput();
+        else unlisteners.push(unlistenOutput);
+
+        const unlistenExit = await listen<TerminalExitEvent>("project-terminal-exit", (event) => {
+          if (event.payload.projectId !== project.id) return;
+          setTerminals((current) => current.map((terminal) => terminal.id === event.payload.terminalId
+            ? { ...terminal, alive: false, exitCode: event.payload.exitCode }
+            : terminal));
+        });
+        if (disposed) unlistenExit();
+        else unlisteners.push(unlistenExit);
+      } catch (listenError) {
+        if (!disposed) setError(messageFromError(listenError));
+      }
+    };
+    void subscribe();
+    void loadTerminals();
+    return () => {
+      disposed = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [loadTerminals, project.id]);
+
+  const selectedTerminal = terminals.find((terminal) => terminal.id === selectedId);
+
+  function terminalReady(id: string, instance: XTerm | null, endOffset: number) {
+    if (!instance) {
+      terminalInstances.current.delete(id);
+      return;
+    }
+    terminalInstances.current.set(id, { instance, endOffset });
+    const queued = pendingOutput.current.get(id) ?? [];
+    for (const event of queued) {
+      const mounted = terminalInstances.current.get(id);
+      if (mounted && event.endOffset > mounted.endOffset) {
+        mounted.instance.write(event.chunk);
+        mounted.endOffset = event.endOffset;
+      }
+    }
+    pendingOutput.current.delete(id);
+  }
+
+  function sendTerminalData(terminalId: string, data: string) {
+    const previous = inputQueues.current.get(terminalId) ?? Promise.resolve();
+    const next = previous
+      .then(async () => {
+        await invoke("write_project_terminal", { projectId: project.id, terminalId, data });
+        setError("");
+      })
+      .catch((writeError: unknown) => setError(messageFromError(writeError)));
+    inputQueues.current.set(terminalId, next);
+    return next;
+  }
+
+  function resizeTerminal(terminalId: string, cols: number, rows: number) {
+    void invoke("resize_project_terminal", {
+      projectId: project.id,
+      terminalId,
+      cols,
+      rows,
+    }).catch((resizeError) => setError(messageFromError(resizeError)));
+  }
+
+  async function createTerminal() {
+    setCreating(true);
+    setError("");
+    try {
+      const terminal = await invoke<TerminalSnapshot>("create_project_terminal", {
+        projectId: project.id,
+        cols: 100,
+        rows: 26,
+      });
+      const queued = pendingOutput.current.get(terminal.id) ?? [];
+      pendingOutput.current.delete(terminal.id);
+      const withQueuedOutput = queued
+        .filter((event) => event.endOffset > terminal.bufferEndOffset)
+        .reduce((current, event) => ({
+          ...current,
+          buffer: `${current.buffer}${event.chunk}`.slice(-200_000),
+          bufferEndOffset: event.endOffset,
+        }), terminal);
+      setTerminals((current) => [...current.filter((item) => item.id !== terminal.id), withQueuedOutput]);
+      setSelectedId(terminal.id);
+    } catch (createError) {
+      setError(messageFromError(createError));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  async function closeTerminal(terminal: TerminalSnapshot) {
+    setError("");
+    try {
+      await invoke("close_project_terminal", { projectId: project.id, terminalId: terminal.id });
+      setTerminals((current) => current.filter((item) => item.id !== terminal.id));
+      setSelectedId((current) => current === terminal.id ? "" : current);
+      setPendingDeleteId("");
+    } catch (closeError) {
+      setError(messageFromError(closeError));
+    }
+  }
+
+  return (
+    <FeatureFrame
+      eyebrow="LOCAL SHELL"
+      title="Terminals"
+      description="Interactive shells start in this project's repository folder and remain available while you switch sections."
+      action={<button className="project-feature-primary" type="button" onClick={() => void createTerminal()} disabled={creating}>{creating ? "Starting…" : "New terminal"}</button>}
+    >
+      <Feedback error={error} />
+      <div className="project-terminal-tabs" aria-label="Project terminals">
+        {terminals.map((terminal) => (
+          <button
+            key={terminal.id}
+            type="button"
+            aria-pressed={selectedId === terminal.id}
+            className={selectedId === terminal.id ? "active" : ""}
+            onClick={() => setSelectedId(terminal.id)}
+          >
+            <span className={terminal.alive ? "terminal-live-dot" : "terminal-exited-dot"} aria-hidden="true" />
+            {terminal.title}
+          </button>
+        ))}
+      </div>
+      {selectedTerminal ? (
+        <div className="project-terminal-panel">
+          <div className="project-terminal-toolbar">
+            <span><code>{project.name}</code> · {selectedTerminal.alive ? "Shell running" : `Exited (${selectedTerminal.exitCode ?? "unknown"})`}</span>
+            {pendingDeleteId === selectedTerminal.id ? (
+              <span className="project-task-confirm">
+                <button className="project-feature-danger" type="button" onClick={() => void closeTerminal(selectedTerminal)}>Terminate</button>
+                <button className="project-feature-button" type="button" onClick={() => setPendingDeleteId("")}>Cancel</button>
+              </span>
+            ) : (
+              <button className="project-feature-quiet" type="button" onClick={() => setPendingDeleteId(selectedTerminal.id)}>Close terminal</button>
+            )}
+          </div>
+          <ProjectTerminalPane
+            key={selectedTerminal.id}
+            projectId={project.id}
+            terminal={selectedTerminal}
+            onReady={terminalReady}
+            onData={(id, data) => void sendTerminalData(id, data)}
+            onResize={resizeTerminal}
+            onError={setError}
+          />
+        </div>
+      ) : (
+        <div className="project-feature-empty">
+          <span className="project-feature-empty-mark" aria-hidden="true">›_</span>
+          <h3>{loading ? "Loading terminals…" : "No terminal sessions"}</h3>
+          <p>Start a shell in the project directory for ad hoc commands.</p>
+          <button className="project-feature-primary" type="button" onClick={() => void createTerminal()} disabled={creating}>{creating ? "Starting…" : "Start a terminal"}</button>
+        </div>
+      )}
+    </FeatureFrame>
+  );
+}
+
+function pipelineState(run: PipelineRun) {
+  if (run.status === "completed") return run.conclusion || "completed";
+  return run.status.replace("_", " ");
+}
+
+export function ProjectPipelinesTab({ project }: { project: ProjectReference }) {
+  const [snapshot, setSnapshot] = useState<ProjectPipelines | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const loadPipelines = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setSnapshot(await invoke<ProjectPipelines>("get_project_pipelines", { projectId: project.id }));
+    } catch (loadError) {
+      setError(messageFromError(loadError));
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    void loadPipelines();
+  }, [loadPipelines]);
+
+  async function openRun(url: string) {
+    try {
+      await openUrl(url);
+    } catch (openError) {
+      setError(messageFromError(openError));
+    }
+  }
+
+  return (
+    <FeatureFrame
+      eyebrow="CONTINUOUS INTEGRATION"
+      title="Pipelines"
+      description={snapshot?.repository ? `Recent GitHub Actions runs for ${snapshot.repository}.` : "View recent GitHub Actions runs for this repository."}
+      action={<button className="project-feature-button" type="button" onClick={() => void loadPipelines()} disabled={loading}>Refresh runs</button>}
+    >
+      <Feedback error={error} />
+      {loading && !snapshot ? (
+        <p className="project-feature-state" role="status">Loading workflow runs…</p>
+      ) : snapshot?.error ? (
+        <div className="project-feature-empty">
+          <span className="project-feature-empty-mark" aria-hidden="true">↗</span>
+          <h3>{snapshot.repository ? "GitHub Actions needs setup" : "No GitHub repository connected"}</h3>
+          <p>{snapshot.error}</p>
+        </div>
+      ) : snapshot?.runs.length ? (
+        <div className="project-pipeline-list">
+          {snapshot.runs.map((run) => (
+            <article className="project-pipeline-row" key={run.id}>
+              <span className={`project-pipeline-state ${pipelineState(run).replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`} aria-label={pipelineState(run)} />
+              <div className="project-pipeline-main">
+                <strong>{run.name}</strong>
+                <span><code>{run.branch || "unknown branch"}</code> · Run #{run.id}</span>
+              </div>
+              <span className="project-pipeline-status">{pipelineState(run)}</span>
+              <time dateTime={run.createdAt}>{new Date(run.createdAt).toLocaleString()}</time>
+              <button className="project-feature-quiet" type="button" onClick={() => void openRun(run.url)}>Open run ↗</button>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <div className="project-feature-empty">
+          <span className="project-feature-empty-mark" aria-hidden="true">✓</span>
+          <h3>No workflow runs found</h3>
+          <p>{snapshot?.repository ? "GitHub Actions has not reported any runs for this repository." : "Connect this project to GitHub to load workflow activity."}</p>
+        </div>
+      )}
+    </FeatureFrame>
+  );
+}
+
+export function ProjectDependenciesTab({ project }: { project: ProjectReference }) {
+  const [snapshot, setSnapshot] = useState<ProjectDependencies | null>(null);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  const loadDependencies = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setSnapshot(await invoke<ProjectDependencies>("get_project_dependencies", { projectId: project.id }));
+    } catch (loadError) {
+      setError(messageFromError(loadError));
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    void loadDependencies();
+  }, [loadDependencies]);
+
+  const dependencies = (snapshot?.dependencies ?? []).filter((dependency) =>
+    `${dependency.name} ${dependency.version} ${dependency.kind}`.toLowerCase().includes(query.toLowerCase()),
+  );
+
+  return (
+    <FeatureFrame
+      eyebrow="MANIFESTS"
+      title="Dependencies"
+      description="Inspect direct declarations from package.json, Cargo.toml, and requirements.txt."
+      action={<button className="project-feature-button" type="button" onClick={() => void loadDependencies()} disabled={loading}>Rescan manifests</button>}
+    >
+      <Feedback error={error} />
+      {snapshot?.errors.map((manifestError) => <p className="project-feature-warning" key={manifestError}>{manifestError}</p>)}
+      {loading && !snapshot ? (
+        <p className="project-feature-state" role="status">Scanning dependency manifests…</p>
+      ) : !snapshot?.manifests.length ? (
+        <div className="project-feature-empty">
+          <span className="project-feature-empty-mark" aria-hidden="true">◇</span>
+          <h3>No supported manifests found</h3>
+          <p>Supported root manifests: package.json, Cargo.toml, and requirements.txt.</p>
+        </div>
+      ) : (
+        <>
+          <div className="project-dependency-summary">
+            <div><strong>{snapshot.dependencies.length}</strong><span>direct dependencies</span></div>
+            <div><strong>{snapshot.manifests.join(", ")}</strong><span>detected manifests</span></div>
+          </div>
+          <label className="project-feature-search">
+            <span>Filter dependencies</span>
+            <input type="search" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search package names or scope" />
+          </label>
+          {dependencies.length ? (
+            <div className="project-dependency-list">
+              {dependencies.map((dependency) => (
+                <article key={`${dependency.manifest}:${dependency.kind}:${dependency.name}`}>
+                  <div><strong>{dependency.name}</strong><span>{dependency.manifest}</span></div>
+                  <code>{dependency.version}</code>
+                  <span className={`project-dependency-kind ${dependency.kind}`}>{dependency.kind}</span>
+                </article>
+              ))}
+            </div>
+          ) : (
+            <p className="project-feature-state">No dependencies match this filter.</p>
+          )}
+        </>
+      )}
+    </FeatureFrame>
+  );
+}
+
+export function ProjectSkillsTab({ project }: { project: ProjectReference }) {
+  const [snapshot, setSnapshot] = useState<ProjectSkills | null>(null);
+  const [selectedSkill, setSelectedSkill] = useState<ProjectSkill | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const skillDialogRef = useRef<HTMLElement>(null);
+
+  const loadSkills = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setSnapshot(await invoke<ProjectSkills>("list_project_skills", { projectId: project.id }));
+    } catch (loadError) {
+      setError(messageFromError(loadError));
+    } finally {
+      setLoading(false);
+    }
+  }, [project.id]);
+
+  useEffect(() => {
+    void loadSkills();
+  }, [loadSkills]);
+
+  useEffect(() => {
+    const dialog = skillDialogRef.current;
+    if (!selectedSkill || !dialog) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusable = () => [...dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )];
+    focusable()[0]?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSelectedSkill(null);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const controls = focusable();
+      if (controls.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    dialog.addEventListener("keydown", handleKeyDown);
+    return () => {
+      dialog.removeEventListener("keydown", handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, [selectedSkill]);
+
+  const skills = [...(snapshot?.project ?? []), ...(snapshot?.global ?? [])];
+
+  return (
+    <FeatureFrame
+      eyebrow="AGENT CUSTOMIZATION"
+      title="Skills"
+      description="Discover project-level and personal Claude Code skills that can guide work in this repository."
+      action={<button className="project-feature-button" type="button" onClick={() => void loadSkills()} disabled={loading}>Rescan skills</button>}
+    >
+      <Feedback error={error} />
+      {snapshot?.errors.map((skillError) => <p className="project-feature-warning" key={skillError}>{skillError}</p>)}
+      {loading && !snapshot ? (
+        <p className="project-feature-state" role="status">Discovering skills…</p>
+      ) : skills.length === 0 ? (
+        <div className="project-feature-empty">
+          <span className="project-feature-empty-mark" aria-hidden="true">✦</span>
+          <h3>No skills discovered</h3>
+          <p>Project skills in .claude/skills and personal skills in ~/.claude/skills appear here.</p>
+        </div>
+      ) : (
+        <div className="project-skills-groups">
+          {[
+            { key: "project", label: "Project skills", entries: snapshot?.project ?? [] },
+            { key: "global", label: "Personal skills", entries: snapshot?.global ?? [] },
+          ].map((group) => (
+            group.entries.length > 0 && (
+              <section key={group.key} aria-labelledby={`skills-${group.key}`}>
+                <header><h3 id={`skills-${group.key}`}>{group.label}</h3><span>{group.entries.length}</span></header>
+                <div className="project-skill-grid">
+                  {group.entries.map((skill) => (
+                    <button className="project-skill-card" type="button" key={`${skill.source}:${skill.folderName}`} onClick={() => setSelectedSkill(skill)}>
+                      <span className="project-skill-icon" aria-hidden="true">✦</span>
+                      <strong>{skill.name}</strong>
+                      <span className="project-skill-description">{skill.description || "No description provided."}</span>
+                      <span className="project-skill-meta">
+                        <code>{skill.folderName}</code>
+                        {skill.shadowed && <span>Shadowed by personal skill</span>}
+                        {skill.warning && <span className="project-skill-warning">{skill.warning}</span>}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </section>
+            )
+          ))}
+        </div>
+      )}
+      {selectedSkill && (
+        <div className="project-skill-dialog-backdrop" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setSelectedSkill(null);
+        }}>
+          <section ref={skillDialogRef} className="project-skill-dialog" role="dialog" aria-modal="true" aria-labelledby="selected-skill-title" tabIndex={-1}>
+            <header>
+              <div><span className="project-feature-eyebrow">{selectedSkill.source} skill</span><h3 id="selected-skill-title">{selectedSkill.name}</h3></div>
+              <button className="project-feature-quiet" type="button" onClick={() => setSelectedSkill(null)} aria-label="Close skill details">Close</button>
+            </header>
+            {selectedSkill.description && <p>{selectedSkill.description}</p>}
+            <pre>{selectedSkill.content}</pre>
+          </section>
+        </div>
+      )}
+    </FeatureFrame>
+  );
+}

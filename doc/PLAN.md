@@ -14,7 +14,7 @@ The selected dashboard direction is **Command Center** (`dashboard-concept-a-com
 
 - **Desktop shell:** dark navy application chrome with a fixed left navigation rail and a fluid content canvas.
 - **Navigation rail:** product mark, Dashboard, Projects, Agent sessions, and Attention inbox, followed by a selectable project list and an add-project action. The bottom of the rail shows supervisor connectivity and project counts.
-- **Project workspace:** selecting a project opens its repository context and a persistent section navigation for Tasks, Diffs, Sessions, Terminals, Pipelines, Dependencies, and Skills. Each section is scoped to the selected project; unavailable services must show an explicit empty/planned state rather than fabricated data.
+- **Project workspace:** selecting a project opens its repository context and sections for Tasks, Diffs, Sessions, Terminals, Pipelines, Dependencies, and Skills. Tasks persist in SQLite and can launch a linked Copilot session; Diffs reads tracked and untracked working-tree changes; Terminals use project-rooted PTY shells; Pipelines shows GitHub Actions for a GitHub origin when a token is configured; Dependencies scans direct declarations in root `package.json`, `Cargo.toml`, and `requirements.txt`; Skills discovers personal and project `.claude/skills`. Unsupported providers or missing integrations must show an explicit setup or error state rather than fabricated data.
 - **Header:** greeting/context line, current date, and a prominent **Add project** action.
 - **Dashboard canvas:** four summary cards, a projects table, an attention inbox, a live activity stream, and a pipeline trend card.
 - **Density:** information-rich but scannable; use clear card boundaries, consistent alignment, and short status labels rather than large decorative illustrations.
@@ -232,7 +232,7 @@ Refresh widgets independently, cache successful results, show stale/error states
 
 ### Phase 1 — Tasks and supervised runs
 
-- Implement backlog CRUD and task state machine.
+- Expand the initial project backlog CRUD and Copilot-session link into the full task state machine.
 - Launch and supervise Claude sessions.
 - Stream transcripts and structured status.
 - Add step/token budgets, bounded retries, failure inbox items, and review decisions.
@@ -251,7 +251,7 @@ Refresh widgets independently, cache successful results, show stale/error states
 
 ### Phase 3 — Diff and pipeline monitoring
 
-- Implement diff viewer and run/review integration.
+- Expand the initial working-tree diff viewer into ref-to-ref, grouped, syntax-highlighted, and review integration.
 - Add provider interface, GitHub Actions adapter, and Vercel adapter.
 - Add conditional requests, per-provider backoff, logs, rolling failure rate, and failure notifications.
 
