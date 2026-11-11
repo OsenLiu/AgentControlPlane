@@ -21,6 +21,8 @@ type Project = {
   branch: string;
   currentCommit: string;
   gitState: "clean" | "dirty";
+  looping: boolean;
+  agentTaskCreation: boolean;
 };
 
 type ToolSettings = {
@@ -1150,11 +1152,52 @@ function ProjectsView({
 function ProjectWorkspaceView({
   project,
   transcriptFontSize,
+  onProjectUpdated,
 }: {
   project: Project;
   transcriptFontSize: number;
+  onProjectUpdated: (project: Project) => void;
 }) {
   const [activeSection, setActiveSection] = useState<ProjectSection>("tasks");
+  const [savingAutomation, setSavingAutomation] = useState(false);
+  const [openingEditor, setOpeningEditor] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [openAutomationHelp, setOpenAutomationHelp] = useState<"looping" | "agentTasks" | null>(null);
+
+  async function updateAutomation(looping: boolean, agentTaskCreation: boolean) {
+    setSavingAutomation(true);
+    setWorkspaceError("");
+    try {
+      const updated = await invoke<Project>("set_project_automation", {
+        projectId: project.id,
+        looping,
+        agentTaskCreation,
+      });
+      onProjectUpdated(updated);
+    } catch (reason) {
+      setWorkspaceError(reason instanceof Error ? reason.message : String(reason));
+      try {
+        const latest = (await invoke<Project[]>("list_projects")).find((item) => item.id === project.id);
+        if (latest) onProjectUpdated(latest);
+      } catch (refreshError) {
+        setWorkspaceError(`${reason instanceof Error ? reason.message : String(reason)}; unable to refresh project settings: ${refreshError instanceof Error ? refreshError.message : String(refreshError)}`);
+      }
+    } finally {
+      setSavingAutomation(false);
+    }
+  }
+
+  async function openInVsCode() {
+    setOpeningEditor(true);
+    setWorkspaceError("");
+    try {
+      await invoke("open_project_in_vscode", { projectId: project.id });
+    } catch (reason) {
+      setWorkspaceError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setOpeningEditor(false);
+    }
+  }
 
   return (
     <div className="project-workspace-page">
@@ -1171,7 +1214,59 @@ function ProjectWorkspaceView({
           </span>
           <span className="project-workspace-branch"><span aria-hidden="true">⑂</span><code>{project.branch || "No branch"}</code></span>
         </div>
+        <div className="project-workspace-actions">
+          <div className="project-automation-control">
+            <label className="project-automation-toggle">
+              <input
+                type="checkbox"
+                aria-label="Enable project looping"
+                checked={project.looping}
+                disabled={savingAutomation}
+                onChange={(event) => void updateAutomation(event.target.checked, project.agentTaskCreation)}
+              />
+              <span>Looping</span>
+            </label>
+            <button
+              className="project-info-button"
+              type="button"
+              aria-label="Looping information"
+              aria-expanded={openAutomationHelp === "looping"}
+              aria-controls="project-loop-help"
+              onClick={() => setOpenAutomationHelp(openAutomationHelp === "looping" ? null : "looping")}
+            >i</button>
+            <div className="project-automation-help" id="project-loop-help" role="note" hidden={openAutomationHelp !== "looping"}>
+              Runs selected tasks one at a time until none remain. Loop-launched tasks may auto-approve one-time tools; failures still need you. There is no token cap yet.
+            </div>
+          </div>
+          <div className="project-automation-control">
+            <label className="project-automation-toggle">
+              <input
+                type="checkbox"
+                aria-label="Allow agent task proposals"
+                checked={project.agentTaskCreation}
+                disabled={savingAutomation}
+                onChange={(event) => void updateAutomation(project.looping, event.target.checked)}
+              />
+              <span>Agent tasks</span>
+            </label>
+            <button
+              className="project-info-button"
+              type="button"
+              aria-label="Agent tasks information"
+              aria-expanded={openAutomationHelp === "agentTasks"}
+              aria-controls="project-agent-task-help"
+              onClick={() => setOpenAutomationHelp(openAutomationHelp === "agentTasks" ? null : "agentTasks")}
+            >i</button>
+            <div className="project-automation-help" id="project-agent-task-help" role="note" hidden={openAutomationHelp !== "agentTasks"}>
+              Save agent-proposed follow-up tasks to the backlog. They run only when looping is enabled and the task is selected.
+            </div>
+          </div>
+          <button className="project-editor-button" type="button" disabled={openingEditor} onClick={() => void openInVsCode()}>
+            {openingEditor ? "Opening…" : "VS Code"}
+          </button>
+        </div>
       </header>
+      {workspaceError && <p className="project-feature-error" role="alert">{workspaceError}</p>}
 
       <nav className="project-section-tabs" aria-label={`${project.name} sections`}>
         {projectSections.map(({ id, label }) => (
@@ -1272,6 +1367,23 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    void listen<string>("project-loop-error", (event) => {
+      if (!disposed) setError(event.payload);
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubscribe = unlisten;
+    }).catch((reason) => {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  }, []);
+
   async function loadSettings() {
     try {
       const loaded = await invoke<Settings>("load_settings");
@@ -1347,6 +1459,10 @@ function App() {
     setActiveNav("Project workspace");
   }
 
+  function updateProject(updatedProject: Project) {
+    setProjects((current) => current.map((project) => project.id === updatedProject.id ? updatedProject : project));
+  }
+
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const urgentAttentionCount = attentionItems.filter((item) => item.priority === "High").length;
 
@@ -1415,7 +1531,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} transcriptFontSize={settings.transcriptFontSize} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} transcriptFontSize={settings.transcriptFontSize} onProjectUpdated={updateProject} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>

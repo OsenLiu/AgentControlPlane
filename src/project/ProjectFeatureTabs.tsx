@@ -16,6 +16,8 @@ type ProjectTask = {
   title: string;
   description: string;
   status: "backlog" | "in_progress" | "done";
+  loopEnabled: boolean;
+  origin: "user" | "agent";
   sessionId: string | null;
   createdAt: string;
   updatedAt: string;
@@ -165,6 +167,23 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
     void loadTasks();
   }, [loadTasks]);
 
+  useEffect(() => {
+    let disposed = false;
+    let unsubscribe: (() => void) | undefined;
+    void listen<string>("agent-session-updated", () => {
+      if (!disposed) void loadTasks();
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubscribe = unlisten;
+    }).catch((listenError) => {
+      if (!disposed) setError(messageFromError(listenError));
+    });
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  }, [loadTasks]);
+
   async function createTask(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSaving(true);
@@ -193,6 +212,23 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
         taskId: task.id,
         status,
       });
+      if (status === "done") {
+        await invoke("continue_project_loop", { projectId: project.id });
+      }
+      await loadTasks();
+    } catch (updateError) {
+      setError(messageFromError(updateError));
+    }
+  }
+
+  async function setTaskLoopEnabled(task: ProjectTask, enabled: boolean) {
+    setError("");
+    try {
+      await invoke("set_project_task_loop_enabled", {
+        projectId: project.id,
+        taskId: task.id,
+        enabled,
+      });
       await loadTasks();
     } catch (updateError) {
       setError(messageFromError(updateError));
@@ -203,14 +239,10 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
     setStartingTaskId(task.id);
     setError("");
     try {
-      const session = await invoke<{ id: string }>("start_copilot_session", {
+      await invoke<{ id: string }>("start_copilot_session", {
         projectId: project.id,
         task: `${task.title}\n\n${task.description}`.trim(),
-      });
-      await invoke("link_project_task_session", {
-        projectId: project.id,
         taskId: task.id,
-        sessionId: session.id,
       });
       await loadTasks();
     } catch (startError) {
@@ -235,7 +267,7 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
     <FeatureFrame
       eyebrow="PROJECT BACKLOG"
       title="Tasks"
-      description="Keep the project backlog close to its repository and delegate a task to a Copilot session."
+      description="Delegate tasks to Copilot, choose which backlog items may run in a project loop, and review agent-proposed follow-ups."
       action={<button className="project-feature-button" type="button" onClick={() => void loadTasks()} disabled={loading}>Refresh</button>}
     >
       <Feedback error={error} />
@@ -279,11 +311,23 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
             <article className={`project-task-card ${task.status}`} key={task.id}>
               <div className="project-task-main">
                 <span className={`project-task-status ${task.status}`}>{task.status.replace("_", " ")}</span>
+                {task.origin === "agent" && <span className="project-task-origin">Agent proposal</span>}
                 <h3>{task.title}</h3>
                 {task.description && <p>{task.description}</p>}
                 {task.sessionId && <span className="project-task-session">Linked session · {task.sessionId.slice(0, 8)}</span>}
               </div>
               <div className="project-task-actions">
+                {task.status === "backlog" && (
+                  <label className="project-task-loop-toggle">
+                    <input
+                      type="checkbox"
+                      checked={task.loopEnabled}
+                      aria-label={`Include ${task.title} in project loop`}
+                      onChange={(event) => void setTaskLoopEnabled(task, event.target.checked)}
+                    />
+                    <span>Loop</span>
+                  </label>
+                )}
                 {task.status !== "done" ? (
                   <>
                     {task.status === "backlog" && (

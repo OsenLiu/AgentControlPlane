@@ -38,6 +38,8 @@ pub(crate) struct ProjectTask {
     title: String,
     description: String,
     status: String,
+    loop_enabled: bool,
+    origin: String,
     session_id: Option<String>,
     created_at: String,
     updated_at: String,
@@ -171,21 +173,56 @@ impl Drop for TerminalManager {
 }
 
 pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS project_tasks (
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS project_tasks (
            id TEXT PRIMARY KEY NOT NULL,
            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
            title TEXT NOT NULL,
            description TEXT NOT NULL DEFAULT '',
            status TEXT NOT NULL DEFAULT 'backlog'
              CHECK(status IN ('backlog', 'in_progress', 'done')),
+           loop_enabled INTEGER NOT NULL DEFAULT 1,
+           origin TEXT NOT NULL DEFAULT 'user',
            session_id TEXT,
            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
          );
          CREATE INDEX IF NOT EXISTS idx_project_tasks_project
            ON project_tasks(project_id, updated_at DESC);",
-    )
+        )
+        .and_then(|_| {
+            connection
+                .execute(
+                    "ALTER TABLE project_tasks ADD COLUMN loop_enabled INTEGER NOT NULL DEFAULT 1",
+                    [],
+                )
+                .or_else(|error| {
+                    if error
+                        .to_string()
+                        .contains("duplicate column name: loop_enabled")
+                    {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                })
+        })
+        .and_then(|_| {
+            connection
+                .execute(
+                    "ALTER TABLE project_tasks ADD COLUMN origin TEXT NOT NULL DEFAULT 'user'",
+                    [],
+                )
+                .or_else(|error| {
+                    if error.to_string().contains("duplicate column name: origin") {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                })
+        })
+        .map(|_| ())
 }
 
 fn project_path(database: &Database, project_id: &str) -> Result<PathBuf, String> {
@@ -235,9 +272,11 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTask> {
         title: row.get(2)?,
         description: row.get(3)?,
         status: row.get(4)?,
-        session_id: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        loop_enabled: row.get::<_, i64>(5)? != 0,
+        origin: row.get(6)?,
+        session_id: row.get(7)?,
+        created_at: row.get(8)?,
+        updated_at: row.get(9)?,
     })
 }
 
@@ -245,7 +284,7 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
     ensure_project_exists(connection, project_id)?;
     let mut statement = connection
         .prepare(
-            "SELECT id, project_id, title, description, status, session_id, created_at, updated_at
+            "SELECT id, project_id, title, description, status, loop_enabled, origin, session_id, created_at, updated_at
              FROM project_tasks
              WHERE project_id = ?1
              ORDER BY CASE status WHEN 'backlog' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
@@ -304,7 +343,7 @@ pub(crate) fn create_project_task(
         .map_err(|error| format!("Unable to create project task: {error}"))?;
     connection
         .query_row(
-            "SELECT id, project_id, title, description, status, session_id, created_at, updated_at
+            "SELECT id, project_id, title, description, status, loop_enabled, origin, session_id, created_at, updated_at
              FROM project_tasks WHERE id = ?1",
             [&id],
             task_from_row,
@@ -339,6 +378,275 @@ pub(crate) fn set_project_task_status(
     } else {
         Err("The task was not found in this project.".to_owned())
     }
+}
+
+#[tauri::command]
+pub(crate) fn set_project_task_loop_enabled(
+    project_id: String,
+    task_id: String,
+    enabled: bool,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Project database is unavailable.".to_owned())?;
+    let changed = connection
+        .execute(
+            "UPDATE project_tasks
+             SET loop_enabled = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND project_id = ?3 AND status = 'backlog'",
+            params![enabled, task_id, project_id],
+        )
+        .map_err(|error| format!("Unable to update task loop selection: {error}"))?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err("Only a backlog task in this project can be selected for looping.".to_owned())
+    }
+}
+
+pub(crate) struct LoopTask {
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) description: String,
+}
+
+pub(crate) fn take_next_loop_task(
+    connection: &Connection,
+    project_id: &str,
+) -> Result<Option<LoopTask>, String> {
+    let looping = connection
+        .query_row(
+            "SELECT looping FROM projects WHERE id = ?1",
+            [project_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Unable to read project looping setting: {error}"))?
+        .unwrap_or(0);
+    if looping == 0 {
+        return Ok(None);
+    }
+    let active_task = connection
+        .query_row(
+            "SELECT 1 FROM project_tasks
+             WHERE project_id = ?1 AND status = 'in_progress' LIMIT 1",
+            [project_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("Unable to check active project tasks: {error}"))?
+        .is_some();
+    if active_task {
+        return Ok(None);
+    }
+    let active_session = connection
+        .query_row(
+            "SELECT 1 FROM agent_sessions
+             WHERE project_id = ?1 AND status IN ('starting', 'running', 'waiting')
+             LIMIT 1",
+            [project_id],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("Unable to check active project sessions: {error}"))?
+        .is_some();
+    if active_session {
+        return Ok(None);
+    }
+    let task = connection
+        .query_row(
+            "SELECT id, title, description FROM project_tasks
+             WHERE project_id = ?1 AND status = 'backlog' AND loop_enabled = 1
+             ORDER BY created_at, id LIMIT 1",
+            [project_id],
+            |row| {
+                Ok(LoopTask {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    description: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Unable to select the next loop task: {error}"))?;
+    if let Some(task) = task {
+        connection
+            .execute(
+                "UPDATE project_tasks SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1 AND project_id = ?2 AND status = 'backlog'",
+                params![task.id, project_id],
+            )
+            .map_err(|error| format!("Unable to claim the next loop task: {error}"))?;
+        Ok(Some(task))
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn finish_project_task_session(
+    connection: &Connection,
+    session_id: &str,
+    success: bool,
+) -> Result<bool, String> {
+    let task = connection
+        .query_row(
+            "SELECT t.id, t.loop_enabled, p.looping, p.agent_task_creation
+             FROM project_tasks t JOIN projects p ON p.id = t.project_id
+             WHERE t.session_id = ?1 AND t.status = 'in_progress'",
+            [session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, i64>(2)? != 0,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Unable to find the task for the completed session: {error}"))?;
+    let Some((task_id, task_loop_enabled, looping, agent_task_creation)) = task else {
+        let agent_task_creation = connection
+            .query_row(
+                "SELECT p.agent_task_creation FROM agent_sessions s
+                 JOIN projects p ON p.id = s.project_id WHERE s.id = ?1",
+                [session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to read agent-task setting: {error}"))?
+            .unwrap_or(0);
+        return Ok(agent_task_creation != 0);
+    };
+    if !success {
+        connection
+            .execute(
+                "UPDATE project_tasks SET status = 'backlog', session_id = NULL,
+                          updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                [&task_id],
+            )
+            .map_err(|error| format!("Unable to mark the failed task: {error}"))?;
+    } else if looping && task_loop_enabled {
+        connection
+            .execute(
+                "UPDATE project_tasks SET status = 'done', updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                [&task_id],
+            )
+            .map_err(|error| format!("Unable to accept the completed task: {error}"))?;
+    }
+    Ok(agent_task_creation)
+}
+
+pub(crate) fn create_agent_task_proposals(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<(), String> {
+    let project_id = connection
+        .query_row(
+            "SELECT p.id FROM projects p JOIN agent_sessions s ON s.project_id = p.id
+             WHERE s.id = ?1 AND p.agent_task_creation = 1",
+            [session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Unable to check agent-task setting: {error}"))?;
+    let Some(project_id) = project_id else {
+        return Ok(());
+    };
+    let mut statement = connection
+        .prepare(
+            "SELECT content FROM session_messages
+             WHERE session_id = ?1 AND role = 'assistant' ORDER BY sequence",
+        )
+        .map_err(|error| format!("Unable to read assistant task proposals: {error}"))?;
+    let messages = statement
+        .query_map([session_id], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("Unable to read assistant task proposals: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("Unable to decode assistant task proposals: {error}"))?;
+    for (title, description) in messages
+        .iter()
+        .flat_map(|message| parse_agent_task_blocks(message))
+    {
+        let duplicate = connection
+            .query_row(
+                "SELECT 1 FROM project_tasks
+                 WHERE project_id = ?1 AND title = ?2 COLLATE NOCASE LIMIT 1",
+                params![project_id, title],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to check duplicate agent task: {error}"))?
+            .is_some();
+        if !duplicate {
+            connection
+                .execute(
+                    "INSERT INTO project_tasks (id, project_id, title, description, origin)
+                     VALUES (?1, ?2, ?3, ?4, 'agent')",
+                    params![new_id("task"), project_id, title, description],
+                )
+                .map_err(|error| format!("Unable to create proposed project task: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn parse_agent_task_blocks(text: &str) -> Vec<(String, String)> {
+    let mut proposals = Vec::new();
+    for section in text.split("```").skip(1).step_by(2) {
+        let Some((language, json)) = section.split_once('\n') else {
+            continue;
+        };
+        if !language.trim().eq_ignore_ascii_case("apt-task") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(json.trim()) else {
+            continue;
+        };
+        let Some(title) = value
+            .get("title")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty() && value.chars().count() <= MAX_TASK_TITLE)
+        else {
+            continue;
+        };
+        let Some(purpose) = value
+            .get("purpose")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        let mut description = purpose.to_owned();
+        if let Some(criteria) = value.get("acceptanceCriteria").and_then(Value::as_array) {
+            let criteria = criteria
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|criterion| !criterion.is_empty())
+                .collect::<Vec<_>>();
+            if !criteria.is_empty() {
+                description.push_str("\n\nAcceptance criteria:\n");
+                description.push_str(
+                    &criteria
+                        .iter()
+                        .map(|criterion| format!("- {criterion}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        }
+        if description.chars().count() <= MAX_TASK_DESCRIPTION {
+            proposals.push((title.to_owned(), description));
+        }
+    }
+    proposals
 }
 
 #[tauri::command]
@@ -1437,5 +1745,223 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "in_progress");
         assert_eq!(tasks[0].session_id.as_deref(), Some("session-1"));
+        assert!(tasks[0].loop_enabled);
+        assert_eq!(tasks[0].origin, "user");
+    }
+
+    #[test]
+    fn existing_tasks_migrate_with_loop_selection_enabled() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
+                 CREATE TABLE project_tasks (
+                   id TEXT PRIMARY KEY NOT NULL,
+                   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                   title TEXT NOT NULL,
+                   description TEXT NOT NULL DEFAULT '',
+                   status TEXT NOT NULL DEFAULT 'backlog'
+                     CHECK(status IN ('backlog', 'in_progress', 'done')),
+                   session_id TEXT,
+                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO projects (id, path) VALUES ('project-1', '/tmp/project-1');
+                 INSERT INTO project_tasks (id, project_id, title)
+                   VALUES ('task-1', 'project-1', 'Existing task');",
+            )
+            .expect("legacy feature schema");
+
+        initialize_schema(&connection).expect("task migration");
+        let tasks = list_tasks(&connection, "project-1").expect("migrated tasks");
+        assert_eq!(tasks.len(), 1);
+        assert!(tasks[0].loop_enabled);
+        assert_eq!(tasks[0].origin, "user");
+    }
+
+    #[test]
+    fn loop_selection_claims_only_eligible_backlog_tasks() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                   id TEXT PRIMARY KEY, path TEXT NOT NULL,
+                   looping INTEGER NOT NULL DEFAULT 0,
+                   agent_task_creation INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE agent_sessions (
+                  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT NOT NULL
+                );",
+            )
+            .expect("core schema");
+        initialize_schema(&connection).expect("feature schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, path, looping) VALUES ('project-1', '/tmp/project-1', 1)",
+                [],
+            )
+            .expect("project row");
+        connection
+            .execute_batch(
+                "INSERT INTO project_tasks (id, project_id, title) VALUES
+                   ('task-a', 'project-1', 'First'),
+                   ('task-b', 'project-1', 'Second');
+                 UPDATE project_tasks SET loop_enabled = 0 WHERE id = 'task-b';",
+            )
+            .expect("task rows");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions (id, project_id, status)
+                 VALUES ('active-session', 'project-1', 'running')",
+                [],
+            )
+            .expect("active session");
+        assert!(
+            take_next_loop_task(&connection, "project-1")
+                .expect("active session prevents a new loop task")
+                .is_none()
+        );
+        connection
+            .execute(
+                "UPDATE agent_sessions SET status = 'completed' WHERE id = 'active-session'",
+                [],
+            )
+            .expect("complete active session");
+
+        let first = take_next_loop_task(&connection, "project-1")
+            .expect("select task")
+            .expect("eligible task");
+        assert_eq!(first.id, "task-a");
+        assert!(
+            take_next_loop_task(&connection, "project-1")
+                .expect("active task prevents a second selection")
+                .is_none()
+        );
+        connection
+            .execute(
+                "UPDATE project_tasks SET status = 'done' WHERE id = 'task-a'",
+                [],
+            )
+            .expect("complete first task");
+        assert!(
+            take_next_loop_task(&connection, "project-1")
+                .expect("excluded task")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn task_completion_requires_project_and_task_loop_opt_in() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                   id TEXT PRIMARY KEY, path TEXT NOT NULL,
+                   looping INTEGER NOT NULL DEFAULT 0,
+                   agent_task_creation INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL);",
+            )
+            .expect("core schema");
+        initialize_schema(&connection).expect("feature schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, path, looping, agent_task_creation)
+                   VALUES ('project-1', '/tmp/project-1', 1, 1);
+                 INSERT INTO agent_sessions (id, project_id) VALUES
+                   ('session-1', 'project-1'), ('session-2', 'project-1');
+                 INSERT INTO project_tasks (id, project_id, title, status, session_id)
+                   VALUES ('task-1', 'project-1', 'Auto-accepted', 'in_progress', 'session-1');
+                 INSERT INTO project_tasks
+                   (id, project_id, title, status, loop_enabled, session_id)
+                   VALUES ('task-2', 'project-1', 'Manual review', 'in_progress', 0, 'session-2');",
+            )
+            .expect("fixture rows");
+
+        assert!(
+            finish_project_task_session(&connection, "session-1", true)
+                .expect("finish linked task")
+        );
+        let first_status: String = connection
+            .query_row(
+                "SELECT status FROM project_tasks WHERE id = 'task-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("first status");
+        assert_eq!(first_status, "done");
+
+        assert!(
+            finish_project_task_session(&connection, "session-2", true)
+                .expect("finish excluded task")
+        );
+        let second_status: String = connection
+            .query_row(
+                "SELECT status FROM project_tasks WHERE id = 'task-2'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("second status");
+        assert_eq!(second_status, "in_progress");
+        finish_project_task_session(&connection, "session-2", false)
+            .expect("mark failed task for retry");
+        let retry: (String, Option<String>) = connection
+            .query_row(
+                "SELECT status, session_id FROM project_tasks WHERE id = 'task-2'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("retry status");
+        assert_eq!(retry, ("backlog".to_owned(), None));
+    }
+
+    #[test]
+    fn agent_task_blocks_create_deduplicated_backlog_proposals() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                   id TEXT PRIMARY KEY, path TEXT NOT NULL,
+                   looping INTEGER NOT NULL DEFAULT 0,
+                   agent_task_creation INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL);
+                 CREATE TABLE session_messages (
+                   id TEXT PRIMARY KEY, session_id TEXT NOT NULL, sequence INTEGER NOT NULL,
+                   role TEXT NOT NULL, content TEXT NOT NULL DEFAULT ''
+                 );",
+            )
+            .expect("core schema");
+        initialize_schema(&connection).expect("feature schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, path, agent_task_creation)
+                   VALUES ('project-1', '/tmp/project-1', 1);
+                 INSERT INTO agent_sessions (id, project_id) VALUES ('session-1', 'project-1');
+                 INSERT INTO session_messages (id, session_id, sequence, role, content)
+                   VALUES ('message-1', 'session-1', 1, 'assistant',
+                     'Follow-up: ```apt-task
+                     {\"title\":\"Add audit log\",\"purpose\":\"Keep a history\",\"acceptanceCriteria\":[\"Users can inspect events\"]}
+                     ```');
+                 INSERT INTO project_tasks (id, project_id, title)
+                   VALUES ('existing', 'project-1', 'ADD AUDIT LOG');",
+            )
+            .expect("fixture rows");
+
+        create_agent_task_proposals(&connection, "session-1").expect("create proposals");
+        assert_eq!(
+            list_tasks(&connection, "project-1")
+                .expect("task list")
+                .len(),
+            1
+        );
+        connection
+            .execute("DELETE FROM project_tasks WHERE id = 'existing'", [])
+            .expect("remove duplicate");
+        create_agent_task_proposals(&connection, "session-1").expect("create proposal");
+        let tasks = list_tasks(&connection, "project-1").expect("task list");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].origin, "agent");
+        assert!(tasks[0].description.contains("- Users can inspect events"));
     }
 }

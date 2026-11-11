@@ -163,6 +163,8 @@ describe("App", () => {
       branch: "main",
       currentCommit: "a1b2c3d4",
       gitState: "clean" as const,
+      looping: false,
+      agentTaskCreation: false,
     };
     let task: {
       id: string;
@@ -170,6 +172,8 @@ describe("App", () => {
       title: string;
       description: string;
       status: "backlog" | "in_progress" | "done";
+      loopEnabled: boolean;
+      origin: "user" | "agent";
       sessionId: string | null;
       createdAt: string;
       updatedAt: string;
@@ -182,6 +186,10 @@ describe("App", () => {
       if (command === "get_pending_session_permission") return null;
       if (command === "load_settings") return settings;
       if (command === "list_project_tasks") return task ? [task] : [];
+      if (command === "set_project_task_loop_enabled") {
+        if (task) task = { ...task, loopEnabled: Boolean(payload.enabled) };
+        return undefined;
+      }
       if (command === "create_project_task") {
         task = {
           id: "task-1",
@@ -189,15 +197,16 @@ describe("App", () => {
           title: payload.title,
           description: payload.description,
           status: "backlog",
+          loopEnabled: true,
+          origin: "user",
           sessionId: null,
           createdAt: "2026-01-01",
           updatedAt: "2026-01-01",
         };
         return task;
       }
-      if (command === "start_copilot_session") return { id: "session-1" };
-      if (command === "link_project_task_session") {
-        if (task) task = { ...task, status: "in_progress", sessionId: payload.sessionId };
+      if (command === "start_copilot_session") {
+        if (task) task = { ...task, status: "in_progress", sessionId: "session-1" };
         return undefined;
       }
       throw new Error(`Unexpected command: ${command}`);
@@ -212,17 +221,77 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add task" }));
 
     expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Include Ship onboarding flow in project loop" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_project_task_loop_enabled", {
+      projectId: "/work/website",
+      taskId: "task-1",
+      enabled: false,
+    }));
     fireEvent.click(screen.getByRole("button", { name: "Start session" }));
     expect(await screen.findByText("Linked session · session-")).toBeTruthy();
     expect(invokeMock).toHaveBeenCalledWith("start_copilot_session", {
       projectId: "/work/website",
       task: "Ship onboarding flow\n\nAdd the welcome screens.",
-    });
-    expect(invokeMock).toHaveBeenCalledWith("link_project_task_session", {
-      projectId: "/work/website",
       taskId: "task-1",
-      sessionId: "session-1",
     });
+  });
+
+  it("saves project automation settings and opens the project in VS Code", async () => {
+    const project = {
+      id: "/work/project",
+      name: "project",
+      path: "/work/project",
+      branch: "main",
+      currentCommit: "abcdef0",
+      gitState: "clean" as const,
+      looping: false,
+      agentTaskCreation: false,
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [project];
+      if (command === "list_agent_sessions") return [];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "load_settings") return settings;
+      if (command === "list_project_tasks") return [];
+      if (command === "set_project_automation") return { ...project, looping: true };
+      if (command === "open_project_in_vscode") return undefined;
+      if (command === "get_project_diff") return { branch: "main", changedFiles: [], diff: "", truncated: false };
+      if (command === "list_project_terminals") return [];
+      if (command === "get_project_pipelines") return {
+        repository: null,
+        configured: false,
+        error: "GitHub Actions are available for projects with a GitHub origin remote.",
+        runs: [],
+      };
+      if (command === "get_project_dependencies") return { manifests: [], dependencies: [], errors: [] };
+      if (command === "list_project_skills") return { global: [], project: [], errors: [] };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /View all projects/ }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open workspace" }));
+    fireEvent.click(screen.getByRole("button", { name: "Looping information" }));
+    expect(screen.getByText(/Runs selected tasks one at a time/)).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Looping information" }));
+    expect(screen.getByText(/Runs selected tasks one at a time/)).not.toBeVisible();
+    fireEvent.click(await screen.findByRole("checkbox", { name: "Enable project looping" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_project_automation", {
+      projectId: project.id,
+      looping: true,
+      agentTaskCreation: false,
+    }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Allow agent task proposals" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_project_automation", {
+      projectId: project.id,
+      looping: true,
+      agentTaskCreation: true,
+    }));
+    fireEvent.click(screen.getByRole("button", { name: "VS Code" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("open_project_in_vscode", {
+      projectId: project.id,
+    }));
   });
 
   it("loads an empty Attention inbox from the backend", async () => {

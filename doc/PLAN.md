@@ -243,11 +243,14 @@ Refresh widgets independently, cache successful results, show stale/error states
 ### Phase 2 — Dashboard, inbox, looping, and sessions
 
 - Build cross-project dashboard and attention inbox.
-- Add project looping mode with safety limits.
+- Add project looping mode, per-task loop selection, and agent-proposed backlog tasks.
+- Open the current project in VS Code from its workspace.
 - Add live session discovery, replies, and permission-mode controls.
 - Add native notifications and deep links.
 
 **Exit criteria:** A user can manage multiple projects from one queue and run a project backlog hands-free while questions and failures still interrupt them.
+
+The current Copilot implementation persists looping and agent-task settings per project (both disabled by default). Looping starts one selected backlog task at a time and only accepts a linked task when it reports `apt-status` complete with `gatePassed: true`; failures return to backlog, while questions and unverified completions remain in the attention flow. Successful opted-in task runs continue to the next eligible item. Only one-time permission options are auto-approved for loop-owned sessions. Agents can add deduplicated draft tasks with fenced `apt-task` JSON blocks when agent-task creation is enabled; individual backlog tasks can be excluded from looping. Numeric token, step, and daily budgets remain future work.
 
 ### Phase 3 — Diff and pipeline monitoring
 

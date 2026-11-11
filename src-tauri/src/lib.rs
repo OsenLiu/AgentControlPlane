@@ -20,12 +20,15 @@ use tauri::{Emitter, Manager, State};
 mod project_features;
 
 use project_features::{
-    TerminalManager, close_project_terminal, create_project_task, create_project_terminal,
-    delete_project_task, get_project_dependencies, get_project_diff, get_project_pipelines,
-    link_project_task_session, list_project_skills, list_project_tasks, list_project_terminals,
-    resize_project_terminal, set_project_task_status, write_project_terminal,
+    TerminalManager, close_project_terminal, create_agent_task_proposals, create_project_task,
+    create_project_terminal, delete_project_task, finish_project_task_session,
+    get_project_dependencies, get_project_diff, get_project_pipelines, link_project_task_session,
+    list_project_skills, list_project_tasks, list_project_terminals, resize_project_terminal,
+    set_project_task_loop_enabled, set_project_task_status, take_next_loop_task,
+    write_project_terminal,
 };
 
+#[derive(Clone)]
 struct Database(pub(crate) Arc<Mutex<Connection>>);
 struct SessionProcesses(Arc<Mutex<HashMap<String, SessionControl>>>);
 
@@ -68,6 +71,8 @@ struct Project {
     branch: String,
     current_commit: String,
     git_state: String,
+    looping: bool,
+    agent_task_creation: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,6 +207,8 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
         branch: row.get(3)?,
         current_commit: row.get(4)?,
         git_state: row.get(5)?,
+        looping: row.get::<_, i64>(6)? != 0,
+        agent_task_creation: row.get::<_, i64>(7)? != 0,
     })
 }
 
@@ -576,6 +583,7 @@ fn send_copilot_message(
     control: &SessionControl,
     message: &str,
     app: &tauri::AppHandle,
+    processes: &SessionProcesses,
     is_initial_prompt: bool,
 ) -> Result<(), String> {
     let message = message.trim();
@@ -648,6 +656,7 @@ fn send_copilot_message(
     match result {
         Ok(_) => {
             update_session_status(database, session_id, "idle", "Ready for your message", "")?;
+            handle_project_task_turn(database, session_id, processes, app);
             app.emit("agent-session-updated", session_id)
                 .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
             Ok(())
@@ -660,6 +669,7 @@ fn send_copilot_message(
                 "Copilot request failed",
                 &error,
             )?;
+            fail_project_task(database, session_id, app);
             let _ = app.emit("agent-session-updated", session_id);
             Err(error)
         }
@@ -832,7 +842,7 @@ fn list_projects(database: State<'_, Database>) -> Result<Vec<Project>, String> 
         .map_err(|_| "Project database is unavailable.".to_owned())?;
     let mut statement = connection
         .prepare(
-            "SELECT id, name, path, branch, current_commit, git_state
+            "SELECT id, name, path, branch, current_commit, git_state, looping, agent_task_creation
              FROM projects ORDER BY name COLLATE NOCASE",
         )
         .map_err(|error| format!("Unable to read projects: {error}"))?;
@@ -842,6 +852,402 @@ fn list_projects(database: State<'_, Database>) -> Result<Vec<Project>, String> 
         .map_err(|error| format!("Unable to read projects: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode project data: {error}"))
+}
+
+#[tauri::command]
+async fn set_project_automation(
+    project_id: String,
+    looping: bool,
+    agent_task_creation: bool,
+    database: State<'_, Database>,
+    processes: State<'_, SessionProcesses>,
+    app: tauri::AppHandle,
+) -> Result<Project, String> {
+    let database = Database(database.0.clone());
+    let processes = SessionProcesses(processes.0.clone());
+    run_agent_operation(move || {
+        {
+            let connection = database
+                .0
+                .lock()
+                .map_err(|_| "Project database is unavailable.".to_owned())?;
+            let changed = connection
+                .execute(
+                    "UPDATE projects SET looping = ?1, agent_task_creation = ?2,
+                     updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+                    params![looping, agent_task_creation, project_id],
+                )
+                .map_err(|error| format!("Unable to save project automation settings: {error}"))?;
+            if changed == 0 {
+                return Err("The selected project is no longer registered.".to_owned());
+            }
+        }
+        if looping {
+            maybe_start_next_loop_task(
+                project_id.clone(),
+                database.clone(),
+                processes,
+                app.clone(),
+            )?;
+        }
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Project database is unavailable.".to_owned())?;
+        connection
+            .query_row(
+                "SELECT id, name, path, branch, current_commit, git_state, looping, agent_task_creation
+                 FROM projects WHERE id = ?1",
+                [&project_id],
+                project_from_row,
+            )
+            .map_err(|error| format!("Unable to read updated project settings: {error}"))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn continue_project_loop(
+    project_id: String,
+    database: State<'_, Database>,
+    processes: State<'_, SessionProcesses>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let database = Database(database.0.clone());
+    let processes = SessionProcesses(processes.0.clone());
+    run_agent_operation(move || {
+        maybe_start_next_loop_task(project_id, database, processes, app)?;
+        Ok(())
+    })
+    .await
+}
+
+#[tauri::command]
+fn open_project_in_vscode(project_id: String, database: State<'_, Database>) -> Result<(), String> {
+    let path = {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Project database is unavailable.".to_owned())?;
+        connection
+            .query_row(
+                "SELECT path FROM projects WHERE id = ?1",
+                [&project_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("Unable to find project folder: {error}"))?
+    };
+    let project_path = Path::new(&path)
+        .canonicalize()
+        .map_err(|error| format!("The project folder is unavailable: {error}"))?;
+    #[allow(unused_mut)]
+    let mut executables = vec![PathBuf::from("code"), PathBuf::from("code-insiders")];
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            executables.push(
+                PathBuf::from(home)
+                    .join("Applications/Visual Studio Code.app/Contents/Resources/app/bin/code"),
+            );
+        }
+        executables.push(PathBuf::from(
+            "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+        ));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            executables
+                .push(PathBuf::from(local_app_data).join("Programs/Microsoft VS Code/Code.exe"));
+        }
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            executables.push(PathBuf::from(program_files).join("Microsoft VS Code/Code.exe"));
+        }
+        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+            executables.push(PathBuf::from(program_files_x86).join("Microsoft VS Code/Code.exe"));
+        }
+    }
+    let mut last_error = None;
+    for executable in executables {
+        match Command::new(executable)
+            .arg("--new-window")
+            .arg(&project_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                last_error = Some(error);
+            }
+            Err(error) => {
+                return Err(format!("Unable to open the project in VS Code: {error}"));
+            }
+        }
+    }
+    Err(format!(
+        "VS Code was not found on PATH. Install its `code` command and try again.{}",
+        last_error
+            .map(|error| format!(" ({error})"))
+            .unwrap_or_default()
+    ))
+}
+
+fn project_session_auto_approve_permissions(
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+) -> Result<bool, String> {
+    let connection = database
+        .lock()
+        .map_err(|_| "Project database is unavailable.".to_owned())?;
+    match connection.query_row(
+        "SELECT p.looping FROM projects p
+         JOIN agent_sessions s ON s.project_id = p.id
+         JOIN project_tasks t ON t.project_id = p.id
+         WHERE s.id = ?1 AND s.loop_owned = 1
+           AND t.session_id = s.id AND t.status = 'in_progress'
+           AND t.loop_enabled = 1",
+        [session_id],
+        |row| row.get::<_, i64>(0),
+    ) {
+        Ok(looping) => Ok(looping != 0),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(error) => Err(format!(
+            "Unable to check whether this session is loop-owned: {error}"
+        )),
+    }
+}
+
+fn maybe_start_next_loop_task(
+    project_id: String,
+    database: Database,
+    processes: SessionProcesses,
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    let task = {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Project database is unavailable.".to_owned())?;
+        take_next_loop_task(&connection, &project_id)?
+    };
+    let Some(task) = task else {
+        return Ok(false);
+    };
+    let task_prompt = format!("{}\n\n{}", task.title, task.description)
+        .trim()
+        .to_owned();
+    if let Err(error) = start_copilot_session_blocking(
+        Some(project_id.clone()),
+        task_prompt,
+        None,
+        Some(task.id.clone()),
+        true,
+        database.clone(),
+        processes,
+        app.clone(),
+    ) {
+        let reset_result = database
+            .0
+            .lock()
+            .map_err(|_| "Project database is unavailable.".to_owned())
+            .and_then(|connection| {
+                connection
+                    .execute(
+                        "UPDATE project_tasks SET status = 'backlog', session_id = NULL,
+                         updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND project_id = ?2
+                           AND status = 'in_progress'",
+                        params![task.id, project_id],
+                    )
+                    .map(|_| ())
+                    .map_err(|reset_error| format!("Unable to reset the loop task: {reset_error}"))
+            });
+        return match reset_result {
+            Ok(()) => Err(error),
+            Err(reset_error) => Err(format!("{error}; additionally, {reset_error}")),
+        };
+    }
+    Ok(true)
+}
+
+struct AptStatusReport {
+    state: String,
+    note: String,
+    gate_passed: Option<bool>,
+}
+
+fn parse_apt_status_report(text: &str) -> Option<AptStatusReport> {
+    let sections = text.split("```").collect::<Vec<_>>();
+    for section in sections
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| index % 2 == 1)
+        .map(|(_, section)| *section)
+        .rev()
+    {
+        let Some((language, json)) = section.split_once('\n') else {
+            continue;
+        };
+        if !language.trim().eq_ignore_ascii_case("apt-status") {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(json.trim()) else {
+            continue;
+        };
+        let Some(state) = value
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|state| matches!(*state, "working" | "question" | "blocked" | "complete"))
+        else {
+            continue;
+        };
+        return Some(AptStatusReport {
+            state: state.to_owned(),
+            note: value
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned(),
+            gate_passed: value.get("gatePassed").and_then(Value::as_bool),
+        });
+    }
+    None
+}
+
+fn handle_project_task_turn(
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    processes: &SessionProcesses,
+    app: &tauri::AppHandle,
+) {
+    let result =
+        (|| -> Result<(Option<(String, bool)>, Option<(String, String, String)>), String> {
+            let connection = database
+                .lock()
+                .map_err(|_| "Project database is unavailable.".to_owned())?;
+            let (project_id, looping, agent_task_creation, task) = connection
+                .query_row(
+                    "SELECT s.project_id, p.looping, p.agent_task_creation,
+                        t.loop_enabled
+                 FROM agent_sessions s
+                 JOIN projects p ON p.id = s.project_id
+                 LEFT JOIN project_tasks t ON t.session_id = s.id
+                 WHERE s.id = ?1",
+                    [session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)? != 0,
+                            row.get::<_, i64>(2)? != 0,
+                            row.get::<_, Option<i64>>(3)?.map(|enabled| enabled != 0),
+                        ))
+                    },
+                )
+                .map_err(|error| format!("Unable to read task session settings: {error}"))?;
+            let assistant_text = connection
+                .query_row(
+                    "SELECT content FROM session_messages
+                 WHERE session_id = ?1 AND role = 'assistant'
+                 ORDER BY sequence DESC LIMIT 1",
+                    [session_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| format!("Unable to read the completed agent response: {error}"))?;
+            let report = parse_apt_status_report(&assistant_text);
+            if agent_task_creation {
+                create_agent_task_proposals(&connection, session_id)?;
+            }
+
+            let mut schedule_loop = false;
+            if let (Some(task_loop_enabled), Some(report)) = (task, report.as_ref()) {
+                match report.state.as_str() {
+                    "complete" if report.gate_passed == Some(true) => {
+                        finish_project_task_session(&connection, session_id, true)?;
+                        schedule_loop = looping && task_loop_enabled;
+                    }
+                    "blocked" => {
+                        finish_project_task_session(&connection, session_id, false)?;
+                    }
+                    _ => {}
+                }
+            }
+
+            let status_update = report.as_ref().and_then(|report| {
+                let (status, reason, detail) = match report.state.as_str() {
+                    "question" => (
+                        "waiting",
+                        "Agent needs your direction",
+                        if report.note.is_empty() {
+                            "The agent needs a decision to continue."
+                        } else {
+                            report.note.as_str()
+                        },
+                    ),
+                    "blocked" => (
+                        "failed",
+                        "Agent is blocked",
+                        if report.note.is_empty() {
+                            "The agent could not complete the task."
+                        } else {
+                            report.note.as_str()
+                        },
+                    ),
+                    "complete" if report.gate_passed != Some(true) => (
+                        "waiting",
+                        "Agent completion needs review",
+                        if report.note.is_empty() {
+                            "The agent did not confirm that its quality checks passed."
+                        } else {
+                            report.note.as_str()
+                        },
+                    ),
+                    "working" if !report.note.is_empty() => ("idle", report.note.as_str(), ""),
+                    _ => return None,
+                };
+                Some((status.to_owned(), reason.to_owned(), detail.to_owned()))
+            });
+            Ok((
+                schedule_loop.then_some((project_id, looping)),
+                status_update,
+            ))
+        })();
+
+    match result {
+        Ok((schedule, status_update)) => {
+            if let Some((status, reason, detail)) = status_update {
+                if let Err(error) =
+                    update_session_status(database, session_id, &status, &reason, &detail)
+                {
+                    let _ = app.emit("project-loop-error", error);
+                }
+            }
+            if let Some((project_id, true)) = schedule {
+                if let Err(error) = maybe_start_next_loop_task(
+                    project_id,
+                    Database(database.clone()),
+                    SessionProcesses(processes.0.clone()),
+                    app.clone(),
+                ) {
+                    let _ = app.emit("project-loop-error", error);
+                }
+            }
+        }
+        Err(error) => {
+            let _ = app.emit("project-loop-error", error);
+        }
+    }
+}
+
+fn fail_project_task(database: &Arc<Mutex<Connection>>, session_id: &str, app: &tauri::AppHandle) {
+    let result = database
+        .lock()
+        .map_err(|_| "Project database is unavailable.".to_owned())
+        .and_then(|connection| finish_project_task_session(&connection, session_id, false));
+    if let Err(error) = result {
+        let _ = app.emit("project-loop-error", error);
+    }
 }
 
 fn list_agent_sessions_from_connection(
@@ -963,7 +1369,15 @@ async fn send_session_message(
             .ok_or_else(|| {
                 "This session is not connected to a managed Copilot process.".to_owned()
             })?;
-        send_copilot_message(&database.0, &session_id, &control, &message, &app, false)
+        send_copilot_message(
+            &database.0,
+            &session_id,
+            &control,
+            &message,
+            &app,
+            &processes,
+            false,
+        )
     })
     .await
 }
@@ -1292,6 +1706,61 @@ fn spawn_copilot_acp(
                         .to_owned(),
                     options,
                 };
+                let auto_option =
+                    match project_session_auto_approve_permissions(&database, &reader_session_id) {
+                        Ok(true) => permission
+                            .options
+                            .iter()
+                            .find(|option| option.kind == "allow_once")
+                            .map(|option| option.option_id.clone()),
+                        Ok(false) => None,
+                        Err(error) => {
+                            let _ = app.emit("project-loop-error", error);
+                            None
+                        }
+                    };
+                if let Some(option_id) = auto_option {
+                    match permission_outcome(&permission, Some(&option_id)) {
+                        Ok(outcome) => match send_acp_message(
+                            &reader_control.input,
+                            serde_json::json!({
+                                "jsonrpc": "2.0",
+                                "id": message["id"],
+                                "result": { "outcome": outcome }
+                            }),
+                        ) {
+                            Ok(()) => {
+                                let observation = CopilotObservation {
+                                    status: Some("running".to_owned()),
+                                    step: Some("Looping task permission approved once".to_owned()),
+                                    last_event: Some(format!("Allowed once: {}", permission.title)),
+                                };
+                                let _ = persist_copilot_observation(
+                                    &database,
+                                    &reader_session_id,
+                                    &observation,
+                                );
+                                let _ = app.emit("agent-session-updated", &reader_session_id);
+                                continue;
+                            }
+                            Err(error) => {
+                                let _ = update_session_status(
+                                    &database,
+                                    &reader_session_id,
+                                    "failed",
+                                    "Unable to approve loop permission",
+                                    &error,
+                                );
+                                let _ = app.emit("project-loop-error", error);
+                                let _ = app.emit("agent-session-updated", &reader_session_id);
+                                continue;
+                            }
+                        },
+                        Err(error) => {
+                            let _ = app.emit("project-loop-error", error);
+                        }
+                    }
+                }
                 if let Ok(mut requests) = reader_control.permission_requests.lock() {
                     requests.insert(request_id, (message["id"].clone(), permission.clone()));
                 }
@@ -1406,6 +1875,9 @@ fn spawn_copilot_acp(
         if let Ok(mut active) = processes.lock() {
             active.remove(&reader_session_id);
         }
+        if !success || stopped {
+            fail_project_task(&database, &reader_session_id, &app);
+        }
         let _ = app.emit("agent-session-updated", &reader_session_id);
     });
 
@@ -1417,6 +1889,7 @@ async fn start_copilot_session(
     project_id: Option<String>,
     task: String,
     resume_session_id: Option<String>,
+    task_id: Option<String>,
     database: State<'_, Database>,
     processes: State<'_, SessionProcesses>,
     app: tauri::AppHandle,
@@ -1428,6 +1901,8 @@ async fn start_copilot_session(
             project_id,
             task,
             resume_session_id,
+            task_id,
+            false,
             database,
             processes,
             app,
@@ -1436,10 +1911,35 @@ async fn start_copilot_session(
     .await
 }
 
+fn reset_task_after_start_failure(
+    database: &Database,
+    task_id: Option<&str>,
+) -> Result<(), String> {
+    let Some(task_id) = task_id else {
+        return Ok(());
+    };
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Project database is unavailable.".to_owned())?;
+    connection
+        .execute(
+            "UPDATE project_tasks SET status = 'backlog', session_id = NULL,
+             updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND status = 'in_progress'",
+            [task_id],
+        )
+        .map_err(|error| {
+            format!("Unable to reset the task after session startup failed: {error}")
+        })?;
+    Ok(())
+}
+
 fn start_copilot_session_blocking(
     project_id: Option<String>,
     task: String,
     resume_session_id: Option<String>,
+    task_id: Option<String>,
+    loop_owned: bool,
     database: Database,
     processes: SessionProcesses,
     app: tauri::AppHandle,
@@ -1455,7 +1955,7 @@ fn start_copilot_session_blocking(
             return Err("This Copilot session is already connected.".to_owned());
         }
     }
-    let (project_id, project_path, branch, session_id, resume_external_id) = {
+    let (project_id, project_path, branch, session_id, resume_external_id, allow_agent_tasks) = {
         let connection = database
             .0
             .lock()
@@ -1486,6 +1986,7 @@ fn start_copilot_session_blocking(
                 branch,
                 session_id.to_owned(),
                 Some(external_id),
+                false,
             )
         } else {
             let project_id = project_id
@@ -1493,16 +1994,40 @@ fn start_copilot_session_blocking(
             if task.is_empty() {
                 return Err("Describe the task before starting a Copilot session.".to_owned());
             }
-            let (path, branch) = connection
+            let (path, branch, allow_agent_tasks) = connection
                 .query_row(
-                    "SELECT path, branch FROM projects WHERE id = ?1",
+                    "SELECT path, branch, agent_task_creation FROM projects WHERE id = ?1",
                     [&project_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                        ))
+                    },
                 )
                 .map_err(|error| format!("Unable to find project for Copilot session: {error}"))?;
-            (project_id, path, branch, copilot_session_id(), None)
+            (
+                project_id,
+                path,
+                branch,
+                copilot_session_id(),
+                None,
+                allow_agent_tasks,
+            )
         }
     };
+
+    if allow_agent_tasks && resume_session_id.is_none() {
+        task.push_str(
+            "\n\n# Agent-proposed backlog tasks\nThis project allows you to propose separate follow-up work. When useful, add a fenced `apt-task` JSON block with a short `title`, a `purpose`, and optional `acceptanceCriteria` string array. Example:\n```apt-task\n{\"title\":\"Add example\",\"purpose\":\"Describe the follow-up work\",\"acceptanceCriteria\":[\"A verifiable outcome\"]}\n```\nProposed tasks are added to the backlog and do not interrupt this session. Do not propose work that is part of the task you were asked to complete.",
+        );
+    }
+    if task_id.is_some() && resume_session_id.is_none() {
+        task.push_str(
+            "\n\n# Task completion protocol\nEnd your response with one fenced apt-status JSON block. Use state `working` with a brief note when unfinished, `question` when you need a human decision, `blocked` when you cannot proceed, or `complete` when the task is done. A `complete` report must include `gatePassed: true` and a brief `gateSummary` only after all available relevant checks pass. Example: ```apt-status\n{\"state\":\"complete\",\"note\":\"Implemented and verified the task\",\"gatePassed\":true,\"gateSummary\":\"Tests passed\"}\n``` Do not report complete when checks fail or were not run.",
+        );
+    }
 
     let version = copilot_command()
         .arg("--version")
@@ -1518,12 +2043,15 @@ fn start_copilot_session_blocking(
     }
 
     {
-        let connection = database
+        let mut connection = database
             .0
             .lock()
             .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Unable to start session transaction: {error}"))?;
         if resume_external_id.is_some() {
-            connection.execute(
+            transaction.execute(
                 "UPDATE agent_sessions
                      SET project_id = ?2, task = ?3, branch = ?4, status = 'starting',
                          status_reason = '', current_step = 'Starting Copilot session',
@@ -1533,16 +2061,34 @@ fn start_copilot_session_blocking(
                 params![session_id, project_id, task, branch],
             )
         } else {
-            connection.execute(
+            transaction.execute(
                 "INSERT INTO agent_sessions
                      (id, project_id, provider, task, branch, status, status_reason,
-                      current_step, permission_mode, origin, last_event)
+                      current_step, permission_mode, origin, loop_owned, last_event)
                      VALUES (?1, ?2, 'copilot', ?3, ?4, 'starting', '',
-                             'Starting Copilot session', 'plan', 'managed', '')",
-                params![session_id, project_id, task, branch],
+                             'Starting Copilot session', 'plan', 'managed', ?5, '')",
+                params![session_id, project_id, task, branch, loop_owned],
             )
         }
         .map_err(|error| format!("Unable to persist Copilot session: {error}"))?;
+        if let Some(task_id) = task_id.as_deref() {
+            let changed = transaction
+                .execute(
+                    "UPDATE project_tasks SET status = 'in_progress', session_id = ?1,
+                     updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?2 AND project_id = ?3 AND
+                      ((status = 'backlog' AND ?4 = 0) OR
+                       (status = 'in_progress' AND session_id IS NULL AND ?4 = 1))",
+                    params![session_id, task_id, project_id, loop_owned],
+                )
+                .map_err(|error| format!("Unable to link task to Copilot session: {error}"))?;
+            if changed != 1 {
+                return Err("The task is no longer available to start.".to_owned());
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Unable to save Copilot task session: {error}"))?;
     }
 
     let processes_ref = processes.0.clone();
@@ -1562,6 +2108,8 @@ fn start_copilot_session_blocking(
                 "Unable to start Copilot ACP",
                 &error,
             )?;
+            reset_task_after_start_failure(&database, task_id.as_deref())
+                .map_err(|cleanup_error| format!("{error}; additionally, {cleanup_error}"))?;
             return Err(error);
         }
     };
@@ -1586,6 +2134,8 @@ fn start_copilot_session_blocking(
             "Copilot initialization failed",
             &error,
         )?;
+        reset_task_after_start_failure(&database, task_id.as_deref())
+            .map_err(|cleanup_error| format!("{error}; additionally, {cleanup_error}"))?;
         return Err(error);
     }
 
@@ -1620,6 +2170,8 @@ fn start_copilot_session_blocking(
                 "Unable to load Copilot session",
                 &error,
             )?;
+            reset_task_after_start_failure(&database, task_id.as_deref())
+                .map_err(|cleanup_error| format!("{error}; additionally, {cleanup_error}"))?;
             return Err(error);
         }
     };
@@ -1638,6 +2190,8 @@ fn start_copilot_session_blocking(
             "Invalid Copilot session response",
             &error,
         )?;
+        reset_task_after_start_failure(&database, task_id.as_deref())
+            .map_err(|cleanup_error| format!("{error}; additionally, {cleanup_error}"))?;
         return Err(error);
     };
     {
@@ -1685,6 +2239,7 @@ fn start_copilot_session_blocking(
         let initial_session_id = session_id.clone();
         let initial_task = task.clone();
         let initial_app = app.clone();
+        let initial_processes = SessionProcesses(processes_ref.clone());
         thread::spawn(move || {
             if let Err(error) = send_copilot_message(
                 &database_ref,
@@ -1692,6 +2247,7 @@ fn start_copilot_session_blocking(
                 &initial_control,
                 &initial_task,
                 &initial_app,
+                &initial_processes,
                 true,
             ) {
                 let _ = update_session_status(
@@ -1745,6 +2301,8 @@ fn register_project(path: String, database: State<'_, Database>) -> Result<Proje
         branch: snapshot.branch,
         current_commit: snapshot.current_commit,
         git_state: snapshot.git_state,
+        looping: false,
+        agent_task_creation: false,
     };
 
     let connection = database
@@ -1773,7 +2331,14 @@ fn register_project(path: String, database: State<'_, Database>) -> Result<Proje
         )
         .map_err(|error| format!("Unable to save project: {error}"))?;
 
-    Ok(project)
+    connection
+        .query_row(
+            "SELECT id, name, path, branch, current_commit, git_state, looping, agent_task_creation
+             FROM projects WHERE id = ?1",
+            [&project.id],
+            project_from_row,
+        )
+        .map_err(|error| format!("Unable to read the registered project: {error}"))
 }
 
 fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
@@ -1786,6 +2351,8 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            branch TEXT NOT NULL,
            current_commit TEXT NOT NULL,
            git_state TEXT NOT NULL,
+           looping INTEGER NOT NULL DEFAULT 0,
+           agent_task_creation INTEGER NOT NULL DEFAULT 0,
            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
          );
@@ -1810,6 +2377,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            token_count INTEGER NOT NULL DEFAULT 0,
            permission_mode TEXT NOT NULL DEFAULT 'plan',
            origin TEXT NOT NULL DEFAULT 'observed',
+           loop_owned INTEGER NOT NULL DEFAULT 0,
            last_event TEXT NOT NULL DEFAULT '',
            pid INTEGER,
            process_start_time TEXT,
@@ -1847,6 +2415,33 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            UNIQUE(session_id, sequence)
          );",
     )?;
+    connection
+        .execute(
+            "ALTER TABLE projects ADD COLUMN looping INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .or_else(|error| {
+            if error.to_string().contains("duplicate column name: looping") {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
+    connection
+        .execute(
+            "ALTER TABLE projects ADD COLUMN agent_task_creation INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .or_else(|error| {
+            if error
+                .to_string()
+                .contains("duplicate column name: agent_task_creation")
+            {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
     connection.execute(
         "UPDATE agent_sessions
          SET status = 'orphaned',
@@ -1866,6 +2461,21 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             if error
                 .to_string()
                 .contains("duplicate column name: archived")
+            {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
+    connection
+        .execute(
+            "ALTER TABLE agent_sessions ADD COLUMN loop_owned INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .or_else(|error| {
+            if error
+                .to_string()
+                .contains("duplicate column name: loop_owned")
             {
                 Ok(0)
             } else {
@@ -1898,6 +2508,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_projects,
+            set_project_automation,
+            continue_project_loop,
+            open_project_in_vscode,
             list_agent_sessions,
             send_session_message,
             get_pending_session_permission,
@@ -1911,6 +2524,7 @@ pub fn run() {
             list_project_tasks,
             create_project_task,
             set_project_task_status,
+            set_project_task_loop_enabled,
             link_project_task_session,
             delete_project_task,
             get_project_diff,
@@ -1952,6 +2566,83 @@ mod tests {
             .expect("session query");
 
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn existing_projects_receive_disabled_automation_defaults() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch(
+                "CREATE TABLE projects (
+                   id TEXT PRIMARY KEY NOT NULL,
+                   name TEXT NOT NULL,
+                   path TEXT NOT NULL,
+                   branch TEXT NOT NULL,
+                   current_commit TEXT NOT NULL,
+                   git_state TEXT NOT NULL,
+                   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO projects
+                   (id, name, path, branch, current_commit, git_state)
+                   VALUES ('project-1', 'Project', '/tmp/project', 'main', 'abc', 'clean');",
+            )
+            .expect("legacy project schema");
+
+        initialize_schema(&connection).expect("automation migration");
+        let settings: (i64, i64) = connection
+            .query_row(
+                "SELECT looping, agent_task_creation FROM projects WHERE id = 'project-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("migrated project settings");
+        assert_eq!(settings, (0, 0));
+    }
+
+    #[test]
+    fn only_loop_owned_task_sessions_auto_approve_one_time_permissions() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, path, branch, current_commit, git_state, looping)
+                 VALUES ('project-1', 'Project', '/tmp/project', 'main', 'abc', 'clean', 1)",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions (id, project_id, provider, task, status, loop_owned)
+                 VALUES ('session-1', 'project-1', 'copilot', 'Task', 'running', 0)",
+                [],
+            )
+            .expect("session");
+        connection
+            .execute(
+                "INSERT INTO project_tasks (id, project_id, title, status, session_id)
+                 VALUES ('task-1', 'project-1', 'Task', 'in_progress', 'session-1')",
+                [],
+            )
+            .expect("task");
+        let database = Arc::new(Mutex::new(connection));
+
+        assert!(
+            !project_session_auto_approve_permissions(&database, "session-1")
+                .expect("manual task permission check")
+        );
+        database
+            .lock()
+            .expect("database lock")
+            .execute(
+                "UPDATE agent_sessions SET loop_owned = 1 WHERE id = 'session-1'",
+                [],
+            )
+            .expect("mark loop-owned session");
+        assert!(
+            project_session_auto_approve_permissions(&database, "session-1")
+                .expect("loop-owned task permission check")
+        );
     }
 
     #[test]
@@ -2187,6 +2878,26 @@ mod tests {
             permission_outcome(&permission, None).expect("cancel choice"),
             serde_json::json!({ "outcome": "cancelled" })
         );
+    }
+
+    #[test]
+    fn task_status_parser_accepts_only_valid_status_blocks_and_uses_the_last_one() {
+        let report = parse_apt_status_report(
+            "Progress\n```apt-status\n{\"state\":\"working\",\"note\":\"Still checking\"}\n```\n\
+             Done\n```apt-status\n{\"state\":\"complete\",\"note\":\"Ready\",\"gatePassed\":true}\n```",
+        )
+        .expect("valid completion report");
+        assert_eq!(report.state, "complete");
+        assert_eq!(report.note, "Ready");
+        assert_eq!(report.gate_passed, Some(true));
+
+        assert!(
+            parse_apt_status_report("```apt-status\n{\"state\":\"complete\"}\n```")
+                .expect("valid state")
+                .gate_passed
+                .is_none()
+        );
+        assert!(parse_apt_status_report("```apt-status\nnot json\n```").is_none());
     }
 
     #[test]
