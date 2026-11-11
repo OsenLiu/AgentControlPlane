@@ -194,6 +194,18 @@ const navItems = [
   ["⚙", "Settings"],
 ];
 
+const projectSections = [
+  { id: "tasks", label: "Tasks" },
+  { id: "diffs", label: "Diffs" },
+  { id: "sessions", label: "Sessions" },
+  { id: "terminals", label: "Terminals" },
+  { id: "pipelines", label: "Pipelines" },
+  { id: "dependencies", label: "Dependencies" },
+  { id: "skills", label: "Skills" },
+] as const;
+
+type ProjectSection = (typeof projectSections)[number]["id"];
+
 function StatusBadge({ status }: { status: Status }) {
   const labels: Record<Status, string> = {
     healthy: "Healthy",
@@ -303,7 +315,15 @@ function SessionStatusBadge({ status }: { status: SessionStatus }) {
   );
 }
 
-function AgentSessionsView({ transcriptFontSize, initialSessionId }: { transcriptFontSize: number; initialSessionId?: string }) {
+function AgentSessionsView({
+  transcriptFontSize,
+  initialSessionId,
+  projectId,
+}: {
+  transcriptFontSize: number;
+  initialSessionId?: string;
+  projectId?: string;
+}) {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
   const [selectedId, setSelectedId] = useState(initialSessionId ?? "");
   const [filter, setFilter] = useState<"all" | SessionStatus>("all");
@@ -312,7 +332,7 @@ function AgentSessionsView({ transcriptFontSize, initialSessionId }: { transcrip
   const [loadError, setLoadError] = useState("");
   const [refreshing, setRefreshing] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [selectedProjectId, setSelectedProjectId] = useState(projectId ?? "");
   const [task, setTask] = useState("Start a new Copilot session");
   const [starting, setStarting] = useState(false);
   const [resuming, setResuming] = useState(false);
@@ -337,11 +357,11 @@ function AgentSessionsView({ transcriptFontSize, initialSessionId }: { transcrip
     void loadSessions(archivedView);
     void invoke<Project[]>("list_projects").then((loaded) => {
       setProjects(loaded);
-      setSelectedProjectId(loaded[0]?.id ?? "");
+      setSelectedProjectId(projectId ?? loaded[0]?.id ?? "");
     }).catch((reason) => {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
     });
-  }, [archivedView]);
+  }, [archivedView, projectId]);
 
   useEffect(() => {
     if (!selectedSession) {
@@ -390,6 +410,7 @@ function AgentSessionsView({ transcriptFontSize, initialSessionId }: { transcrip
       setLoadError("");
       const loaded = await invoke<AgentSession[]>("list_agent_sessions", {
         archived: showArchived,
+        ...(projectId ? { projectId } : {}),
       });
       setSessions(loaded);
       setSelectedId((current) => {
@@ -556,10 +577,12 @@ function AgentSessionsView({ transcriptFontSize, initialSessionId }: { transcrip
         <h2>{loading ? "Loading agent sessions…" : "No agent sessions yet"}</h2>
         <p>{loadError || "Start a Copilot CLI session here to create a locally managed conversation."}</p>
         {!loading && projects.length > 0 && <form className="session-launch-card" onSubmit={startSession}>
-          <label className="field-label" htmlFor="session-project">PROJECT</label>
-          <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)}>
-            {projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
-          </select>
+          {projectId ? <div className="session-project-context"><span>PROJECT</span><strong>{projects.find((project) => project.id === projectId)?.name ?? "Selected project"}</strong></div> : <>
+            <label className="field-label" htmlFor="session-project">PROJECT</label>
+            <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)}>
+              {projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
+            </select>
+          </>}
           <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
           <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
           <button className="primary-button" type="submit" disabled={starting || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
@@ -584,10 +607,12 @@ function AgentSessionsView({ transcriptFontSize, initialSessionId }: { transcrip
         </div>
       </header>
       {launcherOpen && <form className="session-launch-card" onSubmit={startSession}>
-        <label className="field-label" htmlFor="session-project">PROJECT</label>
-        <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)} disabled={projects.length === 0}>
-          {projects.length === 0 ? <option value="">No projects connected</option> : projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
-        </select>
+        {projectId ? <div className="session-project-context"><span>PROJECT</span><strong>{projects.find((project) => project.id === projectId)?.name ?? "Selected project"}</strong></div> : <>
+          <label className="field-label" htmlFor="session-project">PROJECT</label>
+          <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)} disabled={projects.length === 0}>
+            {projects.length === 0 ? <option value="">No projects connected</option> : projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
+          </select>
+        </>}
         <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
         <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
         <button className="primary-button" type="submit" disabled={starting || projects.length === 0 || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
@@ -967,11 +992,13 @@ function ProjectsView({
   projects,
   loading,
   onAddProject,
+  onOpenProject,
   onRefresh,
 }: {
   projects: Project[];
   loading: boolean;
   onAddProject: () => void;
+  onOpenProject: (projectId: string) => void;
   onRefresh: () => void;
 }) {
   const [query, setQuery] = useState("");
@@ -1100,6 +1127,9 @@ function ProjectsView({
                     <code title={project.currentCommit}>{project.currentCommit ? project.currentCommit.slice(0, 7) : "—"}</code>
                   </div>
                 </div>
+                <button className="project-open-button" type="button" onClick={() => onOpenProject(project.id)}>
+                  Open workspace <span aria-hidden="true">→</span>
+                </button>
               </article>
             ))}
           </div>
@@ -1109,11 +1139,95 @@ function ProjectsView({
   );
 }
 
+const unavailableProjectSections: Record<Exclude<ProjectSection, "sessions">, { title: string; description: string }> = {
+  tasks: {
+    title: "Project tasks are not available yet",
+    description: "This area will hold the project backlog, task details, and supervised agent runs.",
+  },
+  diffs: {
+    title: "Diff review is not available yet",
+    description: "A project diff viewer and review workflow are planned for a later release.",
+  },
+  terminals: {
+    title: "Project terminals are not available yet",
+    description: "Terminal sessions will be scoped to this repository when terminal support is added.",
+  },
+  pipelines: {
+    title: "Pipeline integrations are not connected",
+    description: "Connect a CI provider in a future release to view runs, logs, and build status here.",
+  },
+  dependencies: {
+    title: "Dependency insights are not available yet",
+    description: "Project dependency and update information will appear here when that integration is available.",
+  },
+  skills: {
+    title: "Project skills are not available yet",
+    description: "Project-specific agent skills will be discoverable and manageable from this section.",
+  },
+};
+
+function ProjectWorkspaceView({
+  project,
+  transcriptFontSize,
+}: {
+  project: Project;
+  transcriptFontSize: number;
+}) {
+  const [activeSection, setActiveSection] = useState<ProjectSection>("tasks");
+
+  return (
+    <div className="project-workspace-page">
+      <header className="project-workspace-header">
+        <div className="project-workspace-heading">
+          <p className="eyebrow">PROJECT WORKSPACE</p>
+          <h1>{project.name}</h1>
+          <p className="project-workspace-path" title={project.path}>{project.path}</p>
+        </div>
+        <div className="project-workspace-repo-meta">
+          <span className={`project-state-badge ${project.gitState}`}>
+            <span aria-hidden="true" />
+            {project.gitState === "clean" ? "Working tree clean" : "Uncommitted changes"}
+          </span>
+          <span className="project-workspace-branch"><span aria-hidden="true">⑂</span><code>{project.branch || "No branch"}</code></span>
+        </div>
+      </header>
+
+      <nav className="project-section-tabs" aria-label={`${project.name} sections`}>
+        {projectSections.map(({ id, label }) => (
+          <button
+            className={activeSection === id ? "active" : ""}
+            key={id}
+            type="button"
+            aria-current={activeSection === id ? "page" : undefined}
+            onClick={() => setActiveSection(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {activeSection === "sessions" ? (
+        <div className="project-section-content">
+          <AgentSessionsView transcriptFontSize={transcriptFontSize} projectId={project.id} />
+        </div>
+      ) : (
+        <section className="project-module-placeholder" aria-labelledby="project-module-title">
+          <span className="project-module-label">{activeSection.toUpperCase()}</span>
+          <h2 id="project-module-title">{unavailableProjectSections[activeSection].title}</h2>
+          <p>{unavailableProjectSections[activeSection].description}</p>
+          <span className="project-module-status">Not connected in this build</span>
+        </section>
+      )}
+    </div>
+  );
+}
+
 function App() {
   const [activeNav, setActiveNav] = useState("Dashboard");
   const [sessionToOpen, setSessionToOpen] = useState("");
   const [showAddProject, setShowAddProject] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [projectPath, setProjectPath] = useState("");
   const [loadingProjects, setLoadingProjects] = useState(true);
   const [savingProject, setSavingProject] = useState(false);
@@ -1204,7 +1318,12 @@ function App() {
     setSavingProject(true);
     setError("");
     try {
-      await invoke<Project>("register_project", { path: projectPath });
+      const registeredProject = await invoke<Project>("register_project", { path: projectPath });
+      setProjects((current) => current.some((project) => project.id === registeredProject.id)
+        ? current.map((project) => project.id === registeredProject.id ? registeredProject : project)
+        : [...current, registeredProject]);
+      setSelectedProjectId(registeredProject.id);
+      setActiveNav("Project workspace");
       setProjectPath("");
       setShowAddProject(false);
       await loadProjects();
@@ -1240,6 +1359,12 @@ function App() {
     setActiveNav("Agent sessions");
   }
 
+  function openProjectWorkspace(projectId: string) {
+    setSelectedProjectId(projectId);
+    setActiveNav("Project workspace");
+  }
+
+  const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const urgentAttentionCount = attentionItems.filter((item) => item.priority === "High").length;
 
   return (
@@ -1257,7 +1382,7 @@ function App() {
           <p className="nav-label">Workspace</p>
           {navItems.map(([icon, label]) => (
             <button
-              className={`nav-item ${activeNav === label ? "selected" : ""}`}
+              className={`nav-item ${activeNav === label || (label === "Projects" && activeNav === "Project workspace") ? "selected" : ""}`}
               key={label}
               onClick={() => setActiveNav(label)}
             >
@@ -1266,6 +1391,30 @@ function App() {
               {label === "Attention inbox" && attentionItems.length > 0 && <span className="nav-count">{attentionItems.length}</span>}
             </button>
           ))}
+        </nav>
+
+        <nav className="sidebar-projects" aria-label="Projects">
+          <div className="sidebar-projects-heading">
+            <p className="nav-label">Projects <span>{projects.length}</span></p>
+            <button type="button" aria-label="Add project" onClick={() => setShowAddProject(true)}>+</button>
+          </div>
+          <div className="sidebar-project-list">
+            {loadingProjects && projects.length === 0 ? <p className="sidebar-project-empty">Loading projects…</p> : projects.length === 0 ? (
+              <p className="sidebar-project-empty">No projects yet</p>
+            ) : projects.map((project) => (
+              <button
+                className={`sidebar-project-item ${activeNav === "Project workspace" && selectedProjectId === project.id ? "selected" : ""}`}
+                key={project.id}
+                type="button"
+                title={project.path}
+                aria-current={activeNav === "Project workspace" && selectedProjectId === project.id ? "page" : undefined}
+                onClick={() => openProjectWorkspace(project.id)}
+              >
+                <span className="sidebar-project-dot" aria-hidden="true" />
+                <span>{project.name}</span>
+              </button>
+            ))}
+          </div>
         </nav>
 
         <div className="sidebar-footer">
@@ -1277,14 +1426,13 @@ function App() {
             </div>
           </div>
           <div className="footer-stats">
-            <span><strong>3</strong> projects</span>
-            <span><strong>3</strong> active sessions</span>
+            <span><strong>{projects.length}</strong> projects connected</span>
           </div>
         </div>
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Projects" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onRefresh={() => void loadProjects()} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} transcriptFontSize={settings.transcriptFontSize} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
@@ -1339,7 +1487,7 @@ function App() {
                 <div className="progress-cell"><div className="progress-track"><span style={{ width: "0%" }} /></div><small>—</small></div>
                 <StatusBadge status="waiting" />
                 <span className={`git-state ${project.gitState}`}><span /> {project.gitState === "clean" ? "Clean" : "Changes"}</span>
-                <button className="row-action" aria-label={`Open ${project.name}`}>→</button>
+                <button className="row-action" aria-label={`Open ${project.name}`} onClick={() => openProjectWorkspace(project.id)}>→</button>
               </div>
             ))}
           </div>

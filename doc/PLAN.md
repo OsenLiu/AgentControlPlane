@@ -13,7 +13,8 @@ The selected dashboard direction is **Command Center** (`dashboard-concept-a-com
 ### Overall layout
 
 - **Desktop shell:** dark navy application chrome with a fixed left navigation rail and a fluid content canvas.
-- **Navigation rail:** product mark, Dashboard, Projects, Agent sessions, Attention inbox, Pipeline, and Analytics. The bottom of the rail shows supervisor connectivity and project/session counts.
+- **Navigation rail:** product mark, Dashboard, Projects, Agent sessions, and Attention inbox, followed by a selectable project list and an add-project action. The bottom of the rail shows supervisor connectivity and project counts.
+- **Project workspace:** selecting a project opens its repository context and a persistent section navigation for Tasks, Diffs, Sessions, Terminals, Pipelines, Dependencies, and Skills. Each section is scoped to the selected project; unavailable services must show an explicit empty/planned state rather than fabricated data.
 - **Header:** greeting/context line, current date, and a prominent **Add project** action.
 - **Dashboard canvas:** four summary cards, a projects table, an attention inbox, a live activity stream, and a pipeline trend card.
 - **Density:** information-rich but scannable; use clear card boundaries, consistent alignment, and short status labels rather than large decorative illustrations.

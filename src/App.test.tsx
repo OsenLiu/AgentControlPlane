@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
@@ -91,6 +91,23 @@ describe("App", () => {
     });
     expect(screen.getByRole("heading", { name: "website" })).toBeTruthy();
     expect(screen.queryByRole("heading", { name: "agent-control-plane" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open workspace" }));
+    expect(await screen.findByRole("heading", { name: "website" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "website", current: "page" })).toBeTruthy();
+    for (const section of ["Tasks", "Diffs", "Sessions", "Terminals", "Pipelines", "Dependencies", "Skills"]) {
+      expect(screen.getByRole("button", { name: section })).toBeTruthy();
+    }
+
+    fireEvent.click(screen.getByRole("button", { name: "Sessions" }));
+    expect(await screen.findByRole("heading", { name: "No agent sessions yet" })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions", {
+      archived: false,
+      projectId: "/work/website",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Pipelines" }));
+    expect(screen.getByRole("heading", { name: "Pipeline integrations are not connected" })).toBeTruthy();
   });
 
   it("loads an empty Attention inbox from the backend", async () => {
@@ -236,7 +253,7 @@ describe("App", () => {
     });
 
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: /add project/i }));
+    fireEvent.click(within(screen.getByRole("main")).getByRole("button", { name: /add project/i }));
     fireEvent.change(screen.getByLabelText("Repository path"), {
       target: { value: "/tmp/demo" },
     });
