@@ -34,6 +34,7 @@ type Settings = {
   gemini: ToolSettings;
   claudeCode: ToolSettings;
   githubUsername: string;
+  githubAuthMethod: "token" | "cli";
   githubTokenConfigured: boolean;
   defaultProvider: "copilot" | "gemini" | "claudeCode";
   transcriptFontSize: number;
@@ -191,6 +192,7 @@ const emptySettings = (): Settings => ({
   gemini: emptyToolSettings(),
   claudeCode: emptyToolSettings(),
   githubUsername: "",
+  githubAuthMethod: "token",
   githubTokenConfigured: false,
   defaultProvider: "claudeCode",
   transcriptFontSize: 16,
@@ -295,10 +297,45 @@ function SettingsView({
         </div>
       </section>
       <section className="settings-section">
-        <div className="section-header"><div><h2>GitHub access</h2><span className="section-caption">Used for Actions, releases, repository analytics, and deep links.</span></div></div>
+        <div className="section-header"><div><h2>GitHub connection</h2><span className="section-caption">Choose how Agent Control Plane authenticates with GitHub.</span></div></div>
         <div className="github-card">
-          <div className="github-heading"><div className="github-logo">GH</div><div><h3>GitHub account</h3><span>Tokens are stored only in the operating system credential vault.</span></div><span className={`setup-state ${settings.githubTokenConfigured ? "configured" : ""}`}><span /> {settings.githubTokenConfigured ? "Token saved" : "Token not set"}</span></div>
-          <div className="github-fields"><div><label className="field-label" htmlFor="github-username">USERNAME</label><input id="github-username" className="settings-input" value={settings.githubUsername} onChange={(event) => setSettings({ ...settings, githubUsername: event.currentTarget.value })} placeholder="GitHub username" /></div><div><label className="field-label" htmlFor="github-token">PERSONAL ACCESS TOKEN</label><input id="github-token" className="settings-input" type="password" autoComplete="new-password" value={settings.githubToken} onChange={(event) => setSettings({ ...settings, githubToken: event.currentTarget.value })} placeholder={settings.githubTokenConfigured ? "Leave blank to keep saved token" : "ghp_…"} /></div></div>
+          <div className="github-heading"><div className="github-logo" aria-hidden="true">GH</div><div><h3>GitHub account</h3><span>Used for Actions, releases, repository analytics, and deep links.</span></div><span className={`github-connection-state ${settings.githubAuthMethod === "cli" ? "cli-selected" : settings.githubTokenConfigured ? "configured" : ""}`}><span aria-hidden="true" />{settings.githubAuthMethod === "cli" ? "GitHub CLI selected" : settings.githubTokenConfigured ? "Token saved" : "Not connected"}</span></div>
+          <fieldset className="github-auth-methods">
+            <legend>Connection method</legend>
+            <label className={`github-auth-option ${settings.githubAuthMethod === "token" ? "selected" : ""}`}>
+              <input
+                type="radio"
+                name="githubAuthMethod"
+                value="token"
+                checked={settings.githubAuthMethod === "token"}
+                onChange={() => setSettings({ ...settings, githubAuthMethod: "token" })}
+              />
+              <span className="github-auth-icon token" aria-hidden="true">PAT</span>
+              <span className="github-auth-copy"><strong>Personal access token</strong><small>Paste a token and store it in your OS credential vault.</small></span>
+            </label>
+            <label className={`github-auth-option ${settings.githubAuthMethod === "cli" ? "selected" : ""}`}>
+              <input
+                type="radio"
+                name="githubAuthMethod"
+                value="cli"
+                checked={settings.githubAuthMethod === "cli"}
+                onChange={() => setSettings({ ...settings, githubAuthMethod: "cli" })}
+              />
+              <span className="github-auth-icon cli" aria-hidden="true">gh</span>
+              <span className="github-auth-copy"><strong>GitHub CLI</strong><small>Reuse the credentials from your existing <code>gh</code> login.</small></span>
+            </label>
+          </fieldset>
+          {settings.githubAuthMethod === "token" ? (
+            <div className="github-fields">
+              <div><label className="field-label" htmlFor="github-username">GITHUB USERNAME <span>(OPTIONAL)</span></label><input id="github-username" className="settings-input" value={settings.githubUsername} onChange={(event) => setSettings({ ...settings, githubUsername: event.currentTarget.value })} placeholder="octocat" /></div>
+              <div><label className="field-label" htmlFor="github-token">PERSONAL ACCESS TOKEN</label><input id="github-token" className="settings-input" type="password" autoComplete="new-password" value={settings.githubToken} onChange={(event) => setSettings({ ...settings, githubToken: event.currentTarget.value })} placeholder={settings.githubTokenConfigured ? "Leave blank to keep saved token" : "ghp_…"} /><span className="github-field-help">Saved securely in your operating system credential vault.</span></div>
+            </div>
+          ) : (
+            <div className="github-cli-details">
+              <span className="github-cli-mark" aria-hidden="true">$</span>
+              <div><strong>Use your existing GitHub CLI login</strong><p>Run this once in a terminal if you have not authenticated yet:</p><code>gh auth login</code><small>GitHub requests will use the CLI’s secure credential store. No token is copied into this app.</small></div>
+            </div>
+          )}
         </div>
       </section>
     </form>
@@ -1399,7 +1436,9 @@ function App() {
     setError("");
     try {
       const { githubToken, ...input } = settings;
-      const saved = await invoke<Settings>("save_settings", { input: { ...input, githubToken } });
+      const saved = await invoke<Settings>("save_settings", {
+        input: { ...input, githubToken: input.githubAuthMethod === "token" ? githubToken : "" },
+      });
       setSettings({ ...emptySettings(), ...saved, transcriptFontSize: saved.transcriptFontSize ?? 16, githubToken: "" });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));

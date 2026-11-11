@@ -1268,6 +1268,33 @@ fn github_repository(remote: &str) -> Option<String> {
     Some(format!("{owner}/{repository}"))
 }
 
+fn github_cli_token() -> Result<String, String> {
+    let output = Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "GitHub CLI was not found. Install `gh` or choose a personal access token."
+                    .to_owned()
+            } else {
+                format!("Unable to start GitHub CLI: {error}")
+            }
+        })?;
+    if !output.status.success() {
+        return Err(
+            "GitHub CLI is not authenticated. Run `gh auth login` and try again.".to_owned(),
+        );
+    }
+    let token = String::from_utf8(output.stdout)
+        .map_err(|error| format!("GitHub CLI returned an invalid token response: {error}"))?
+        .trim()
+        .to_owned();
+    if token.is_empty() {
+        return Err("GitHub CLI returned no token. Run `gh auth login` and try again.".to_owned());
+    }
+    Ok(token)
+}
+
 #[tauri::command]
 pub(crate) async fn get_project_pipelines(
     project_id: String,
@@ -1295,19 +1322,48 @@ pub(crate) async fn get_project_pipelines(
             runs: Vec::new(),
         });
     };
-    let token = match Entry::new(GITHUB_CREDENTIAL_SERVICE, GITHUB_CREDENTIAL_USER)
-        .and_then(|entry| entry.get_password())
-    {
-        Ok(token) => token,
-        Err(keyring::Error::NoEntry) => {
-            return Ok(ProjectPipelines {
-                repository: Some(repository),
-                configured: false,
-                error: Some("Add a GitHub token in Settings to view workflow runs.".to_owned()),
-                runs: Vec::new(),
-            });
-        }
-        Err(error) => return Err(format!("Unable to read the GitHub token: {error}")),
+    let auth_method = {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Settings database is unavailable.".to_owned())?;
+        connection
+            .query_row(
+                "SELECT value FROM app_settings WHERE key = 'github_auth_method'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Unable to read GitHub settings: {error}"))?
+            .unwrap_or_else(|| "token".to_owned())
+    };
+    let token = match auth_method.as_str() {
+        "token" => match Entry::new(GITHUB_CREDENTIAL_SERVICE, GITHUB_CREDENTIAL_USER)
+            .and_then(|entry| entry.get_password())
+        {
+            Ok(token) => token,
+            Err(keyring::Error::NoEntry) => {
+                return Ok(ProjectPipelines {
+                    repository: Some(repository),
+                    configured: false,
+                    error: Some("Add a GitHub token in Settings to view workflow runs.".to_owned()),
+                    runs: Vec::new(),
+                });
+            }
+            Err(error) => return Err(format!("Unable to read the GitHub token: {error}")),
+        },
+        "cli" => match github_cli_token() {
+            Ok(token) => token,
+            Err(error) => {
+                return Ok(ProjectPipelines {
+                    repository: Some(repository),
+                    configured: false,
+                    error: Some(error),
+                    runs: Vec::new(),
+                });
+            }
+        },
+        _ => return Err("Unsupported GitHub connection method.".to_owned()),
     };
 
     let url = format!("https://api.github.com/repos/{repository}/actions/runs?per_page=30");

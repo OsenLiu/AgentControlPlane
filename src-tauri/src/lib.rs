@@ -124,6 +124,7 @@ struct SettingsInput {
     gemini: ToolSettingsInput,
     claude_code: ToolSettingsInput,
     github_username: String,
+    github_auth_method: String,
     github_token: String,
     default_provider: String,
     transcript_font_size: u8,
@@ -142,6 +143,7 @@ struct Settings {
     gemini: ToolSettings,
     claude_code: ToolSettings,
     github_username: String,
+    github_auth_method: String,
     github_token_configured: bool,
     default_provider: String,
     transcript_font_size: u8,
@@ -731,6 +733,13 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
             |row| row.get::<_, String>(0),
         )
         .unwrap_or_default();
+    let github_auth_method = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'github_auth_method'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| "token".to_owned());
     let default_provider = connection
         .query_row(
             "SELECT value FROM app_settings WHERE key = 'default_provider'",
@@ -754,6 +763,7 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
         gemini: read("gemini"),
         claude_code: read("claude_code"),
         github_username,
+        github_auth_method,
         github_token_configured: github_token_configured(),
         default_provider,
         transcript_font_size,
@@ -762,6 +772,9 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
 
 #[tauri::command]
 fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<Settings, String> {
+    if !matches!(input.github_auth_method.as_str(), "token" | "cli") {
+        return Err("Choose a supported GitHub connection method.".to_owned());
+    }
     if !matches!(
         input.default_provider.as_str(),
         "copilot" | "gemini" | "claudeCode"
@@ -810,6 +823,13 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
             "INSERT INTO app_settings (key, value) VALUES ('github_username', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [&input.github_username.trim()],
+        )
+        .map_err(|error| format!("Unable to save GitHub settings: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO app_settings (key, value) VALUES ('github_auth_method', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&input.github_auth_method],
         )
         .map_err(|error| format!("Unable to save GitHub settings: {error}"))?;
     transaction

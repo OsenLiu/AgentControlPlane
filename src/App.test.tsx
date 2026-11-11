@@ -26,6 +26,7 @@ const settings = {
   gemini: { enabled: false },
   claudeCode: { enabled: true },
   githubUsername: "",
+  githubAuthMethod: "token" as const,
   githubTokenConfigured: false,
   defaultProvider: "claudeCode" as const,
 };
@@ -59,6 +60,41 @@ describe("App", () => {
     expect(await screen.findByText("No projects connected yet. Add a local Git repository to get started.")).toBeTruthy();
     expect(invokeMock).toHaveBeenCalledWith("list_projects");
     expect(invokeMock).toHaveBeenCalledWith("load_settings");
+  });
+
+  it("supports selecting GitHub CLI authentication and saves without a token", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [];
+      if (command === "list_agent_sessions") return [];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "load_settings") return settings;
+      if (command === "save_settings") return { ...settings, githubAuthMethod: "cli" };
+      if (command === "list_project_tasks") return [];
+      if (command === "get_project_diff") return { branch: "main", changedFiles: [], diff: "", truncated: false };
+      if (command === "list_project_terminals") return [];
+      if (command === "get_project_pipelines") return {
+        repository: null,
+        configured: false,
+        error: "GitHub Actions are available for projects with a GitHub origin remote.",
+        runs: [],
+      };
+      if (command === "get_project_dependencies") return { manifests: [], dependencies: [], errors: [] };
+      if (command === "list_project_skills") return { global: [], project: [], errors: [] };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    fireEvent.click(screen.getByRole("radio", { name: /GitHub CLI/ }));
+
+    expect(screen.getByText("gh auth login")).toBeTruthy();
+    expect(screen.queryByLabelText("PERSONAL ACCESS TOKEN")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
+      "save_settings",
+      { input: expect.objectContaining({ githubAuthMethod: "cli", githubToken: "" }) },
+    ));
   });
 
   it("opens the project directory and filters repositories by search and Git state", async () => {
