@@ -41,6 +41,11 @@ h1 { color: #f3f5ff; font-size: 26px; letter-spacing: -.7px; }
 .summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
 .summary-card, .table-card, .inbox-card, .activity-card { border: 1px solid #202b48; background: linear-gradient(140deg, #151f35, #121a2e); border-radius: 10px; }
 .summary-card { min-height: 150px; padding: 19px 19px 15px; }
+.pipeline-health-actions { display: flex; align-items: center; gap: 8px; }
+.pipeline-health-refresh { padding: 4px 7px; border: 1px solid #354363; border-radius: 5px; color: #aeb9d0; background: #1a2740; font-size: 9px; }
+.pipeline-health-refresh:hover:not(:disabled) { color: #f0f3ff; border-color: #6879a1; }
+.pipeline-health-refresh:focus-visible { outline: 2px solid #8e9df7; outline-offset: 2px; }
+.pipeline-health-refresh:disabled { cursor: default; opacity: .65; }
 .card-heading { display: flex; justify-content: space-between; align-items: center; font-size: 9px; letter-spacing: 1.2px; }
 .card-icon { width: 22px; height: 22px; display: grid; place-items: center; border-radius: 6px; font-size: 12px; }
 .purple { color: #a891ff; background: #684ce52b; }.amber { color: #f3b568; background: #bd722b2b; }.blue { color: #6cb5ff; background: #307ac52b; }.green { color: #58dda6; background: #2e9c6a2b; }

@@ -100,6 +100,8 @@ describe("App", () => {
     expect(screen.getByText("67")).toBeTruthy();
     expect(screen.getByText("Queued")).toBeTruthy();
     expect(screen.queryByText("92")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh pipeline health" }));
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "get_project_pipelines")).toHaveLength(2));
   });
 
   it("hides Gemini CLI from the agent provider settings", async () => {

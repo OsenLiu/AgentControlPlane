@@ -1427,6 +1427,7 @@ function App() {
   const [projectPipelineStatuses, setProjectPipelineStatuses] = useState<Record<string, ProjectPipelineStatus>>({});
   const [pipelineHealthLoading, setPipelineHealthLoading] = useState(true);
   const [pipelineHealthErrors, setPipelineHealthErrors] = useState<string[]>([]);
+  const [pipelineRefreshKey, setPipelineRefreshKey] = useState(0);
 
   async function loadProjects() {
     setLoadingProjects(true);
@@ -1505,7 +1506,7 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [activeNav, loadingProjects, projects]);
+  }, [activeNav, loadingProjects, pipelineRefreshKey, projects]);
 
   useEffect(() => {
     void refreshAttentionItems();
@@ -1734,7 +1735,24 @@ function App() {
             <div className="backlog-line"><span style={{ width: "72%" }} /></div>
           </article>
           <article className="summary-card">
-            <div className="card-heading"><span>PIPELINE HEALTH</span><span className="card-icon green">↗</span></div>
+            <div className="card-heading">
+              <span>PIPELINE HEALTH</span>
+              <div className="pipeline-health-actions">
+                <button
+                  className="pipeline-health-refresh"
+                  type="button"
+                  aria-label="Refresh pipeline health"
+                  onClick={() => {
+                    setPipelineHealthLoading(true);
+                    setPipelineRefreshKey((current) => current + 1);
+                  }}
+                  disabled={pipelineHealthLoading || loadingProjects || projects.length === 0}
+                >
+                  {pipelineHealthLoading ? "Refreshing…" : "Refresh"}
+                </button>
+                <span className="card-icon green" aria-hidden="true">↗</span>
+              </div>
+            </div>
             <strong className="metric">{pipelineHealthLoading ? "…" : pipelineHealthPercent === null ? "—" : <>{pipelineHealthPercent}<small>%</small></>}</strong>
             <div className="metric-meta">
               {pipelineHealthLoading
