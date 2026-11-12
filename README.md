@@ -38,3 +38,10 @@ npm run tauri build
 
 The web build is currently independent of native system libraries; the Tauri
 build validates the complete desktop bundle.
+
+## Releases
+
+Pushing a Git tag matching `v*` builds the desktop app for Linux, macOS, and
+Windows and publishes the installers as a GitHub Release. Use a semantic
+version tag such as `v1.2.3`; the tag version is applied to the app and its
+package metadata before building.
