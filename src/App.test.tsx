@@ -252,11 +252,17 @@ describe("App", () => {
     fireEvent.click(await screen.findByRole("button", { name: /View all projects/ }));
     fireEvent.click(await screen.findByRole("button", { name: "Open workspace" }));
 
+    fireEvent.click(await screen.findByRole("button", { name: /New task/ }));
     fireEvent.change(await screen.findByLabelText("Task title"), { target: { value: "Ship onboarding flow" } });
     fireEvent.change(screen.getByLabelText("Brief"), { target: { value: "Add the welcome screens." } });
     fireEvent.click(screen.getByRole("button", { name: "Add task" }));
 
     expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
+    const taskFilter = screen.getByRole("searchbox", { name: "Filter tasks" });
+    fireEvent.change(taskFilter, { target: { value: "not in this task" } });
+    expect(screen.getByText("No tasks match these filters.")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
+    fireEvent.change(taskFilter, { target: { value: "Ship" } });
     fireEvent.click(screen.getByRole("checkbox", { name: "Include Ship onboarding flow in project loop" }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_project_task_loop_enabled", {
       projectId: "/work/website",
@@ -264,7 +270,8 @@ describe("App", () => {
       enabled: false,
     }));
     fireEvent.click(screen.getByRole("button", { name: "Start session" }));
-    expect(await screen.findByText("Linked session · session-")).toBeTruthy();
+    expect(await screen.findByText("Linked session")).toBeTruthy();
+    expect(await screen.findByText("session-1")).toBeTruthy();
     expect(invokeMock).toHaveBeenCalledWith("start_copilot_session", {
       projectId: "/work/website",
       task: "Ship onboarding flow\n\nAdd the welcome screens.",

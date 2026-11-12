@@ -144,6 +144,10 @@ function Feedback({ error }: { error: string }) {
 
 export function ProjectTasksTab({ project }: { project: ProjectReference }) {
   const [tasks, setTasks] = useState<ProjectTask[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState("");
+  const [filter, setFilter] = useState("");
+  const [statusFilter, setStatusFilter] = useState<ProjectTask["status"] | "all">("all");
+  const [showTaskForm, setShowTaskForm] = useState(false);
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [loading, setLoading] = useState(true);
@@ -155,13 +159,24 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
   const loadTasks = useCallback(async () => {
     setError("");
     try {
-      setTasks(await invoke<ProjectTask[]>("list_project_tasks", { projectId: project.id }));
+      const loadedTasks = await invoke<ProjectTask[]>("list_project_tasks", { projectId: project.id });
+      setTasks(loadedTasks);
+      setSelectedTaskId((current) =>
+        current && loadedTasks.some((task) => task.id === current) ? current : loadedTasks[0]?.id ?? "",
+      );
     } catch (loadError) {
       setError(messageFromError(loadError));
     } finally {
       setLoading(false);
     }
   }, [project.id]);
+
+  const visibleTasks = tasks.filter((task) => {
+    const searchable = `${task.title} ${task.description}`.toLowerCase();
+    return searchable.includes(filter.trim().toLowerCase()) &&
+      (statusFilter === "all" || task.status === statusFilter);
+  });
+  const selectedTask = tasks.find((task) => task.id === selectedTaskId);
 
   useEffect(() => {
     void loadTasks();
@@ -189,13 +204,15 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
     setSaving(true);
     setError("");
     try {
-      await invoke<ProjectTask>("create_project_task", {
+      const created = await invoke<ProjectTask>("create_project_task", {
         projectId: project.id,
         title,
         description,
       });
+      setSelectedTaskId(created.id);
       setTitle("");
       setDescription("");
+      setShowTaskForm(false);
       await loadTasks();
     } catch (saveError) {
       setError(messageFromError(saveError));
@@ -264,101 +281,238 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
   }
 
   return (
-    <FeatureFrame
-      eyebrow="PROJECT BACKLOG"
-      title="Tasks"
-      description="Delegate tasks to Copilot, choose which backlog items may run in a project loop, and review agent-proposed follow-ups."
-      action={<button className="project-feature-button" type="button" onClick={() => void loadTasks()} disabled={loading}>Refresh</button>}
-    >
+    <section className="project-feature project-tasks-feature" aria-label="Project tasks">
       <Feedback error={error} />
-      <form className="project-task-form" onSubmit={(event) => void createTask(event)}>
-        <label>
-          Task title
-          <input
-            required
-            maxLength={200}
-            value={title}
-            onChange={(event) => setTitle(event.target.value)}
-            placeholder="What needs to be done?"
-          />
-        </label>
-        <label>
-          Brief
-          <textarea
-            maxLength={20_000}
-            rows={2}
-            value={description}
-            onChange={(event) => setDescription(event.target.value)}
-            placeholder="Add context or acceptance notes"
-          />
-        </label>
-        <button className="project-feature-primary" type="submit" disabled={saving || !title.trim()}>
-          {saving ? "Adding…" : "Add task"}
-        </button>
-      </form>
+      <div className="project-task-workspace">
+        <aside className="project-task-sidebar" aria-label="Task list">
+          <header className="project-task-sidebar-header">
+            <div>
+              <h2>Tasks</h2>
+              <span>{tasks.length} {tasks.length === 1 ? "task" : "tasks"}</span>
+            </div>
+            <button
+              className="project-feature-primary project-task-new-button"
+              type="button"
+              onClick={() => setShowTaskForm((show) => !show)}
+              aria-expanded={showTaskForm}
+            >
+              {showTaskForm ? "Cancel" : "+ New task"}
+            </button>
+          </header>
 
-      {loading && tasks.length === 0 ? (
-        <p className="project-feature-state" role="status">Loading project tasks…</p>
-      ) : tasks.length === 0 ? (
-        <div className="project-feature-empty">
-          <span className="project-feature-empty-mark" aria-hidden="true">✓</span>
-          <h3>No tasks yet</h3>
-          <p>Add the first task to this project backlog.</p>
-        </div>
-      ) : (
-        <div className="project-task-list">
-          {tasks.map((task) => (
-            <article className={`project-task-card ${task.status}`} key={task.id}>
-              <div className="project-task-main">
-                <span className={`project-task-status ${task.status}`}>{task.status.replace("_", " ")}</span>
-                {task.origin === "agent" && <span className="project-task-origin">Agent proposal</span>}
-                <h3>{task.title}</h3>
-                {task.description && <p>{task.description}</p>}
-                {task.sessionId && <span className="project-task-session">Linked session · {task.sessionId.slice(0, 8)}</span>}
-              </div>
-              <div className="project-task-actions">
-                {task.status === "backlog" && (
-                  <label className="project-task-loop-toggle">
-                    <input
-                      type="checkbox"
-                      checked={task.loopEnabled}
-                      aria-label={`Include ${task.title} in project loop`}
-                      onChange={(event) => void setTaskLoopEnabled(task, event.target.checked)}
-                    />
-                    <span>Loop</span>
-                  </label>
-                )}
-                {task.status !== "done" ? (
-                  <>
-                    {task.status === "backlog" && (
-                      <button
-                        className="project-feature-button"
-                        type="button"
-                        disabled={startingTaskId === task.id}
-                        onClick={() => void startTask(task)}
-                      >
-                        {startingTaskId === task.id ? "Starting…" : "Start session"}
-                      </button>
-                    )}
-                    <button className="project-feature-button" type="button" onClick={() => void setTaskStatus(task, "done")}>Mark done</button>
-                  </>
-                ) : (
-                  <button className="project-feature-button" type="button" onClick={() => void setTaskStatus(task, "backlog")}>Reopen</button>
-                )}
-                {confirmDeleteId === task.id ? (
-                  <span className="project-task-confirm">
-                    <button className="project-feature-danger" type="button" onClick={() => void deleteTask(task)}>Delete</button>
-                    <button className="project-feature-button" type="button" onClick={() => setConfirmDeleteId("")}>Cancel</button>
+          {showTaskForm && (
+            <form className="project-task-form" onSubmit={(event) => void createTask(event)}>
+              <label>
+                Task title
+                <input
+                  required
+                  maxLength={200}
+                  autoFocus
+                  value={title}
+                  onChange={(event) => setTitle(event.target.value)}
+                  placeholder="What needs to be done?"
+                />
+              </label>
+              <label>
+                Brief
+                <textarea
+                  maxLength={20_000}
+                  rows={3}
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                  placeholder="Add context or acceptance notes"
+                />
+              </label>
+              <button className="project-feature-primary" type="submit" disabled={saving || !title.trim()}>
+                {saving ? "Adding…" : "Add task"}
+              </button>
+            </form>
+          )}
+
+          <div className="project-task-list-controls">
+            <input
+              type="search"
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+              placeholder="Filter tasks…"
+              aria-label="Filter tasks"
+            />
+            <select
+              aria-label="Filter by status"
+              value={statusFilter}
+              onChange={(event) => setStatusFilter(event.target.value as ProjectTask["status"] | "all")}
+            >
+              <option value="all">All statuses</option>
+              <option value="backlog">Backlog</option>
+              <option value="in_progress">In progress</option>
+              <option value="done">Done</option>
+            </select>
+          </div>
+
+          {loading && tasks.length === 0 ? (
+            <p className="project-feature-state" role="status">Loading project tasks…</p>
+          ) : tasks.length === 0 ? (
+            <div className="project-task-list-empty">
+              <h3>No tasks yet</h3>
+              <p>Add the first task to this project backlog.</p>
+              <button className="project-feature-quiet" type="button" onClick={() => setShowTaskForm(true)}>
+                Create a task
+              </button>
+            </div>
+          ) : (
+            <div className="project-task-list">
+              {visibleTasks.map((task) => (
+                <button
+                  className={`project-task-row ${selectedTaskId === task.id ? "active" : ""} ${task.status}`}
+                  key={task.id}
+                  type="button"
+                  aria-pressed={selectedTaskId === task.id}
+                  onClick={() => setSelectedTaskId(task.id)}
+                >
+                  <span className="project-task-row-title">{task.title}</span>
+                  <span className="project-task-row-meta">
+                    <span className={`project-task-status ${task.status}`}>
+                      {task.status.replace("_", " ")}
+                    </span>
+                    {task.loopEnabled && task.status === "backlog" && <span className="project-task-row-loop">In loop</span>}
                   </span>
-                ) : (
-                  <button className="project-feature-quiet" type="button" onClick={() => setConfirmDeleteId(task.id)}>Delete</button>
-                )}
-              </div>
-            </article>
-          ))}
+                </button>
+              ))}
+              {visibleTasks.length === 0 && (
+                <p className="project-task-list-empty" role="status">No tasks match these filters.</p>
+              )}
+            </div>
+          )}
+        </aside>
+
+        {selectedTask ? (
+            <ProjectTaskDetail
+              task={selectedTask}
+              confirmDelete={confirmDeleteId === selectedTask.id}
+              starting={startingTaskId === selectedTask.id}
+              onStart={() => void startTask(selectedTask)}
+              onSetStatus={(status) => void setTaskStatus(selectedTask, status)}
+              onSetLoop={(enabled) => void setTaskLoopEnabled(selectedTask, enabled)}
+              onDelete={() => void deleteTask(selectedTask)}
+              onConfirmDelete={() => setConfirmDeleteId(selectedTask.id)}
+              onCancelDelete={() => setConfirmDeleteId("")}
+            />
+        ) : (
+          <div className="project-task-detail project-task-detail-empty">
+            <span className="project-task-detail-mark" aria-hidden="true">✓</span>
+            <h2>{tasks.length === 0 ? "Your backlog starts here" : "No task selected"}</h2>
+            <p>{tasks.length === 0 ? "Create a task to give your agent a clear goal, or add context for later." : "Choose a task from the list to see its details."}</p>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function ProjectTaskDetail({
+  task,
+  confirmDelete,
+  starting,
+  onStart,
+  onSetStatus,
+  onSetLoop,
+  onDelete,
+  onConfirmDelete,
+  onCancelDelete,
+}: {
+  task: ProjectTask;
+  confirmDelete: boolean;
+  starting: boolean;
+  onStart: () => void;
+  onSetStatus: (status: ProjectTask["status"]) => void;
+  onSetLoop: (enabled: boolean) => void;
+  onDelete: () => void;
+  onConfirmDelete: () => void;
+  onCancelDelete: () => void;
+}) {
+  return (
+    <article className="project-task-detail" aria-labelledby="selected-task-title">
+      <header className="project-task-detail-header">
+        <div className="project-task-detail-heading">
+          <h2 id="selected-task-title">{task.title}</h2>
+          <div className="project-task-detail-badges">
+            <span className={`project-task-status ${task.status}`}>{task.status.replace("_", " ")}</span>
+            {task.origin === "agent" && <span className="project-task-origin">Agent proposal</span>}
+            {task.status === "backlog" && (
+              <span className={`project-task-loop-badge ${task.loopEnabled ? "enabled" : ""}`}>
+                {task.loopEnabled ? "In project loop" : "Loop off"}
+              </span>
+            )}
+          </div>
         </div>
+        {confirmDelete ? (
+          <div className="project-task-confirm">
+            <span>Delete this task?</span>
+            <button className="project-feature-danger" type="button" onClick={onDelete}>Delete</button>
+            <button className="project-feature-button" type="button" onClick={onCancelDelete}>Cancel</button>
+          </div>
+        ) : (
+          <button className="project-feature-quiet" type="button" onClick={onConfirmDelete}>Delete</button>
+        )}
+      </header>
+
+      <section className="project-task-description-section">
+        <h3>Description</h3>
+        <p>{task.description || "No description added."}</p>
+      </section>
+
+      {task.sessionId && (
+        <section className="project-task-session-section" aria-label="Linked session">
+          <span className="project-task-session-icon" aria-hidden="true">↗</span>
+          <div>
+            <strong>Linked session</strong>
+            <code>{task.sessionId}</code>
+          </div>
+        </section>
       )}
-    </FeatureFrame>
+
+      <section className="project-task-actions-panel" aria-label="Task actions">
+        <div className="project-task-actions-copy">
+          <h3>{task.status === "done" ? "Task complete" : task.status === "in_progress" ? "Work in progress" : "Ready to delegate"}</h3>
+          <p>
+            {task.status === "done"
+              ? "This task is complete. Reopen it if more work is needed."
+              : task.status === "in_progress"
+                ? "A session has been started for this task."
+                : "Start a Copilot session now, or keep this task in your project backlog."}
+          </p>
+        </div>
+        <div className="project-task-action-controls">
+          {task.status === "backlog" && (
+            <label className="project-task-loop-toggle">
+              <input
+                type="checkbox"
+                checked={task.loopEnabled}
+                aria-label={`Include ${task.title} in project loop`}
+                onChange={(event) => onSetLoop(event.target.checked)}
+              />
+              <span>Include in project loop</span>
+            </label>
+          )}
+          <div className="project-task-action-buttons">
+            {task.status === "backlog" && (
+              <button className="project-feature-primary" type="button" disabled={starting} onClick={onStart}>
+                {starting ? "Starting…" : "Start session"}
+              </button>
+            )}
+            {task.status !== "done" ? (
+              <button className="project-feature-button" type="button" onClick={() => onSetStatus("done")}>
+                Mark done
+              </button>
+            ) : (
+              <button className="project-feature-primary" type="button" onClick={() => onSetStatus("backlog")}>
+                Reopen task
+              </button>
+            )}
+          </div>
+        </div>
+      </section>
+    </article>
   );
 }
 
