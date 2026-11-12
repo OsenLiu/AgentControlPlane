@@ -12,7 +12,7 @@ import {
 } from "./project/ProjectFeatureTabs";
 import "./App.css";
 
-type Status = "healthy" | "running" | "waiting" | "failed";
+type Status = "healthy" | "running" | "waiting" | "failed" | "unknown";
 
 type Project = {
   id: string;
@@ -23,6 +23,34 @@ type Project = {
   gitState: "clean" | "dirty";
   looping: boolean;
   agentTaskCreation: boolean;
+};
+
+type PipelineRun = {
+  id: string;
+  name: string;
+  status: string;
+  conclusion: string | null;
+  branch: string;
+  url: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+type ProjectPipelines = {
+  repository: string | null;
+  configured: boolean;
+  error: string | null;
+  runs: PipelineRun[];
+};
+
+type DashboardPipelineRun = PipelineRun & {
+  projectId: string;
+  projectName: string;
+};
+
+type ProjectPipelineStatus = {
+  status: Status;
+  label: string;
 };
 
 type ToolSettings = {
@@ -218,19 +246,49 @@ const projectSections = [
 
 type ProjectSection = (typeof projectSections)[number]["id"];
 
-function StatusBadge({ status }: { status: Status }) {
+function StatusBadge({ status, label }: { status: Status; label?: string }) {
   const labels: Record<Status, string> = {
     healthy: "Healthy",
     running: "Running",
     waiting: "Waiting",
     failed: "Failed",
+    unknown: "Unknown",
   };
   return (
     <span className={`status status-${status}`}>
       <span className="status-dot" aria-hidden="true" />
-      {labels[status]}
+      {label ?? labels[status]}
     </span>
   );
+}
+
+function pipelineRunStatus(run: PipelineRun): ProjectPipelineStatus {
+  if (run.status === "completed") {
+    switch (run.conclusion) {
+      case "success":
+        return { status: "healthy", label: "Healthy" };
+      case "failure":
+      case "timed_out":
+      case "startup_failure":
+        return { status: "failed", label: "Failed" };
+      case "cancelled":
+        return { status: "unknown", label: "Cancelled" };
+      default:
+        return { status: "unknown", label: run.conclusion ?? "Completed" };
+    }
+  }
+  if (run.status === "in_progress") return { status: "running", label: "Running" };
+  if (run.status === "queued" || run.status === "waiting" || run.status === "pending") {
+    return { status: "waiting", label: run.status === "queued" ? "Queued" : "Waiting" };
+  }
+  return { status: "unknown", label: run.status || "Unknown" };
+}
+
+function dashboardProjectPipelineStatus(snapshot: ProjectPipelines | null): ProjectPipelineStatus {
+  if (!snapshot) return { status: "unknown", label: "Unavailable" };
+  if (!snapshot.configured) return { status: "unknown", label: "Not configured" };
+  const latestRun = [...snapshot.runs].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))[0];
+  return latestRun ? pipelineRunStatus(latestRun) : { status: "unknown", label: "No runs" };
 }
 
 function SettingsView({
@@ -1365,6 +1423,10 @@ function App() {
   const [attentionItems, setAttentionItems] = useState<AttentionItem[]>([]);
   const [attentionLoading, setAttentionLoading] = useState(true);
   const [attentionError, setAttentionError] = useState("");
+  const [dashboardPipelineRuns, setDashboardPipelineRuns] = useState<DashboardPipelineRun[]>([]);
+  const [projectPipelineStatuses, setProjectPipelineStatuses] = useState<Record<string, ProjectPipelineStatus>>({});
+  const [pipelineHealthLoading, setPipelineHealthLoading] = useState(true);
+  const [pipelineHealthErrors, setPipelineHealthErrors] = useState<string[]>([]);
 
   async function loadProjects() {
     setLoadingProjects(true);
@@ -1394,6 +1456,56 @@ function App() {
     void loadProjects();
     void loadSettings();
   }, []);
+
+  useEffect(() => {
+    if (loadingProjects || activeNav !== "Dashboard") return;
+    if (projects.length === 0) {
+      setDashboardPipelineRuns([]);
+      setProjectPipelineStatuses({});
+      setPipelineHealthErrors([]);
+      setPipelineHealthLoading(false);
+      return;
+    }
+
+    let disposed = false;
+    setPipelineHealthLoading(true);
+    void Promise.all(projects.map(async (project) => {
+      try {
+        const snapshot = await invoke<ProjectPipelines>("get_project_pipelines", { projectId: project.id });
+        return { project, snapshot, error: null };
+      } catch (reason) {
+        return {
+          project,
+          snapshot: null,
+          error: `${project.name}: ${reason instanceof Error ? reason.message : String(reason)}`,
+        };
+      }
+    })).then((results) => {
+      if (disposed) return;
+      const statuses: Record<string, ProjectPipelineStatus> = {};
+      const runs: DashboardPipelineRun[] = [];
+      const errors: string[] = [];
+      for (const { project, snapshot, error } of results) {
+        if (error) errors.push(error);
+        statuses[project.id] = dashboardProjectPipelineStatus(snapshot);
+        if (snapshot?.configured) {
+          runs.push(...snapshot.runs.map((run) => ({
+            ...run,
+            projectId: project.id,
+            projectName: project.name,
+          })));
+        }
+      }
+      setProjectPipelineStatuses(statuses);
+      setDashboardPipelineRuns(runs);
+      setPipelineHealthErrors(errors);
+      setPipelineHealthLoading(false);
+    });
+
+    return () => {
+      disposed = true;
+    };
+  }, [activeNav, loadingProjects, projects]);
 
   useEffect(() => {
     void refreshAttentionItems();
@@ -1516,6 +1628,14 @@ function App() {
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
   const urgentAttentionCount = attentionItems.filter((item) => item.priority === "High").length;
+  const completedPipelineRuns = dashboardPipelineRuns
+    .filter((run) => run.status === "completed" && ["success", "failure", "timed_out", "startup_failure"].includes(run.conclusion ?? ""))
+    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    .slice(0, 20);
+  const pipelineHealthPercent = completedPipelineRuns.length === 0
+    ? null
+    : Math.round((completedPipelineRuns.filter((run) => run.conclusion === "success").length / completedPipelineRuns.length) * 100);
+  const pipelineSuccessCount = completedPipelineRuns.filter((run) => run.conclusion === "success").length;
 
   return (
     <div className="app-shell">
@@ -1615,9 +1735,27 @@ function App() {
           </article>
           <article className="summary-card">
             <div className="card-heading"><span>PIPELINE HEALTH</span><span className="card-icon green">↗</span></div>
-            <strong className="metric">92<small>%</small></strong>
-            <div className="metric-meta"><span className="trend-up">↑ 4.8%</span> over last 20 runs</div>
-            <div className="sparkline" aria-label="Pipeline health trend"><i /><i /><i /><i /><i /><i /><i /><i /></div>
+            <strong className="metric">{pipelineHealthLoading ? "…" : pipelineHealthPercent === null ? "—" : <>{pipelineHealthPercent}<small>%</small></>}</strong>
+            <div className="metric-meta">
+              {pipelineHealthLoading
+                ? "Loading recent workflow runs…"
+                : completedPipelineRuns.length > 0
+                  ? `${pipelineSuccessCount} of ${completedPipelineRuns.length} recent runs succeeded`
+                  : "No completed workflow runs available"}
+            </div>
+            {pipelineHealthErrors.length > 0 && <div className="pipeline-health-error" role="status" title={pipelineHealthErrors.join("\n")}>
+              Could not load runs for {pipelineHealthErrors.length} project{pipelineHealthErrors.length === 1 ? "" : "s"}
+            </div>}
+            {completedPipelineRuns.length > 0 && <div className="sparkline" aria-label="Recent completed pipeline runs">
+              {[...completedPipelineRuns].reverse().map((run) => (
+                <i
+                  key={`${run.projectId}:${run.id}`}
+                  className={run.conclusion === "success" ? "success" : "failure"}
+                  title={`${run.projectName}: ${run.name} — ${run.conclusion}`}
+                  aria-label={`${run.projectName}: ${run.name} — ${run.conclusion}`}
+                />
+              ))}
+            </div>}
           </article>
         </section>
 
@@ -1635,7 +1773,7 @@ function App() {
                 <div className="project-name"><span className="project-avatar">{project.name.charAt(0)}</span><div><strong>{project.name}</strong><span><code>{project.branch}</code> · {project.path}</span></div></div>
                 <span className="agent-count"><span className="idle-dot" /> No agents</span>
                 <div className="progress-cell"><div className="progress-track"><span style={{ width: "0%" }} /></div><small>—</small></div>
-                <StatusBadge status="waiting" />
+                <StatusBadge {...(projectPipelineStatuses[project.id] ?? { status: "unknown", label: pipelineHealthLoading ? "Loading" : "No data" })} />
                 <span className={`git-state ${project.gitState}`}><span /> {project.gitState === "clean" ? "Clean" : "Changes"}</span>
                 <button className="row-action" aria-label={`Open ${project.name}`} onClick={() => openProjectWorkspace(project.id)}>→</button>
               </div>

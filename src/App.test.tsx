@@ -63,6 +63,45 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("load_settings");
   });
 
+  it("calculates dashboard pipeline health from recent completed workflow runs", async () => {
+    const project = {
+      id: "/work/website",
+      name: "website",
+      path: "/work/website",
+      branch: "main",
+      currentCommit: "abcdef0",
+      gitState: "clean" as const,
+      looping: false,
+      agentTaskCreation: false,
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [project];
+      if (command === "list_agent_sessions") return [];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "load_settings") return settings;
+      if (command === "get_project_pipelines") return {
+        repository: "owner/website",
+        configured: true,
+        error: null,
+        runs: [
+          { id: "1", name: "CI", status: "completed", conclusion: "success", branch: "main", url: "", createdAt: "2026-07-01T00:00:00Z", updatedAt: "2026-07-01T00:01:00Z" },
+          { id: "2", name: "CI", status: "completed", conclusion: "failure", branch: "main", url: "", createdAt: "2026-07-02T00:00:00Z", updatedAt: "2026-07-02T00:01:00Z" },
+          { id: "3", name: "CI", status: "completed", conclusion: "success", branch: "main", url: "", createdAt: "2026-07-03T00:00:00Z", updatedAt: "2026-07-03T00:01:00Z" },
+          { id: "4", name: "CI", status: "completed", conclusion: "cancelled", branch: "main", url: "", createdAt: "2026-07-04T00:00:00Z", updatedAt: "2026-07-04T00:01:00Z" },
+          { id: "5", name: "CI", status: "queued", conclusion: null, branch: "main", url: "", createdAt: "2026-07-05T00:00:00Z", updatedAt: "2026-07-05T00:01:00Z" },
+        ],
+      };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("2 of 3 recent runs succeeded")).toBeTruthy();
+    expect(screen.getByText("67")).toBeTruthy();
+    expect(screen.getByText("Queued")).toBeTruthy();
+    expect(screen.queryByText("92")).toBeNull();
+  });
+
   it("hides Gemini CLI from the agent provider settings", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
