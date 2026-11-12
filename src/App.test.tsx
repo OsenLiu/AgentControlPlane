@@ -160,6 +160,47 @@ describe("App", () => {
     await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "list_project_tasks")).toHaveLength(4));
   });
 
+  it("opens the most recent session transcript from dashboard live activity", async () => {
+    const latestSession = {
+      id: "latest-session",
+      externalSessionId: null,
+      project: "website",
+      task: "Most recent work",
+      branch: "main",
+      provider: "copilot",
+      status: "completed",
+      step: "Finished",
+      elapsed: "2026-11-12 10:00:00",
+      tokens: "100",
+      permissionMode: "Plan",
+      managed: false,
+      lastEvent: "Completed",
+      archived: false,
+      statusReason: "",
+      updatedAt: "2026-11-12 10:00:00",
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [];
+      if (command === "list_agent_sessions") return [latestSession];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "load_settings") return settings;
+      if (command === "get_session_transcript") return [{
+        role: "assistant",
+        content: "Transcript entry from the latest session",
+        timestamp: "2026-11-12 10:00:00",
+      }];
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /View transcript/ }));
+
+    expect(await screen.findByRole("heading", { name: "Agent sessions" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Most recent work" })).toBeTruthy();
+    expect(await screen.findByText("Transcript entry from the latest session")).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("get_session_transcript", { sessionId: "latest-session" });
+  });
+
   it("hides Gemini CLI from the agent provider settings", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
@@ -489,6 +530,10 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create task" }));
 
     expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
+    expect(screen.getByRole("region", { name: "Task settings" })).toBeTruthy();
+    expect(screen.getByText("Permission mode")).toBeTruthy();
+    expect(screen.getByText("Auto", { selector: ".project-task-setting-value" })).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "Steps used" })).toHaveAttribute("aria-valuenow", "0");
     expect(invokeMock).toHaveBeenCalledWith("create_project_task", {
       projectId: "/work/website",
       title: "Ship onboarding flow",

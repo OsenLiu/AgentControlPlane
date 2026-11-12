@@ -1905,7 +1905,7 @@ function App() {
             </div>
           </section>
           <section className="section-block activity-section">
-            <div className="section-header"><div><h2>Live activity</h2><span className="section-caption live-caption"><span /> Streaming now</span></div><button className="text-button">View transcript <span>→</span></button></div>
+            <div className="section-header"><div><h2>Live activity</h2><span className="section-caption live-caption"><span /> Streaming now</span></div><button className="text-button" type="button" onClick={() => { setSessionToOpen(""); setActiveNav("Agent sessions"); }}>View transcript <span>→</span></button></div>
             <div className="activity-card">
               <div className="empty-card">Live activity will appear when an agent session is connected.</div>
             </div>

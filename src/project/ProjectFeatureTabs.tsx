@@ -861,6 +861,9 @@ function ProjectTaskDetail({
   onCancelDelete: () => void;
 }) {
   const linkedSessionId = task.sessionId;
+  const stepBudget = Math.max(task.stepBudget, 1);
+  const stepsUsed = Math.max(task.stepsUsed, 0);
+  const visibleStepsUsed = Math.min(stepsUsed, stepBudget);
 
   return (
     <article className="project-task-detail" aria-labelledby="selected-task-title">
@@ -921,10 +924,50 @@ function ProjectTaskDetail({
       )}
 
       <section className="project-task-settings-summary" aria-label="Task settings">
-        <span>{task.mode === "acceptEdits" ? "Accept edits" : "Auto"} mode</span>
-        <span>{task.model === "auto" ? "Auto model" : task.model}</span>
-        <span>{task.stepsUsed}/{task.stepBudget} steps</span>
-        {task.autoApprove && <span>Auto-approve</span>}
+        <header className="project-task-settings-header">
+          <h3>Run configuration</h3>
+          <span>Applied when this task starts</span>
+        </header>
+        <div className="project-task-settings-grid">
+          <div className="project-task-setting">
+            <span className="project-task-setting-label">Permission mode</span>
+            <strong className="project-task-setting-value">{task.mode === "acceptEdits" ? "Accept edits" : "Auto"}</strong>
+            <span className="project-task-setting-detail">
+              {task.mode === "acceptEdits"
+                ? "File edits are approved; other tools ask first."
+                : "All tool permissions are approved."}
+            </span>
+          </div>
+          <div className="project-task-setting">
+            <span className="project-task-setting-label">Model</span>
+            <strong className="project-task-setting-value">{task.model === "auto" ? "Automatic" : task.model}</strong>
+            <span className="project-task-setting-detail">
+              {task.model === "auto" ? "Uses the Copilot CLI default." : "Selected Copilot model."}
+            </span>
+          </div>
+          <div className="project-task-setting">
+            <div className="project-task-setting-topline">
+              <span className="project-task-setting-label">Steps used</span>
+              <strong className="project-task-setting-value">{stepsUsed} / {task.stepBudget}</strong>
+            </div>
+            <div
+              className="project-task-step-progress"
+              role="progressbar"
+              aria-label="Steps used"
+              aria-valuemin={0}
+              aria-valuemax={stepBudget}
+              aria-valuenow={visibleStepsUsed}
+            >
+              <span style={{ width: `${(visibleStepsUsed / stepBudget) * 100}%` }} />
+            </div>
+            <span className="project-task-setting-detail">of the task step budget</span>
+          </div>
+          <div className="project-task-setting">
+            <span className="project-task-setting-label">Auto-approve</span>
+            <strong className="project-task-setting-value">{task.autoApprove ? "Enabled" : "Disabled"}</strong>
+            <span className="project-task-setting-detail">Task approval setting</span>
+          </div>
+        </div>
       </section>
 
       <section className="project-task-actions-panel" aria-label="Task actions">
