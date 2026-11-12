@@ -1131,13 +1131,16 @@ fn parse_apt_status_report(text: &str) -> Option<AptStatusReport> {
         .map(|(_, section)| *section)
         .rev()
     {
-        let Some((language, json)) = section.split_once('\n') else {
+        let section = section.trim();
+        let Some(separator) = section.find(char::is_whitespace) else {
             continue;
         };
+        let language = &section[..separator];
+        let json = section[separator..].trim();
         if !language.trim().eq_ignore_ascii_case("apt-status") {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(json.trim()) else {
+        let Ok(value) = serde_json::from_str::<Value>(json) else {
             continue;
         };
         let Some(state) = value
@@ -1175,7 +1178,7 @@ fn handle_project_task_turn(
             let (project_id, looping, agent_task_creation, task) = connection
                 .query_row(
                     "SELECT s.project_id, p.looping, p.agent_task_creation,
-                        t.loop_enabled, t.step_budget, t.steps_used
+                        t.loop_enabled, t.step_budget, t.steps_used, t.auto_approve
                  FROM agent_sessions s
                  JOIN projects p ON p.id = s.project_id
                  LEFT JOIN project_tasks t ON t.session_id = s.id
@@ -1191,6 +1194,7 @@ fn handle_project_task_turn(
                                     enabled != 0,
                                     row.get::<_, i64>(4)?,
                                     row.get::<_, i64>(5)?,
+                                    row.get::<_, i64>(6)? != 0,
                                 )),
                                 None => None,
                             },
@@ -1213,7 +1217,11 @@ fn handle_project_task_turn(
             }
 
             let mut schedule_loop = false;
-            if let (Some((task_loop_enabled, _, _)), Some(report)) = (task, report.as_ref()) {
+            let task_requires_review =
+                task.is_some_and(|(task_loop_enabled, _, _, auto_approve)| {
+                    !auto_approve && !(looping && task_loop_enabled)
+                });
+            if let (Some((task_loop_enabled, _, _, _)), Some(report)) = (task, report.as_ref()) {
                 match report.state.as_str() {
                     "complete" if report.gate_passed == Some(true) => {
                         finish_project_task_session(&connection, session_id, true)?;
@@ -1256,8 +1264,22 @@ fn handle_project_task_turn(
                                 report.note.as_str()
                             },
                         )),
-                        "complete" if report.gate_passed == Some(true) => None,
-                        _ if task.is_some_and(|(_, budget, used)| used >= budget) => Some((
+                        "complete" if report.gate_passed == Some(true) => {
+                            Some(if task_requires_review {
+                                (
+                                    "completed",
+                                    "Task ready for review",
+                                    "The agent completed the task and passed its checks. Review the result, then mark the task done.",
+                                )
+                            } else {
+                                (
+                                    "completed",
+                                    "Task complete",
+                                    "The agent completed the task and passed its checks.",
+                                )
+                            })
+                        }
+                        _ if task.is_some_and(|(_, budget, used, _)| used >= budget) => Some((
                             "waiting",
                             "Task step budget reached",
                             "Increase the task's step budget to continue this session.",
@@ -1271,7 +1293,7 @@ fn handle_project_task_turn(
                         (status.to_owned(), reason.to_owned(), detail.to_owned())
                     })
                 }
-                None if task.is_some_and(|(_, budget, used)| used >= budget) => Some((
+                None if task.is_some_and(|(_, budget, used, _)| used >= budget) => Some((
                     "waiting".to_owned(),
                     "Task step budget reached".to_owned(),
                     "Increase the task's step budget to continue this session.".to_owned(),
@@ -3039,6 +3061,13 @@ mod tests {
         assert_eq!(report.state, "complete");
         assert_eq!(report.note, "Ready");
         assert_eq!(report.gate_passed, Some(true));
+
+        let inline_report = parse_apt_status_report(
+            "```apt-status {\"state\":\"complete\",\"note\":\"Answered using the provided current time\",\"gatePassed\":true,\"gateSummary\":\"Current time provided in the conversation context\"} ```",
+        )
+        .expect("valid inline completion report");
+        assert_eq!(inline_report.state, "complete");
+        assert_eq!(inline_report.gate_passed, Some(true));
 
         assert!(
             parse_apt_status_report("```apt-status\n{\"state\":\"complete\"}\n```")

@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import App, { getGreetingForLocalTime } from "./App";
-import { ProjectDiffsTab } from "./project/ProjectFeatureTabs";
+import { ProjectDiffsTab, ProjectTasksTab } from "./project/ProjectFeatureTabs";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -457,6 +457,7 @@ describe("App", () => {
       createdAt: string;
       updatedAt: string;
       archived: boolean;
+      reviewPending: boolean;
     } | null = null;
 
     invokeMock.mockImplementation(async (command, args) => {
@@ -510,6 +511,7 @@ describe("App", () => {
           createdAt: "2026-01-01",
           updatedAt: "2026-01-01",
           archived: false,
+          reviewPending: false,
         };
         return task;
       }
@@ -697,6 +699,121 @@ describe("App", () => {
 
     expect(await screen.findByText("You’re all caught up")).toBeTruthy();
     expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions", { archived: false });
+  });
+
+  it("labels an in-progress project task ready for review when its agent has completed", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_project_tasks") return [{
+        id: "review-task",
+        projectId: "/work/demo",
+        title: "Write release notes",
+        description: "Summarize this release.",
+        mode: "acceptEdits",
+        model: "auto",
+        stepBudget: 10,
+        stepsUsed: 3,
+        autoApprove: false,
+        status: "in_progress",
+        loopEnabled: false,
+        origin: "user",
+        sessionId: "review-session",
+        createdAt: "2026-11-12 10:00:00",
+        updatedAt: "2026-11-12 10:15:00",
+        archived: false,
+        reviewPending: true,
+      }];
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<ProjectTasksTab project={{ id: "/work/demo", name: "demo" }} onOpenSession={vi.fn()} />);
+
+    expect(await screen.findByRole("heading", { name: "Ready for review" })).toBeTruthy();
+    expect(screen.getByText(/Review the session, then mark the task done/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Mark done" })).toBeTruthy();
+  });
+
+  it("shows completed and failed sessions in Task outcomes with working filters", async () => {
+    const sessions = [
+      {
+        id: "completed-session",
+        project: "demo",
+        task: "Update the docs",
+        branch: "docs/setup",
+        provider: "copilot",
+        status: "completed",
+        step: "Finished",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "1.2k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Prompt stopped: end_turn",
+        archived: false,
+        statusReason: "",
+        updatedAt: "2026-11-10 08:00:00",
+      },
+      {
+        id: "review-session",
+        project: "demo",
+        task: "Write release notes",
+        branch: "release/notes",
+        provider: "copilot",
+        status: "completed",
+        step: "Task ready for review",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "0.8k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Task summary ready",
+        archived: false,
+        statusReason: "The agent completed the task and passed its checks. Review the result, then mark the task done.",
+        updatedAt: "2026-11-10 08:30:00",
+      },
+      {
+        id: "failed-session",
+        project: "demo",
+        task: "Build the app",
+        branch: "fix/build",
+        provider: "claudeCode",
+        status: "failed",
+        step: "Build failed",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "1.0k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Compiler exited with status 1",
+        archived: false,
+        statusReason: "Build command failed",
+        updatedAt: "2026-11-10 09:00:00",
+      },
+    ];
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_agent_sessions") return sessions;
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: /^Task outcomes/ }));
+
+    expect(await screen.findByRole("heading", { name: "Task history 3" })).toBeTruthy();
+    const outcomesList = within(screen.getByRole("region", { name: "Completed and failed sessions" }));
+    const filters = within(screen.getByRole("group", { name: "Filter task outcomes" }));
+    expect(outcomesList.getByRole("button", { name: /Update the docs/ })).toBeTruthy();
+    expect(outcomesList.getByRole("button", { name: /Write release notes/ })).toBeTruthy();
+    expect(outcomesList.getByRole("button", { name: /Build the app/ })).toBeTruthy();
+
+    fireEvent.click(filters.getByRole("button", { name: /^Ready for review/ }));
+    expect(outcomesList.getByRole("button", { name: /Write release notes/ })).toBeTruthy();
+    expect(outcomesList.queryByRole("button", { name: /Update the docs/ })).toBeNull();
+    expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();
+    fireEvent.click(filters.getByRole("button", { name: /^Completed/ }));
+    expect(outcomesList.getByRole("button", { name: /Update the docs/ })).toBeTruthy();
+    expect(outcomesList.queryByRole("button", { name: /Write release notes/ })).toBeNull();
+    expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();
+    fireEvent.click(filters.getByRole("button", { name: /^Failed/ }));
+    expect(outcomesList.getByRole("button", { name: /Build the app/ })).toBeTruthy();
+    expect(outcomesList.queryByRole("button", { name: /Update the docs/ })).toBeNull();
   });
 
   it("shows pending permissions and failed sessions but excludes completed and orphaned sessions", async () => {

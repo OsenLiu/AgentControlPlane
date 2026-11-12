@@ -49,6 +49,7 @@ pub(crate) struct ProjectTask {
     created_at: String,
     updated_at: String,
     archived: bool,
+    review_pending: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -399,6 +400,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTask> {
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
         archived: row.get::<_, i64>(15)? != 0,
+        review_pending: row.get::<_, i64>(16)? != 0,
     })
 }
 
@@ -407,7 +409,12 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
     let mut statement = connection
         .prepare(
             "SELECT id, project_id, title, description, mode, model, step_budget, steps_used, auto_approve,
-                    status, loop_enabled, origin, session_id, created_at, updated_at, archived
+                    status, loop_enabled, origin, session_id, created_at, updated_at, archived,
+                    CASE WHEN project_tasks.status = 'in_progress' AND EXISTS (
+                      SELECT 1 FROM agent_sessions s
+                      WHERE s.id = project_tasks.session_id AND s.status = 'completed'
+                        AND s.current_step = 'Task ready for review'
+                    ) THEN 1 ELSE 0 END
              FROM project_tasks
              WHERE project_id = ?1
              ORDER BY CASE status WHEN 'backlog' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
@@ -424,7 +431,12 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
 fn task_by_id(connection: &Connection, task_id: &str) -> rusqlite::Result<ProjectTask> {
     connection.query_row(
         "SELECT id, project_id, title, description, mode, model, step_budget, steps_used, auto_approve,
-                status, loop_enabled, origin, session_id, created_at, updated_at, archived
+                status, loop_enabled, origin, session_id, created_at, updated_at, archived,
+                CASE WHEN project_tasks.status = 'in_progress' AND EXISTS (
+                  SELECT 1 FROM agent_sessions s
+                  WHERE s.id = project_tasks.session_id AND s.status = 'completed'
+                    AND s.current_step = 'Task ready for review'
+                ) THEN 1 ELSE 0 END
          FROM project_tasks WHERE id = ?1",
         [task_id],
         task_from_row,
@@ -2179,7 +2191,12 @@ mod tests {
     fn task_readback_includes_the_archived_state() {
         let connection = Connection::open_in_memory().expect("in-memory database");
         connection
-            .execute_batch("CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);")
+            .execute_batch(
+                "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
+                 CREATE TABLE agent_sessions (
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                 );",
+            )
             .expect("core schema");
         initialize_schema(&connection).expect("feature schema");
         connection
@@ -2206,7 +2223,9 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
-                 CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL);",
+                 CREATE TABLE agent_sessions (
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                 );",
             )
             .expect("core schema");
         initialize_schema(&connection).expect("feature schema");
@@ -2244,6 +2263,17 @@ mod tests {
         assert_eq!(tasks[0].session_id.as_deref(), Some("session-1"));
         assert!(tasks[0].loop_enabled);
         assert_eq!(tasks[0].origin, "user");
+        assert!(!tasks[0].review_pending);
+
+        connection
+            .execute(
+                "UPDATE agent_sessions SET status = 'completed', current_step = 'Task ready for review'
+                 WHERE id = 'session-1'",
+                [],
+            )
+            .expect("mark session ready for review");
+        let reviewed_task = task_by_id(&connection, "task-1").expect("task review readback");
+        assert!(reviewed_task.review_pending);
     }
 
     #[test]
@@ -2252,7 +2282,9 @@ mod tests {
         connection
             .execute_batch(
                 "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
-                 CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL);
+                 CREATE TABLE agent_sessions (
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                 );
                  INSERT INTO projects (id, path) VALUES ('project-1', '/tmp/project-1');
                  INSERT INTO agent_sessions (id, project_id) VALUES ('session-1', 'project-1');",
             )
@@ -2302,6 +2334,9 @@ mod tests {
                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                  );
+                 CREATE TABLE agent_sessions (
+                   id TEXT PRIMARY KEY, status TEXT, current_step TEXT
+                 );
                  INSERT INTO projects (id, path) VALUES ('project-1', '/tmp/project-1');
                  INSERT INTO project_tasks (id, project_id, title)
                    VALUES ('task-1', 'project-1', 'Existing task');",
@@ -2326,7 +2361,8 @@ mod tests {
                    agent_task_creation INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE agent_sessions (
-                  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT NOT NULL
+                  id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT NOT NULL,
+                  current_step TEXT
                 );",
             )
             .expect("core schema");
@@ -2396,7 +2432,9 @@ mod tests {
                    looping INTEGER NOT NULL DEFAULT 0,
                    agent_task_creation INTEGER NOT NULL DEFAULT 0
                  );
-                 CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL);",
+                 CREATE TABLE agent_sessions (
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                 );",
             )
             .expect("core schema");
         initialize_schema(&connection).expect("feature schema");
@@ -2482,7 +2520,9 @@ mod tests {
                    looping INTEGER NOT NULL DEFAULT 0,
                    agent_task_creation INTEGER NOT NULL DEFAULT 0
                  );
-                 CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, project_id TEXT NOT NULL);
+                 CREATE TABLE agent_sessions (
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                 );
                  CREATE TABLE session_messages (
                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, sequence INTEGER NOT NULL,
                    role TEXT NOT NULL, content TEXT NOT NULL DEFAULT ''

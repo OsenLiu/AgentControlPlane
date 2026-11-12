@@ -85,6 +85,8 @@ type SettingsForm = Settings & { githubToken: string };
 
 type SessionStatus = "starting" | "running" | "waiting" | "idle" | "paused" | "completed" | "failed" | "orphaned" | "unknown";
 
+const taskReadyForReviewStep = "Task ready for review";
+
 type AgentSession = {
   id: string;
   externalSessionId: string | null;
@@ -139,8 +141,12 @@ const attentionFilters: Array<{ label: string; kind: AttentionKind | "all" }> = 
   { label: "Failures", kind: "failure" },
 ];
 
-async function loadAttentionItemsFromBackend(): Promise<AttentionItem[]> {
-  const sessions = await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
+async function loadAttentionItemsFromBackend(sessions?: AgentSession[]): Promise<AttentionItem[]> {
+  const loadedSessions = sessions ?? await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
+  return attentionItemsFromSessions(loadedSessions);
+}
+
+async function attentionItemsFromSessions(sessions: AgentSession[]): Promise<AttentionItem[]> {
   const waitingSessions = sessions.filter((session) => session.status === "waiting");
   const permissionResults = await Promise.all(waitingSessions.map(async (session) => [
     session.id,
@@ -244,6 +250,7 @@ const navItems = [
   ["▣", "Projects"],
   ["◉", "Agent sessions"],
   ["!", "Attention inbox"],
+  ["✓", "Task outcomes"],
   ["⚙", "Settings"],
 ];
 
@@ -1105,6 +1112,180 @@ function AttentionInboxView({
   );
 }
 
+function TaskOutcomesView({
+  sessions,
+  loading,
+  error,
+  onRefresh,
+  onOpenSession,
+}: {
+  sessions: AgentSession[];
+  loading: boolean;
+  error: string;
+  onRefresh: () => Promise<void>;
+  onOpenSession: (sessionId: string) => void;
+}) {
+  const [filter, setFilter] = useState<"all" | "review" | "completed" | "failed">("all");
+  const [query, setQuery] = useState("");
+  const [selectedId, setSelectedId] = useState("");
+  const normalizedQuery = query.trim().toLowerCase();
+  const isReadyForReview = (session: AgentSession) =>
+    session.status === "completed" && session.step === taskReadyForReviewStep;
+  const visibleSessions = sessions.filter((session) => {
+    const matchesFilter = filter === "all"
+      || (filter === "review" ? isReadyForReview(session) : session.status === filter && !isReadyForReview(session));
+    const searchable = `${session.task} ${session.project} ${session.branch} ${session.provider} ${session.statusReason} ${session.lastEvent}`.toLowerCase();
+    return matchesFilter && searchable.includes(normalizedQuery);
+  });
+  const selectedSession = visibleSessions.find((session) => session.id === selectedId) ?? visibleSessions[0];
+  const reviewCount = sessions.filter(isReadyForReview).length;
+  const completedCount = sessions.filter((session) => session.status === "completed" && !isReadyForReview(session)).length;
+  const failedCount = sessions.filter((session) => session.status === "failed").length;
+
+  return (
+    <div className="task-outcomes-page">
+      <header className="task-outcomes-header">
+        <div>
+          <p className="eyebrow">WORKSPACE / SESSION HISTORY</p>
+          <h1>Task outcomes</h1>
+          <p className="subtitle">See what finished, what failed, and what is ready for your review.</p>
+        </div>
+        <button className="secondary-button task-outcomes-refresh" type="button" onClick={() => void onRefresh()} disabled={loading}>
+          <span className="refresh-glyph" aria-hidden="true">↻</span> {loading ? "Refreshing…" : "Refresh"}
+        </button>
+      </header>
+
+      <section className="session-summary-grid task-outcomes-summary" aria-label="Task outcomes summary">
+        <article className="session-summary-card">
+          <span className="summary-icon outcome-review-icon" aria-hidden="true">⌕</span>
+          <div><strong>{reviewCount}</strong><span>Ready for review</span></div>
+          <small>Agent finished; task awaits approval</small>
+        </article>
+        <article className="session-summary-card">
+          <span className="summary-icon outcome-completed-icon" aria-hidden="true">✓</span>
+          <div><strong>{completedCount}</strong><span>Completed</span></div>
+          <small>Finished successfully</small>
+        </article>
+        <article className="session-summary-card">
+          <span className="summary-icon outcome-failed-icon" aria-hidden="true">!</span>
+          <div><strong>{failedCount}</strong><span>Failed</span></div>
+          <small>Review the session details</small>
+        </article>
+      </section>
+
+      <section className="task-outcomes-queue" aria-label="Task outcomes">
+        <div className="task-outcomes-toolbar">
+          <div>
+            <p className="eyebrow">RECENT SESSIONS</p>
+            <h2>Task history <span className="queue-count">{visibleSessions.length}</span></h2>
+          </div>
+          <label className="task-outcomes-search">
+            <span aria-hidden="true">⌕</span>
+            <input
+              aria-label="Search task outcomes"
+              placeholder="Search tasks"
+              value={query}
+              onChange={(event) => setQuery(event.currentTarget.value)}
+            />
+            {query && <button type="button" aria-label="Clear search" onClick={() => setQuery("")}>×</button>}
+          </label>
+        </div>
+
+        {error && <div className="attention-error" role="alert">{error}</div>}
+
+        <div className="task-outcomes-filters" role="group" aria-label="Filter task outcomes">
+          {([
+            ["all", "All outcomes", sessions.length],
+            ["review", "Ready for review", reviewCount],
+            ["completed", "Completed", completedCount],
+            ["failed", "Failed", failedCount],
+          ] as const).map(([value, label, count]) => (
+            <button
+              className={`task-outcomes-filter ${filter === value ? "active" : ""}`}
+              key={value}
+              type="button"
+              aria-pressed={filter === value}
+              onClick={() => setFilter(value)}
+            >
+              {label}<span>{count}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="task-outcomes-workspace">
+          <div className="task-outcomes-list" role="region" aria-label="Completed and failed sessions">
+            {visibleSessions.map((session) => (
+              <button
+                className={`task-outcome-item ${selectedSession?.id === session.id ? "selected" : ""}`}
+                key={session.id}
+                type="button"
+                aria-pressed={selectedSession?.id === session.id}
+                onClick={() => setSelectedId(session.id)}
+              >
+                <span className={`task-outcome-icon ${session.status === "completed" ? "completed" : "failed"}`} aria-hidden="true">
+                  {session.status === "completed" ? "✓" : "!"}
+                </span>
+                <span className="task-outcome-copy">
+                  <strong>{session.task}</strong>
+                  <span>{session.project} <i>·</i> {providerLabel(session.provider)}</span>
+                  <span className="task-outcome-row-meta">
+                    {isReadyForReview(session)
+                      ? <span className="task-outcome-review-badge">Ready for review</span>
+                      : <SessionStatusBadge status={session.status} />}
+                    <time>{formatLocalTimestamp(session.updatedAt)}</time>
+                  </span>
+                </span>
+                <span className="attention-item-chevron" aria-hidden="true">›</span>
+              </button>
+            ))}
+            {loading && visibleSessions.length === 0 && (
+              <div className="task-outcomes-empty"><strong>Loading task outcomes…</strong></div>
+            )}
+            {!loading && visibleSessions.length === 0 && (
+              <div className="task-outcomes-empty">
+                <span aria-hidden="true">{sessions.length === 0 && !query && filter === "all" ? "✓" : "⌕"}</span>
+                <strong>{sessions.length === 0 && !query && filter === "all" ? "No finished sessions yet" : "No matching outcomes"}</strong>
+                <p>{sessions.length === 0 && !query && filter === "all" ? "Completed and failed sessions will appear here. Nothing needs your attention until you choose to review it." : "Try another filter or search term."}</p>
+                {(query || filter !== "all") && <button type="button" onClick={() => { setFilter("all"); setQuery(""); }}>Clear filters</button>}
+              </div>
+            )}
+          </div>
+
+          {selectedSession ? (
+            <article className="task-outcome-detail">
+              <div className="task-outcome-detail-status">
+                <span className={`task-outcome-icon ${selectedSession.status === "completed" ? "completed" : "failed"}`} aria-hidden="true">
+                  {selectedSession.status === "completed" ? "✓" : "!"}
+                </span>
+                {isReadyForReview(selectedSession)
+                  ? <span className="task-outcome-review-badge">Ready for review</span>
+                  : <SessionStatusBadge status={selectedSession.status} />}
+              </div>
+              <h3>{selectedSession.task}</h3>
+              <p className="task-outcome-detail-summary">
+                {selectedSession.statusReason || selectedSession.lastEvent || selectedSession.step || (selectedSession.status === "completed" ? "The session finished successfully." : "The session stopped before completing the task.")}
+              </p>
+              <dl className="attention-metadata task-outcome-metadata">
+                <div><dt>PROJECT</dt><dd>{selectedSession.project}</dd></div>
+                <div><dt>BRANCH</dt><dd><code>{selectedSession.branch}</code></dd></div>
+                <div><dt>AGENT</dt><dd>{providerLabel(selectedSession.provider)}</dd></div>
+                <div><dt>LAST UPDATED</dt><dd>{formatLocalTimestamp(selectedSession.updatedAt)}</dd></div>
+              </dl>
+              <button className="primary-button task-outcome-open" type="button" onClick={() => onOpenSession(selectedSession.id)}>
+                Open session
+              </button>
+            </article>
+          ) : (
+            <div className="task-outcome-detail-empty">
+              {loading ? "Loading session context…" : "Select an outcome to see its session details."}
+            </div>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ProjectsView({
   projects,
   loading,
@@ -1438,6 +1619,9 @@ function App() {
   const [attentionItems, setAttentionItems] = useState<AttentionItem[]>([]);
   const [attentionLoading, setAttentionLoading] = useState(true);
   const [attentionError, setAttentionError] = useState("");
+  const [taskOutcomes, setTaskOutcomes] = useState<AgentSession[]>([]);
+  const [taskOutcomesLoading, setTaskOutcomesLoading] = useState(true);
+  const [taskOutcomesError, setTaskOutcomesError] = useState("");
   const [dashboardPipelineRuns, setDashboardPipelineRuns] = useState<DashboardPipelineRun[]>([]);
   const [projectPipelineStatuses, setProjectPipelineStatuses] = useState<Record<string, ProjectPipelineStatus>>({});
   const [pipelineHealthLoading, setPipelineHealthLoading] = useState(true);
@@ -1464,12 +1648,25 @@ function App() {
   async function refreshAttentionItems() {
     setAttentionLoading(true);
     setAttentionError("");
+    setTaskOutcomesLoading(true);
+    setTaskOutcomesError("");
     try {
-      setAttentionItems(await loadAttentionItemsFromBackend());
+      const sessions = await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
+      setTaskOutcomes(sessions
+        .filter((session) => session.status === "completed" || session.status === "failed")
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+      try {
+        setAttentionItems(await loadAttentionItemsFromBackend(sessions));
+      } catch (reason) {
+        setAttentionError(reason instanceof Error ? reason.message : String(reason));
+      }
     } catch (reason) {
-      setAttentionError(reason instanceof Error ? reason.message : String(reason));
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setAttentionError(message);
+      setTaskOutcomesError(message);
     } finally {
       setAttentionLoading(false);
+      setTaskOutcomesLoading(false);
     }
   }
 
@@ -1603,7 +1800,9 @@ function App() {
         unsubscribe = unlisten;
       }
     }).catch((reason) => {
-      setAttentionError(reason instanceof Error ? reason.message : String(reason));
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setAttentionError(message);
+      setTaskOutcomesError(message);
     });
     return () => {
       disposed = true;
@@ -1789,7 +1988,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} transcriptFontSize={settings.transcriptFontSize} onProjectUpdated={updateProject} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} transcriptFontSize={settings.transcriptFontSize} onProjectUpdated={updateProject} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>

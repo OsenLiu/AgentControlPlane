@@ -28,6 +28,7 @@ type ProjectTask = {
   createdAt: string;
   updatedAt: string;
   archived: boolean;
+  reviewPending: boolean;
 };
 
 const COPILOT_MODEL_GROUPS = [
@@ -479,6 +480,7 @@ export function ProjectTasksTab({
                     <span className={`project-task-status ${task.status}`}>
                       {task.status.replace("_", " ")}
                     </span>
+                    {task.reviewPending && <span className="project-task-review-badge">Ready for review</span>}
                     {task.archived && <span className="project-task-row-archived">Archived</span>}
                     {task.loopEnabled && task.status === "backlog" && <span className="project-task-row-loop">In loop</span>}
                   </span>
@@ -872,6 +874,7 @@ function ProjectTaskDetail({
           <h2 id="selected-task-title">{task.title}</h2>
           <div className="project-task-detail-badges">
             <span className={`project-task-status ${task.status}`}>{task.status.replace("_", " ")}</span>
+            {task.reviewPending && <span className="project-task-review-badge">Ready for review</span>}
             {task.archived && <span className="project-task-archived-badge">Archived</span>}
             {task.origin === "agent" && <span className="project-task-origin">Agent proposal</span>}
             {task.status === "backlog" && (
@@ -974,6 +977,8 @@ function ProjectTaskDetail({
         <div className="project-task-actions-copy">
           <h3>{task.archived
             ? "Task archived"
+            : task.reviewPending
+              ? "Ready for review"
             : task.status === "done"
               ? "Task complete"
               : task.status === "in_progress"
@@ -982,6 +987,8 @@ function ProjectTaskDetail({
           <p>
             {task.archived
               ? "This task is archived. Unarchive it to return it to the active task list."
+              : task.reviewPending
+                ? "The agent completed the task and passed its checks. Review the session, then mark the task done."
               : task.status === "done"
                 ? "This task is complete. Reopen it if more work is needed."
                 : task.status === "in_progress"
