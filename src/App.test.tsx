@@ -702,6 +702,7 @@ describe("App", () => {
   });
 
   it("labels an in-progress project task ready for review when its agent has completed", async () => {
+    const onTaskUpdated = vi.fn();
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_project_tasks") return [{
         id: "review-task",
@@ -722,14 +723,18 @@ describe("App", () => {
         archived: false,
         reviewPending: true,
       }];
+      if (command === "set_project_task_status") return undefined;
+      if (command === "continue_project_loop") return false;
       throw new Error(`Unexpected command: ${command}`);
     });
 
-    render(<ProjectTasksTab project={{ id: "/work/demo", name: "demo" }} onOpenSession={vi.fn()} />);
+    render(<ProjectTasksTab project={{ id: "/work/demo", name: "demo" }} onOpenSession={vi.fn()} onTaskUpdated={onTaskUpdated} />);
 
     expect(await screen.findByRole("heading", { name: "Ready for review" })).toBeTruthy();
     expect(screen.getByText(/Review the session, then mark the task done/)).toBeTruthy();
     expect(screen.getByRole("button", { name: "Mark done" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Mark done" }));
+    await waitFor(() => expect(onTaskUpdated).toHaveBeenCalledOnce());
   });
 
   it("shows completed and failed sessions in Task outcomes with working filters", async () => {
@@ -785,6 +790,44 @@ describe("App", () => {
         statusReason: "Build command failed",
         updatedAt: "2026-11-10 09:00:00",
       },
+      {
+        id: "done-task-session",
+        project: "demo",
+        task: "Already accepted task",
+        branch: "main",
+        provider: "copilot",
+        status: "completed",
+        step: "Task complete",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "0.8k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Task complete",
+        archived: false,
+        statusReason: "",
+        updatedAt: "2026-11-10 07:00:00",
+        taskDone: true,
+        taskArchived: false,
+      },
+      {
+        id: "archived-task-session",
+        project: "demo",
+        task: "Archived task",
+        branch: "main",
+        provider: "copilot",
+        status: "failed",
+        step: "Failed",
+        elapsed: "2026-11-09 11:20:00",
+        tokens: "0.8k",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Stopped",
+        archived: false,
+        statusReason: "Stopped",
+        updatedAt: "2026-11-10 06:00:00",
+        taskDone: false,
+        taskArchived: true,
+      },
     ];
     const defaultImplementation = invokeMock.getMockImplementation();
     invokeMock.mockImplementation(async (command, args) => {
@@ -794,6 +837,8 @@ describe("App", () => {
     });
 
     render(<App />);
+    const taskOutcomesNavItem = screen.getByRole("button", { name: /Task outcomes/ });
+    expect(await within(taskOutcomesNavItem).findByText("3")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /^Task outcomes/ }));
 
     expect(await screen.findByRole("heading", { name: "Task history 3" })).toBeTruthy();
@@ -802,6 +847,8 @@ describe("App", () => {
     expect(outcomesList.getByRole("button", { name: /Update the docs/ })).toBeTruthy();
     expect(outcomesList.getByRole("button", { name: /Write release notes/ })).toBeTruthy();
     expect(outcomesList.getByRole("button", { name: /Build the app/ })).toBeTruthy();
+    expect(outcomesList.queryByRole("button", { name: /Already accepted task/ })).toBeNull();
+    expect(outcomesList.queryByRole("button", { name: /Archived task/ })).toBeNull();
 
     fireEvent.click(filters.getByRole("button", { name: /^Ready for review/ }));
     expect(outcomesList.getByRole("button", { name: /Write release notes/ })).toBeTruthy();

@@ -104,6 +104,8 @@ type AgentSession = {
   archived: boolean;
   statusReason: string;
   updatedAt: string;
+  taskDone: boolean;
+  taskArchived: boolean;
 };
 
 type TranscriptMessage = {
@@ -784,7 +786,7 @@ function AgentSessionsView({
 
         <section className="session-detail-panel" aria-label="Selected agent session">
           <div className="detail-header">
-            <div className="detail-title"><div className={`session-avatar avatar-${selectedSession.status}`}>{selectedSession.project.charAt(0)}</div><div><div className="detail-name-row"><h2>{selectedSession.task}</h2><SessionStatusBadge status={selectedSession.status} /></div><p>{selectedSession.project} <span>·</span> <code>{selectedSession.branch}</code></p></div></div>
+            <div className="detail-title"><div className={`session-avatar avatar-${selectedSession.status}`}>{selectedSession.project.charAt(0)}</div><div className="detail-title-copy"><div className="detail-name-row"><h2 title={selectedSession.task}>{selectedSession.task}</h2><SessionStatusBadge status={selectedSession.status} /></div><p>{selectedSession.project} <span>·</span> <code>{selectedSession.branch}</code></p></div></div>
             <div className="detail-actions">
               <button className="secondary-button" onClick={beginRenameSession} disabled={savingSessionName}>Rename</button>
               <button className="secondary-button archive-button" onClick={() => void updateArchiveState()} disabled={resuming}>{archivedView ? "Unarchive session" : "Archive session"}</button>
@@ -1441,10 +1443,12 @@ function ProjectWorkspaceView({
   project,
   transcriptFontSize,
   onProjectUpdated,
+  onTaskOutcomesRefresh,
 }: {
   project: Project;
   transcriptFontSize: number;
   onProjectUpdated: (project: Project) => void;
+  onTaskOutcomesRefresh: () => void;
 }) {
   const [activeSection, setActiveSection] = useState<ProjectSection>("tasks");
   const [sessionToOpen, setSessionToOpen] = useState("");
@@ -1584,6 +1588,7 @@ function ProjectWorkspaceView({
           {activeSection === "tasks" && (
             <ProjectTasksTab
               project={project}
+              onTaskUpdated={onTaskOutcomesRefresh}
               onOpenSession={(sessionId) => {
                 setSessionToOpen(sessionId);
                 setActiveSection("sessions");
@@ -1653,7 +1658,11 @@ function App() {
     try {
       const sessions = await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
       setTaskOutcomes(sessions
-        .filter((session) => session.status === "completed" || session.status === "failed")
+        .filter((session) =>
+          (session.status === "completed" || session.status === "failed") &&
+          !session.taskDone &&
+          !session.taskArchived,
+        )
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
       try {
         setAttentionItems(await loadAttentionItemsFromBackend(sessions));
@@ -1941,6 +1950,7 @@ function App() {
               <span className="nav-icon" aria-hidden="true">{icon}</span>
               <span>{label}</span>
               {label === "Attention inbox" && attentionItems.length > 0 && <span className="nav-count">{attentionItems.length}</span>}
+              {label === "Task outcomes" && taskOutcomes.length > 0 && <span className="nav-count">{taskOutcomes.length}</span>}
             </button>
           ))}
         </nav>
@@ -1988,7 +1998,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} transcriptFontSize={settings.transcriptFontSize} onProjectUpdated={updateProject} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} transcriptFontSize={settings.transcriptFontSize} onProjectUpdated={updateProject} onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>

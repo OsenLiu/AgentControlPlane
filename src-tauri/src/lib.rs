@@ -95,6 +95,8 @@ struct AgentSession {
     archived: bool,
     status_reason: String,
     updated_at: String,
+    task_done: bool,
+    task_archived: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -234,6 +236,8 @@ fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSess
         status_reason: row.get(13)?,
         updated_at: row.get(14)?,
         external_session_id: row.get(15)?,
+        task_done: row.get::<_, i64>(16)? != 0,
+        task_archived: row.get::<_, i64>(17)? != 0,
     })
 }
 
@@ -1357,7 +1361,15 @@ fn list_agent_sessions_from_connection(
             "SELECT s.id, p.name, s.task, s.branch, s.provider, s.status,
                     s.current_step, s.started_at, s.token_count,
                    s.permission_mode, s.origin, s.last_event, s.archived,
-                   s.status_reason, s.updated_at, s.external_session_id
+                   s.status_reason, s.updated_at, s.external_session_id,
+                   EXISTS(
+                     SELECT 1 FROM project_tasks t
+                     WHERE t.session_id = s.id AND t.status = 'done'
+                   ),
+                   EXISTS(
+                     SELECT 1 FROM project_tasks t
+                     WHERE t.session_id = s.id AND t.archived = 1
+                   )
              FROM agent_sessions s
              JOIN projects p ON p.id = s.project_id
              WHERE (?1 IS NULL OR s.project_id = ?1)
@@ -2873,6 +2885,13 @@ mod tests {
                 [],
             )
             .expect("session");
+        connection
+            .execute(
+                "INSERT INTO project_tasks (id, project_id, title, status, session_id)
+                 VALUES ('task-1', 'project-1', 'Implement sessions', 'in_progress', 'session-1')",
+                [],
+            )
+            .expect("linked task");
 
         let sessions = list_agent_sessions_from_connection(&connection, None, None, None)
             .expect("session query");
@@ -2889,6 +2908,25 @@ mod tests {
         assert!(!sessions[0].updated_at.is_empty());
         assert!(sessions[0].managed);
         assert_eq!(sessions[0].tokens, "12.8k");
+        assert!(!sessions[0].task_done);
+        assert!(!sessions[0].task_archived);
+
+        connection
+            .execute("UPDATE project_tasks SET status = 'done' WHERE id = 'task-1'", [])
+            .expect("complete linked task");
+        let completed = list_agent_sessions_from_connection(&connection, None, None, None)
+            .expect("completed task session query");
+        assert!(completed[0].task_done);
+
+        connection
+            .execute(
+                "UPDATE project_tasks SET status = 'in_progress', archived = 1 WHERE id = 'task-1'",
+                [],
+            )
+            .expect("archive linked task");
+        let archived = list_agent_sessions_from_connection(&connection, None, None, None)
+            .expect("archived task session query");
+        assert!(archived[0].task_archived);
     }
 
     #[test]

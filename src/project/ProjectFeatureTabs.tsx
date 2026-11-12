@@ -239,9 +239,11 @@ function Feedback({ error }: { error: string }) {
 export function ProjectTasksTab({
   project,
   onOpenSession,
+  onTaskUpdated,
 }: {
   project: ProjectReference;
   onOpenSession: (sessionId: string) => void;
+  onTaskUpdated?: () => void;
 }) {
   const [tasks, setTasks] = useState<ProjectTask[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState("");
@@ -336,6 +338,7 @@ export function ProjectTasksTab({
         await invoke("continue_project_loop", { projectId: project.id });
       }
       await loadTasks();
+      onTaskUpdated?.();
     } catch (updateError) {
       setError(messageFromError(updateError));
     }
@@ -364,6 +367,7 @@ export function ProjectTasksTab({
         archived,
       });
       await loadTasks();
+      onTaskUpdated?.();
     } catch (archiveError) {
       setError(messageFromError(archiveError));
     }
