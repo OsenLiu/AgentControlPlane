@@ -1,7 +1,8 @@
-import { FormEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { createPortal } from "react-dom";
 import type { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 
@@ -516,16 +517,111 @@ type ProjectTaskInput = {
 };
 
 function TaskSettingHelp({ label, text }: { label: string; text: string }) {
+  const tooltipId = useId();
+  const helpRef = useRef<HTMLSpanElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const tooltipRef = useRef<HTMLSpanElement>(null);
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const [tooltipPosition, setTooltipPosition] = useState<{ top: number; left: number } | null>(null);
+  const open = hovered || focused || pinned;
+
+  useEffect(() => {
+    if (!pinned) return;
+    function dismissOutside(event: PointerEvent) {
+      const target = event.target as Node;
+      if (!helpRef.current?.contains(target) && !tooltipRef.current?.contains(target)) setPinned(false);
+    }
+    document.addEventListener("pointerdown", dismissOutside);
+    return () => document.removeEventListener("pointerdown", dismissOutside);
+  }, [pinned]);
+
+  useLayoutEffect(() => {
+    if (!open) {
+      setTooltipPosition(null);
+      return;
+    }
+
+    function positionTooltip() {
+      const button = buttonRef.current;
+      const tooltip = tooltipRef.current;
+      if (!button || !tooltip) return;
+
+      const buttonRect = button.getBoundingClientRect();
+      const tooltipRect = tooltip.getBoundingClientRect();
+      const margin = 12;
+      const gap = 8;
+      const below = buttonRect.bottom + gap + tooltipRect.height <= window.innerHeight - margin;
+      const top = below
+        ? buttonRect.bottom + gap
+        : Math.max(margin, buttonRect.top - gap - tooltipRect.height);
+      const left = Math.max(
+        margin,
+        Math.min(buttonRect.left, window.innerWidth - tooltipRect.width - margin),
+      );
+
+      setTooltipPosition({ top, left });
+    }
+
+    positionTooltip();
+    window.addEventListener("resize", positionTooltip);
+    document.addEventListener("scroll", positionTooltip, true);
+    return () => {
+      window.removeEventListener("resize", positionTooltip);
+      document.removeEventListener("scroll", positionTooltip, true);
+    };
+  }, [open]);
+
   return (
-    <button
-      className="project-info-button task-setting-help"
-      type="button"
-      aria-label={`${label} help: ${text}`}
-      aria-description={text}
-      title={text}
-    >
-      !
-    </button>
+    <>
+      <span
+        ref={helpRef}
+        className="task-setting-help-control"
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+      >
+        <button
+          ref={buttonRef}
+          className="project-info-button task-setting-help"
+          type="button"
+          aria-label={`${label} help`}
+          aria-expanded={open}
+          aria-controls={tooltipId}
+          aria-describedby={open ? tooltipId : undefined}
+          onClick={() => setPinned(true)}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              setPinned(false);
+              setHovered(false);
+              setFocused(false);
+              event.stopPropagation();
+            }
+          }}
+        >
+          !
+        </button>
+      </span>
+      {open && createPortal(
+        <span
+          ref={tooltipRef}
+          className="task-setting-help-tooltip"
+          id={tooltipId}
+          role="tooltip"
+          style={{
+            position: "fixed",
+            top: tooltipPosition?.top ?? 0,
+            left: tooltipPosition?.left ?? 0,
+            visibility: tooltipPosition ? "visible" : "hidden",
+          }}
+        >
+          {text}
+        </span>,
+        document.body,
+      )}
+    </>
   );
 }
 

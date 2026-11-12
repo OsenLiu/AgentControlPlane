@@ -301,6 +301,15 @@ describe("App", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Open workspace" }));
 
     fireEvent.click(await screen.findByRole("button", { name: /New task/ }));
+    const modeHelp = screen.getByRole("button", { name: "Mode help" });
+    fireEvent.mouseEnter(modeHelp);
+    const helpTooltip = screen.getByRole("tooltip");
+    expect(helpTooltip.parentElement).toBe(document.body);
+    expect(window.getComputedStyle(helpTooltip).position).toBe("fixed");
+    fireEvent.mouseLeave(modeHelp);
+    expect(screen.queryByRole("tooltip")).toBeNull();
+    fireEvent.click(modeHelp);
+    expect(screen.getByRole("tooltip")).toBeTruthy();
     expect(screen.getByRole("option", { name: "GPT-6.1 Terra" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "Claude Sonnet 5.5" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "Gemini 4 Argon" })).toBeTruthy();
