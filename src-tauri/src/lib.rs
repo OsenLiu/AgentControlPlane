@@ -731,6 +731,18 @@ fn github_token_configured() -> bool {
 }
 
 #[tauri::command]
+fn get_current_username() -> Option<String> {
+    ["USER", "USERNAME"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|username| username.trim().to_owned())
+                .filter(|username| !username.is_empty())
+        })
+}
+
+#[tauri::command]
 fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
     let connection = database
         .0
@@ -2610,6 +2622,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_current_username,
             list_projects,
             set_project_automation,
             continue_project_loop,

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
-import App from "./App";
+import App, { getGreetingForLocalTime } from "./App";
 import { ProjectDiffsTab } from "./project/ProjectFeatureTabs";
 
 vi.mock("@tauri-apps/api/core", () => ({
@@ -34,6 +34,7 @@ const settings = {
 
 beforeEach(() => {
   invokeMock.mockImplementation(async (command) => {
+    if (command === "get_current_username") return "Test User";
     if (command === "list_projects") return [];
     if (command === "list_agent_sessions") return [];
     if (command === "get_pending_session_permission") return null;
@@ -55,13 +56,41 @@ beforeEach(() => {
 });
 
 describe("App", () => {
+  it.each([
+    [4, "Good evening"],
+    [5, "Good morning"],
+    [11, "Good morning"],
+    [12, "Good afternoon"],
+    [16, "Good afternoon"],
+    [17, "Good evening"],
+    [23, "Good evening"],
+  ])("uses the local hour %i for the greeting", (hour, expected) => {
+    expect(getGreetingForLocalTime(new Date(2026, 10, 12, hour))).toBe(expected);
+  });
+
   it("loads the empty dashboard state", async () => {
     render(<App />);
 
     expect(await screen.findByText("No projects connected yet. Add a local Git repository to get started.")).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: /Good (morning|afternoon|evening), Test User/ })).toBeTruthy();
     expect(screen.getByText(/^v\d+\.\d+\.\d+$/)).toBeTruthy();
     expect(invokeMock).toHaveBeenCalledWith("list_projects");
     expect(invokeMock).toHaveBeenCalledWith("load_settings");
+    expect(invokeMock).toHaveBeenCalledWith("get_current_username");
+  });
+
+  it("omits the username from the greeting when it is unavailable", async () => {
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "get_current_username") return null;
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: /^Good (morning|afternoon|evening)\s*✦$/ })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("get_current_username");
   });
 
   it("calculates dashboard pipeline health from recent completed workflow runs", async () => {

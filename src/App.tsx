@@ -13,6 +13,13 @@ import {
 } from "./project/ProjectFeatureTabs";
 import "./App.css";
 
+export function getGreetingForLocalTime(date: Date): string {
+  const hour = date.getHours();
+  if (hour >= 5 && hour < 12) return "Good morning";
+  if (hour >= 12 && hour < 17) return "Good afternoon";
+  return "Good evening";
+}
+
 type Status = "healthy" | "running" | "waiting" | "failed" | "unknown";
 
 type Project = {
@@ -1415,6 +1422,8 @@ function ProjectWorkspaceView({
 
 function App() {
   const [activeNav, setActiveNav] = useState("Dashboard");
+  const [userName, setUserName] = useState("");
+  const [greeting, setGreeting] = useState(() => getGreetingForLocalTime(new Date()));
   const [sessionToOpen, setSessionToOpen] = useState("");
   const [showAddProject, setShowAddProject] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -1467,6 +1476,18 @@ function App() {
   useEffect(() => {
     void loadProjects();
     void loadSettings();
+    void invoke<string | null>("get_current_username")
+      .then((currentUserName) => setUserName(currentUserName ?? ""))
+      .catch((reason) => {
+        setError(`Unable to determine the current operating system user: ${reason instanceof Error ? reason.message : String(reason)}`);
+      });
+  }, []);
+
+  useEffect(() => {
+      const intervalId = window.setInterval(() => {
+        setGreeting(getGreetingForLocalTime(new Date()));
+      }, 60_000);
+      return () => window.clearInterval(intervalId);
   }, []);
 
   useEffect(() => {
@@ -1772,7 +1793,7 @@ function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
-            <h1>Good morning, Osen <span className="wave">✦</span></h1>
+            <h1>{greeting}{userName ? `, ${userName}` : ""} <span className="wave">✦</span></h1>
             <p className="subtitle">Here is what is happening across your projects.</p>
           </div>
           <button className="primary-button" onClick={() => setShowAddProject(true)}>
