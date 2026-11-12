@@ -28,6 +28,69 @@ type ProjectTask = {
   updatedAt: string;
 };
 
+const COPILOT_MODEL_GROUPS = [
+  {
+    provider: "OpenAI",
+    models: [
+      { id: "gpt-5.3-codex", label: "GPT-5.3-Codex" },
+      { id: "gpt-5.4-nano", label: "GPT-5.4 nano" },
+      { id: "gpt-5.6-luna", label: "GPT-5.6 Luna" },
+      { id: "gpt-5.6-sol", label: "GPT-5.6 Sol" },
+      { id: "gpt-5.6-terra", label: "GPT-5.6 Terra" },
+      { id: "gpt-6-astra", label: "GPT-6 Astra" },
+      { id: "gpt-6-luna", label: "GPT-6 Luna" },
+      { id: "gpt-6-sol", label: "GPT-6 Sol" },
+      { id: "gpt-6.1-sol", label: "GPT-6.1 Sol" },
+      { id: "gpt-6.1-terra", label: "GPT-6.1 Terra" },
+    ],
+  },
+  {
+    provider: "Anthropic",
+    models: [
+      { id: "claude-fable-5", label: "Claude Fable 5" },
+      { id: "claude-fable-5.1", label: "Claude Fable 5.1" },
+      { id: "claude-fable-5.2", label: "Claude Fable 5.2" },
+      { id: "claude-haiku-4.5", label: "Claude Haiku 4.5" },
+      { id: "claude-haiku-5.5", label: "Claude Haiku 5.5" },
+      { id: "claude-opus-4.8", label: "Claude Opus 4.8" },
+      { id: "claude-opus-4.8-fast", label: "Claude Opus 4.8 (fast mode, preview)" },
+      { id: "claude-opus-5", label: "Claude Opus 5" },
+      { id: "claude-opus-5.5", label: "Claude Opus 5.5" },
+      { id: "claude-sonnet-4.6", label: "Claude Sonnet 4.6" },
+      { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
+      { id: "claude-sonnet-5.5", label: "Claude Sonnet 5.5" },
+    ],
+  },
+  {
+    provider: "Google",
+    models: [
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+      { id: "gemini-4-argon", label: "Gemini 4 Argon" },
+      { id: "gemini-4-carbon", label: "Gemini 4 Carbon" },
+    ],
+  },
+  {
+    provider: "Microsoft",
+    models: [{ id: "mai-code-1.1-flash", label: "MAI-Code-1.1-Flash" }],
+  },
+  {
+    provider: "Moonshot AI",
+    models: [{ id: "kimi-k3", label: "Kimi K3" }],
+  },
+  {
+    provider: "xAI",
+    models: [
+      { id: "grok-4.5", label: "Grok 4.5" },
+      { id: "grok-4.6", label: "Grok 4.6" },
+      { id: "grok-4.7", label: "Grok 4.7" },
+    ],
+  },
+] as const;
+
+const COPILOT_MODEL_IDS = new Set<string>(
+  COPILOT_MODEL_GROUPS.flatMap(({ models }) => models.map(({ id }) => id)),
+);
+
 type ProjectDiff = {
   branch: string;
   changedFiles: string[];
@@ -442,11 +505,12 @@ function ProjectTaskDialog({
   const [title, setTitle] = useState(initial?.title ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
   const [mode, setMode] = useState<ProjectTask["mode"]>(initial?.mode ?? "acceptEdits");
+  const initialModel = initial?.model ?? "auto";
   const [modelChoice, setModelChoice] = useState(
-    initial?.model === "auto" || initial?.model === "gpt-5.6-sol" ? initial.model : "custom",
+    initialModel === "auto" || COPILOT_MODEL_IDS.has(initialModel) ? initialModel : "custom",
   );
   const [customModel, setCustomModel] = useState(
-    initial && initial.model !== "auto" && initial.model !== "gpt-5.6-sol" ? initial.model : "",
+    initialModel !== "auto" && !COPILOT_MODEL_IDS.has(initialModel) ? initialModel : "",
   );
   const [stepBudget, setStepBudget] = useState(initial?.stepBudget ?? 30);
   const [autoApprove, setAutoApprove] = useState(initial?.autoApprove ?? false);
@@ -544,11 +608,15 @@ function ProjectTaskDialog({
             <label htmlFor="project-task-model">Model</label>
             <TaskSettingHelp
               label="Model"
-              text="Auto uses Copilot CLI's default model. GPT-5.6 Sol is listed by this installed CLI; model availability depends on your Copilot account. You can also enter another Copilot model ID."
+              text="The model choices follow GitHub Copilot's supported-model catalog. Availability depends on your Copilot plan and the model support in your Copilot CLI/ACP version. Auto uses the CLI default; enter a custom model ID if needed."
             />
             <select id="project-task-model" value={modelChoice} onChange={(event) => setModelChoice(event.target.value)}>
               <option value="auto">Auto (default)</option>
-              <option value="gpt-5.6-sol">GPT-5.6 Sol</option>
+              {COPILOT_MODEL_GROUPS.map(({ provider, models }) => (
+                <optgroup key={provider} label={provider}>
+                  {models.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
+                </optgroup>
+              ))}
               <option value="custom">Custom model ID…</option>
             </select>
             {modelChoice === "custom" && (

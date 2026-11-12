@@ -295,6 +295,9 @@ describe("App", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Open workspace" }));
 
     fireEvent.click(await screen.findByRole("button", { name: /New task/ }));
+    expect(screen.getByRole("option", { name: "GPT-6.1 Terra" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Claude Sonnet 5.5" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Gemini 4 Argon" })).toBeTruthy();
     fireEvent.change(await screen.findByLabelText("Task title"), { target: { value: "Ship onboarding flow" } });
     fireEvent.change(screen.getByLabelText("Brief"), { target: { value: "Add the welcome screens." } });
     fireEvent.change(screen.getByLabelText("Mode"), { target: { value: "auto" } });
