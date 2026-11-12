@@ -433,6 +433,27 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .project-skill-dialog h3 { margin-top: 5px; color: #e2e9f6; font-size: 15px; }
 .project-skill-dialog > p { color: #9aa8c0; font-size: 11px; }
 .project-skill-dialog > pre { max-height: 65vh; margin: 0; padding: 14px; overflow: auto; border: 1px solid #293550; border-radius: 6px; color: #c5d0e4; background: #0b1321; font-family: "JetBrains Mono", monospace; font-size: 10px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-dialog-backdrop { position: fixed; z-index: 30; inset: 0; display: grid; place-items: center; padding: 20px; overflow-y: auto; background: #050912c9; }
+.task-dialog { width: min(560px, 100%); max-height: min(760px, calc(100vh - 40px)); padding: 20px; overflow-y: auto; border: 1px solid #35415e; border-radius: 10px; background: #111a2b; box-shadow: 0 20px 70px #0009; }
+.task-dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.task-dialog-header h2 { color: #e2e9f6; font-size: 16px; }
+.task-dialog > form { display: grid; gap: 15px; }
+.task-dialog-field { display: grid; gap: 7px; color: #aab6cd; font-size: 11px; font-weight: 600; }
+.task-dialog-field input, .task-dialog-field textarea, .task-dialog-setting select, .task-dialog-setting > input:not([type="checkbox"]) { width: 100%; min-height: 40px; padding: 9px 10px; border: 1px solid #34415d; border-radius: 5px; outline: none; color: #e1e8f6; color-scheme: dark; background: #0c1423; font: inherit; font-size: 11px; }
+.task-dialog-setting select option { color: #e1e8f6; background-color: #0c1423; }
+.task-dialog-field textarea { min-height: 92px; resize: vertical; }
+.task-dialog-field input:focus, .task-dialog-field textarea:focus, .task-dialog-setting select:focus, .task-dialog-setting > input:focus { border-color: #8b7ce0; box-shadow: 0 0 0 2px #8b7ce033; }
+.task-dialog-field input::placeholder, .task-dialog-field textarea::placeholder, .task-dialog-custom-model::placeholder { color: #66748f; }
+.task-dialog-setting { display: grid; grid-template-columns: auto 18px minmax(0, 1fr); align-items: center; gap: 8px; color: #aab6cd; font-size: 11px; }
+.task-dialog-setting > label { font-weight: 600; }
+.task-dialog-setting select { grid-column: 1 / -1; }
+.task-dialog-setting > input:not([type="checkbox"]) { grid-column: 1 / -1; }
+.task-setting-help { width: 20px; height: 20px; font-family: Arial, sans-serif; font-weight: 600; }
+.task-dialog-custom-model { grid-column: 1 / -1; }
+.task-dialog-auto-approve { grid-template-columns: auto 20px 1fr; }
+.task-dialog-auto-approve input[type="checkbox"] { grid-column: 3; grid-row: 1; justify-self: start; width: 16px; height: 16px; accent-color: #8876fa; }
+.task-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 5px; padding-top: 14px; border-top: 1px solid #293550; }
+.task-dialog-actions button, .task-dialog-header button { min-height: 36px; }
 .session-project-context { display: grid; gap: 6px; }
 .session-project-context > span { color: #6d7b9b; font-size: 9px; font-weight: 700; letter-spacing: 1px; }
 .session-project-context > strong { color: #cbd4e8; font-size: 11px; font-weight: 600; }
@@ -521,7 +542,8 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .project-task-workspace .project-task-form label { gap: 5px; font-size: 9px; }
 .project-task-workspace .project-task-form input, .project-task-workspace .project-task-form textarea { min-height: 36px; font-size: 10px; }
 .project-task-list-controls { display: grid; grid-template-columns: minmax(0, 1fr) 120px; gap: 7px; padding: 10px; border-bottom: 1px solid #252f45; }
-.project-task-list-controls input, .project-task-list-controls select { width: 100%; min-width: 0; min-height: 34px; padding: 0 9px; border: 1px solid #34415d; border-radius: 5px; outline: none; color: #cbd4e8; background: #0c1423; font: inherit; font-size: 10px; }
+.project-task-list-controls input, .project-task-list-controls select { width: 100%; min-width: 0; min-height: 34px; padding: 0 9px; border: 1px solid #34415d; border-radius: 5px; outline: none; color: #cbd4e8; color-scheme: dark; background: #0c1423; font: inherit; font-size: 10px; }
+.project-task-list-controls select option { color: #e1e8f6; background-color: #0c1423; }
 .project-task-list-controls input::placeholder { color: #73819b; }
 .project-task-list-controls input:focus, .project-task-list-controls select:focus { border-color: #8b7ce0; box-shadow: 0 0 0 2px #8b7ce033; }
 .project-task-list { display: flex; flex: 1; flex-direction: column; gap: 5px; min-height: 0; padding: 8px; overflow-y: auto; }
@@ -551,11 +573,14 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .project-task-description-section { margin-top: 23px; }
 .project-task-description-section h3, .project-task-actions-copy h3 { color: #c7d1e4; font-size: 10px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase; }
 .project-task-description-section p { margin-top: 7px; color: #bec9dc; font-size: 11px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; }
-.project-task-session-section { display: flex; align-items: center; gap: 9px; margin-top: 18px; padding: 10px 11px; border: 1px solid #2b3850; border-radius: 6px; background: #131d2d; }
+.project-task-session-section { display: flex; align-items: center; gap: 9px; width: 100%; margin-top: 18px; padding: 10px 11px; border: 1px solid #2b3850; border-radius: 6px; color: inherit; background: #131d2d; font: inherit; text-align: left; cursor: pointer; }
+.project-task-session-section:hover { border-color: #675ba0; background: #191f35; }
+.project-task-session-section:focus-visible { outline: 2px solid #a99bff; outline-offset: 2px; }
 .project-task-session-icon { display: grid; place-items: center; width: 26px; height: 26px; flex: 0 0 26px; border: 1px solid #3c4564; border-radius: 6px; color: #b7aaff; background: #242442; font-size: 12px; }
 .project-task-session-section > div { display: grid; gap: 4px; min-width: 0; }
 .project-task-session-section strong { color: #cbd4e8; font-size: 10px; font-weight: 600; }
 .project-task-session-section code { overflow: hidden; color: #8f9db6; font-size: 9px; text-overflow: ellipsis; }
+.project-task-session-open { margin-left: auto; color: #b6aaff; font-size: 10px; white-space: nowrap; }
 .project-task-actions-panel { display: grid; gap: 14px; margin-top: auto; padding: 14px; border: 1px solid #3a3b56; border-radius: 7px; background: #151a2a; }
 .project-task-actions-copy p { margin-top: 6px; color: #929fba; font-size: 10px; line-height: 1.5; }
 .project-task-action-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; }

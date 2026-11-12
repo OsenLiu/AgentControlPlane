@@ -1196,6 +1196,7 @@ function ProjectWorkspaceView({
   onProjectUpdated: (project: Project) => void;
 }) {
   const [activeSection, setActiveSection] = useState<ProjectSection>("tasks");
+  const [sessionToOpen, setSessionToOpen] = useState("");
   const [savingAutomation, setSavingAutomation] = useState(false);
   const [openingEditor, setOpeningEditor] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
@@ -1321,11 +1322,23 @@ function ProjectWorkspaceView({
 
       {activeSection === "sessions" ? (
         <div className="project-section-content">
-          <AgentSessionsView transcriptFontSize={transcriptFontSize} projectId={project.id} />
+          <AgentSessionsView
+            transcriptFontSize={transcriptFontSize}
+            projectId={project.id}
+            initialSessionId={sessionToOpen}
+          />
         </div>
       ) : (
         <div className="project-section-content">
-          {activeSection === "tasks" && <ProjectTasksTab project={project} />}
+          {activeSection === "tasks" && (
+            <ProjectTasksTab
+              project={project}
+              onOpenSession={(sessionId) => {
+                setSessionToOpen(sessionId);
+                setActiveSection("sessions");
+              }}
+            />
+          )}
           {activeSection === "diffs" && <ProjectDiffsTab project={project} />}
           {activeSection === "terminals" && <ProjectTerminalsTab project={project} />}
           {activeSection === "pipelines" && <ProjectPipelinesTab project={project} />}

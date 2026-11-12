@@ -207,6 +207,11 @@ describe("App", () => {
       projectId: string;
       title: string;
       description: string;
+      mode: "acceptEdits" | "auto";
+      model: string;
+      stepBudget: number;
+      stepsUsed: number;
+      autoApprove: boolean;
       status: "backlog" | "in_progress" | "done";
       loopEnabled: boolean;
       origin: "user" | "agent";
@@ -218,8 +223,26 @@ describe("App", () => {
     invokeMock.mockImplementation(async (command, args) => {
       const payload = args as Record<string, string>;
       if (command === "list_projects") return [project];
-      if (command === "list_agent_sessions") return [];
+      if (command === "list_agent_sessions") return task?.sessionId ? [{
+        id: task.sessionId,
+        externalSessionId: null,
+        project: "website",
+        task: task.title,
+        branch: "main",
+        provider: "copilot",
+        status: "running",
+        step: "Working",
+        elapsed: "2026-11-12 10:00:00",
+        tokens: "0",
+        permissionMode: "Accept edits",
+        managed: true,
+        lastEvent: "Working on the task",
+        archived: false,
+        statusReason: "",
+        updatedAt: "2026-11-12 10:00:00",
+      }] : [];
       if (command === "get_pending_session_permission") return null;
+      if (command === "get_session_transcript") return [];
       if (command === "load_settings") return settings;
       if (command === "list_project_tasks") return task ? [task] : [];
       if (command === "set_project_task_loop_enabled") {
@@ -232,6 +255,11 @@ describe("App", () => {
           projectId: payload.projectId,
           title: payload.title,
           description: payload.description,
+          mode: payload.mode as "acceptEdits" | "auto",
+          model: payload.model,
+          stepBudget: Number(payload.stepBudget),
+          stepsUsed: 0,
+          autoApprove: Boolean(payload.autoApprove),
           status: "backlog",
           loopEnabled: true,
           origin: "user",
@@ -239,6 +267,20 @@ describe("App", () => {
           createdAt: "2026-01-01",
           updatedAt: "2026-01-01",
         };
+        return task;
+      }
+      if (command === "update_project_task") {
+        if (task) {
+          task = {
+            ...task,
+            title: payload.title,
+            description: payload.description,
+            mode: payload.mode as "acceptEdits" | "auto",
+            model: payload.model,
+            stepBudget: Number(payload.stepBudget),
+            autoApprove: Boolean(payload.autoApprove),
+          };
+        }
         return task;
       }
       if (command === "start_copilot_session") {
@@ -255,9 +297,36 @@ describe("App", () => {
     fireEvent.click(await screen.findByRole("button", { name: /New task/ }));
     fireEvent.change(await screen.findByLabelText("Task title"), { target: { value: "Ship onboarding flow" } });
     fireEvent.change(screen.getByLabelText("Brief"), { target: { value: "Add the welcome screens." } });
-    fireEvent.click(screen.getByRole("button", { name: "Add task" }));
+    fireEvent.change(screen.getByLabelText("Mode"), { target: { value: "auto" } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.6-sol" } });
+    fireEvent.change(screen.getByLabelText("Step budget"), { target: { value: "6" } });
+    fireEvent.click(screen.getByRole("checkbox", { name: "Auto-approve" }));
+    fireEvent.click(screen.getByRole("button", { name: "Create task" }));
 
     expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("create_project_task", {
+      projectId: "/work/website",
+      title: "Ship onboarding flow",
+      description: "Add the welcome screens.",
+      mode: "auto",
+      model: "gpt-5.6-sol",
+      stepBudget: 6,
+      autoApprove: true,
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByRole("combobox", { name: "Model" })).toHaveProperty("value", "gpt-5.6-sol");
+    fireEvent.change(screen.getByLabelText("Brief"), { target: { value: "Add the welcome and sign-in screens." } });
+    fireEvent.click(screen.getByRole("button", { name: "Save task" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("update_project_task", {
+      projectId: "/work/website",
+      taskId: "task-1",
+      title: "Ship onboarding flow",
+      description: "Add the welcome and sign-in screens.",
+      mode: "auto",
+      model: "gpt-5.6-sol",
+      stepBudget: 6,
+      autoApprove: true,
+    }));
     const taskFilter = screen.getByRole("searchbox", { name: "Filter tasks" });
     fireEvent.change(taskFilter, { target: { value: "not in this task" } });
     expect(screen.getByText("No tasks match these filters.")).toBeTruthy();
@@ -272,9 +341,15 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start session" }));
     expect(await screen.findByText("Linked session")).toBeTruthy();
     expect(await screen.findByText("session-1")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open linked session session-1" }));
+    expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Sessions", current: "page" })).toBeTruthy();
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("get_session_transcript", {
+      sessionId: "session-1",
+    }));
     expect(invokeMock).toHaveBeenCalledWith("start_copilot_session", {
       projectId: "/work/website",
-      task: "Ship onboarding flow\n\nAdd the welcome screens.",
+      task: "Ship onboarding flow\n\nAdd the welcome and sign-in screens.",
       taskId: "task-1",
     });
   });

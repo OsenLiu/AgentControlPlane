@@ -15,6 +15,11 @@ type ProjectTask = {
   projectId: string;
   title: string;
   description: string;
+  mode: "acceptEdits" | "auto";
+  model: string;
+  stepBudget: number;
+  stepsUsed: number;
+  autoApprove: boolean;
   status: "backlog" | "in_progress" | "done";
   loopEnabled: boolean;
   origin: "user" | "agent";
@@ -142,14 +147,18 @@ function Feedback({ error }: { error: string }) {
   return error ? <p className="project-feature-error" role="alert">{error}</p> : null;
 }
 
-export function ProjectTasksTab({ project }: { project: ProjectReference }) {
+export function ProjectTasksTab({
+  project,
+  onOpenSession,
+}: {
+  project: ProjectReference;
+  onOpenSession: (sessionId: string) => void;
+}) {
   const [tasks, setTasks] = useState<ProjectTask[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [filter, setFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState<ProjectTask["status"] | "all">("all");
-  const [showTaskForm, setShowTaskForm] = useState(false);
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
+  const [taskDialog, setTaskDialog] = useState<ProjectTask | "new" | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
@@ -199,20 +208,20 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
     };
   }, [loadTasks]);
 
-  async function createTask(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function saveTask(input: ProjectTaskInput) {
+    if (!taskDialog) return;
     setSaving(true);
     setError("");
     try {
-      const created = await invoke<ProjectTask>("create_project_task", {
-        projectId: project.id,
-        title,
-        description,
-      });
-      setSelectedTaskId(created.id);
-      setTitle("");
-      setDescription("");
-      setShowTaskForm(false);
+      const saved = taskDialog === "new"
+        ? await invoke<ProjectTask>("create_project_task", { projectId: project.id, ...input })
+        : await invoke<ProjectTask>("update_project_task", {
+            projectId: project.id,
+            taskId: taskDialog.id,
+            ...input,
+          });
+      setSelectedTaskId(saved.id);
+      setTaskDialog(null);
       await loadTasks();
     } catch (saveError) {
       setError(messageFromError(saveError));
@@ -293,41 +302,11 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
             <button
               className="project-feature-primary project-task-new-button"
               type="button"
-              onClick={() => setShowTaskForm((show) => !show)}
-              aria-expanded={showTaskForm}
+              onClick={() => setTaskDialog("new")}
             >
-              {showTaskForm ? "Cancel" : "+ New task"}
+              + New task
             </button>
           </header>
-
-          {showTaskForm && (
-            <form className="project-task-form" onSubmit={(event) => void createTask(event)}>
-              <label>
-                Task title
-                <input
-                  required
-                  maxLength={200}
-                  autoFocus
-                  value={title}
-                  onChange={(event) => setTitle(event.target.value)}
-                  placeholder="What needs to be done?"
-                />
-              </label>
-              <label>
-                Brief
-                <textarea
-                  maxLength={20_000}
-                  rows={3}
-                  value={description}
-                  onChange={(event) => setDescription(event.target.value)}
-                  placeholder="Add context or acceptance notes"
-                />
-              </label>
-              <button className="project-feature-primary" type="submit" disabled={saving || !title.trim()}>
-                {saving ? "Adding…" : "Add task"}
-              </button>
-            </form>
-          )}
 
           <div className="project-task-list-controls">
             <input
@@ -355,7 +334,7 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
             <div className="project-task-list-empty">
               <h3>No tasks yet</h3>
               <p>Add the first task to this project backlog.</p>
-              <button className="project-feature-quiet" type="button" onClick={() => setShowTaskForm(true)}>
+              <button className="project-feature-quiet" type="button" onClick={() => setTaskDialog("new")}>
                 Create a task
               </button>
             </div>
@@ -390,6 +369,8 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
               task={selectedTask}
               confirmDelete={confirmDeleteId === selectedTask.id}
               starting={startingTaskId === selectedTask.id}
+              onEdit={() => setTaskDialog(selectedTask)}
+              onOpenSession={onOpenSession}
               onStart={() => void startTask(selectedTask)}
               onSetStatus={(status) => void setTaskStatus(selectedTask, status)}
               onSetLoop={(enabled) => void setTaskLoopEnabled(selectedTask, enabled)}
@@ -405,7 +386,222 @@ export function ProjectTasksTab({ project }: { project: ProjectReference }) {
           </div>
         )}
       </div>
+      {taskDialog && (
+        <ProjectTaskDialog
+          initial={taskDialog === "new" ? null : taskDialog}
+          error={error}
+          saving={saving}
+          onClose={() => {
+            setTaskDialog(null);
+            setError("");
+          }}
+          onSave={(input) => void saveTask(input)}
+        />
+      )}
     </section>
+  );
+}
+
+type ProjectTaskInput = {
+  title: string;
+  description: string;
+  mode: ProjectTask["mode"];
+  model: string;
+  stepBudget: number;
+  autoApprove: boolean;
+};
+
+function TaskSettingHelp({ label, text }: { label: string; text: string }) {
+  return (
+    <button
+      className="project-info-button task-setting-help"
+      type="button"
+      aria-label={`${label} help: ${text}`}
+      aria-description={text}
+      title={text}
+    >
+      !
+    </button>
+  );
+}
+
+function ProjectTaskDialog({
+  initial,
+  error,
+  saving,
+  onClose,
+  onSave,
+}: {
+  initial: ProjectTask | null;
+  error: string;
+  saving: boolean;
+  onClose: () => void;
+  onSave: (input: ProjectTaskInput) => void;
+}) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const [title, setTitle] = useState(initial?.title ?? "");
+  const [description, setDescription] = useState(initial?.description ?? "");
+  const [mode, setMode] = useState<ProjectTask["mode"]>(initial?.mode ?? "acceptEdits");
+  const [modelChoice, setModelChoice] = useState(
+    initial?.model === "auto" || initial?.model === "gpt-5.6-sol" ? initial.model : "custom",
+  );
+  const [customModel, setCustomModel] = useState(
+    initial && initial.model !== "auto" && initial.model !== "gpt-5.6-sol" ? initial.model : "",
+  );
+  const [stepBudget, setStepBudget] = useState(initial?.stepBudget ?? 30);
+  const [autoApprove, setAutoApprove] = useState(initial?.autoApprove ?? false);
+
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape" && !saving) onClose();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose, saving]);
+
+  const model = modelChoice === "custom" ? customModel.trim() : modelChoice;
+  const valid = title.trim().length > 0 &&
+    description.trim().length > 0 &&
+    model.length > 0 &&
+    model.length <= 120 &&
+    Number.isSafeInteger(stepBudget) &&
+    stepBudget >= 1;
+
+  function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (valid) onSave({ title, description, mode, model, stepBudget, autoApprove });
+  }
+
+  return (
+    <div
+      className="task-dialog-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget && !saving) onClose();
+      }}
+    >
+      <section
+        ref={dialogRef}
+        className="task-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="task-dialog-title"
+        onKeyDown={(event) => {
+          if (event.key !== "Tab") return;
+          const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(
+            'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+          );
+          if (!focusable?.length) return;
+          const first = focusable[0];
+          const last = focusable[focusable.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+          }
+        }}
+      >
+        <header className="task-dialog-header">
+          <h2 id="task-dialog-title">{initial ? "Edit task" : "New task"}</h2>
+          <button className="project-feature-quiet" type="button" disabled={saving} onClick={onClose}>Close</button>
+        </header>
+        <form onSubmit={submit}>
+          <label className="task-dialog-field">
+            <span>Task title</span>
+            <input
+              autoFocus
+              required
+              maxLength={200}
+              value={title}
+              onChange={(event) => setTitle(event.target.value)}
+              placeholder="Task title"
+            />
+          </label>
+          <label className="task-dialog-field">
+            <span>Brief</span>
+            <textarea
+              required
+              maxLength={20_000}
+              rows={4}
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              placeholder="What should the agent build? Be specific about the goal."
+            />
+          </label>
+          <div className="task-dialog-setting">
+            <label htmlFor="project-task-mode">Mode</label>
+            <TaskSettingHelp
+              label="Mode"
+              text="Accept edits automatically approves file-edit requests while asking before other tools run. Auto approves all tool permissions and should be used only for trusted projects."
+            />
+            <select id="project-task-mode" value={mode} onChange={(event) => setMode(event.target.value as ProjectTask["mode"])}>
+              <option value="acceptEdits">Accept edits</option>
+              <option value="auto">Auto</option>
+            </select>
+          </div>
+          <div className="task-dialog-setting">
+            <label htmlFor="project-task-model">Model</label>
+            <TaskSettingHelp
+              label="Model"
+              text="Auto uses Copilot CLI's default model. GPT-5.6 Sol is listed by this installed CLI; model availability depends on your Copilot account. You can also enter another Copilot model ID."
+            />
+            <select id="project-task-model" value={modelChoice} onChange={(event) => setModelChoice(event.target.value)}>
+              <option value="auto">Auto (default)</option>
+              <option value="gpt-5.6-sol">GPT-5.6 Sol</option>
+              <option value="custom">Custom model ID…</option>
+            </select>
+            {modelChoice === "custom" && (
+              <input
+                className="task-dialog-custom-model"
+                required
+                maxLength={120}
+                value={customModel}
+                onChange={(event) => setCustomModel(event.target.value)}
+                placeholder="Copilot model ID"
+                aria-label="Custom Copilot model ID"
+              />
+            )}
+          </div>
+          <div className="task-dialog-setting">
+            <label htmlFor="project-task-step-budget">Step budget</label>
+            <TaskSettingHelp
+              label="Step budget"
+              text="Maximum number of agent replies in this task session. When the limit is reached, the session pauses and you can raise the budget to continue."
+            />
+            <input
+              id="project-task-step-budget"
+              type="number"
+              min={1}
+              step={1}
+              required
+              value={stepBudget}
+              onChange={(event) => setStepBudget(Number(event.target.value))}
+            />
+          </div>
+          <div className="task-dialog-setting task-dialog-auto-approve">
+            <label htmlFor="project-task-auto-approve">Auto-approve</label>
+            <TaskSettingHelp
+              label="Auto-approve"
+              text="Automatically mark this task done when Copilot reports completion and the required quality gate passes. This does not auto-approve tool permission requests."
+            />
+            <input
+              id="project-task-auto-approve"
+              type="checkbox"
+              checked={autoApprove}
+              onChange={(event) => setAutoApprove(event.target.checked)}
+            />
+          </div>
+          {error && <p className="project-feature-error" role="alert">{error}</p>}
+          <footer className="task-dialog-actions">
+            <button className="project-feature-button" type="button" disabled={saving} onClick={onClose}>Cancel</button>
+            <button className="project-feature-primary" type="submit" disabled={saving || !valid}>
+              {saving ? "Saving…" : initial ? "Save task" : "Create task"}
+            </button>
+          </footer>
+        </form>
+      </section>
+    </div>
   );
 }
 
@@ -413,6 +609,8 @@ function ProjectTaskDetail({
   task,
   confirmDelete,
   starting,
+  onEdit,
+  onOpenSession,
   onStart,
   onSetStatus,
   onSetLoop,
@@ -423,6 +621,8 @@ function ProjectTaskDetail({
   task: ProjectTask;
   confirmDelete: boolean;
   starting: boolean;
+  onEdit: () => void;
+  onOpenSession: (sessionId: string) => void;
   onStart: () => void;
   onSetStatus: (status: ProjectTask["status"]) => void;
   onSetLoop: (enabled: boolean) => void;
@@ -430,6 +630,8 @@ function ProjectTaskDetail({
   onConfirmDelete: () => void;
   onCancelDelete: () => void;
 }) {
+  const linkedSessionId = task.sessionId;
+
   return (
     <article className="project-task-detail" aria-labelledby="selected-task-title">
       <header className="project-task-detail-header">
@@ -445,15 +647,18 @@ function ProjectTaskDetail({
             )}
           </div>
         </div>
-        {confirmDelete ? (
-          <div className="project-task-confirm">
-            <span>Delete this task?</span>
-            <button className="project-feature-danger" type="button" onClick={onDelete}>Delete</button>
-            <button className="project-feature-button" type="button" onClick={onCancelDelete}>Cancel</button>
-          </div>
-        ) : (
-          <button className="project-feature-quiet" type="button" onClick={onConfirmDelete}>Delete</button>
-        )}
+        <div className="project-task-detail-header-actions">
+          <button className="project-feature-button" type="button" onClick={onEdit}>Edit</button>
+          {confirmDelete ? (
+            <div className="project-task-confirm">
+              <span>Delete this task?</span>
+              <button className="project-feature-danger" type="button" onClick={onDelete}>Delete</button>
+              <button className="project-feature-button" type="button" onClick={onCancelDelete}>Cancel</button>
+            </div>
+          ) : (
+            <button className="project-feature-quiet" type="button" onClick={onConfirmDelete}>Delete</button>
+          )}
+        </div>
       </header>
 
       <section className="project-task-description-section">
@@ -461,15 +666,28 @@ function ProjectTaskDetail({
         <p>{task.description || "No description added."}</p>
       </section>
 
-      {task.sessionId && (
-        <section className="project-task-session-section" aria-label="Linked session">
+      {linkedSessionId && (
+        <button
+          className="project-task-session-section"
+          type="button"
+          aria-label={`Open linked session ${linkedSessionId}`}
+          onClick={() => onOpenSession(linkedSessionId)}
+        >
           <span className="project-task-session-icon" aria-hidden="true">↗</span>
           <div>
             <strong>Linked session</strong>
-            <code>{task.sessionId}</code>
+            <code>{linkedSessionId}</code>
           </div>
-        </section>
+          <span className="project-task-session-open">Open session</span>
+        </button>
       )}
+
+      <section className="project-task-settings-summary" aria-label="Task settings">
+        <span>{task.mode === "acceptEdits" ? "Accept edits" : "Auto"} mode</span>
+        <span>{task.model === "auto" ? "Auto model" : task.model}</span>
+        <span>{task.stepsUsed}/{task.stepBudget} steps</span>
+        {task.autoApprove && <span>Auto-approve</span>}
+      </section>
 
       <section className="project-task-actions-panel" aria-label="Task actions">
         <div className="project-task-actions-copy">
