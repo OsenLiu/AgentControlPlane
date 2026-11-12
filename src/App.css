@@ -27,6 +27,8 @@ button { cursor: pointer; }
 .connection div span { margin-top: 3px; color: #687797; font-size: 10px; }
 .footer-stats { display: flex; justify-content: space-between; margin-top: 20px; color: #63708e; font-size: 10px; }
 .footer-stats strong { color: #aeb8d1; font-weight: 600; }
+.sidebar-app-version { display: flex; align-items: center; justify-content: space-between; margin-top: 12px; padding-top: 10px; border-top: 1px solid #1c2741; color: #7e8ba6; font-size: 9px; }
+.sidebar-app-version strong { padding: 3px 6px; border: 1px solid #293550; border-radius: 4px; color: #aeb8d1; background: #141d30; font-family: "JetBrains Mono", monospace; font-size: 9px; font-weight: 500; }
 .main-content { width: calc(100% - 238px); max-width: 1500px; padding: 39px 48px 60px; }
 .topbar { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 34px; }
 .eyebrow { margin: 0 0 8px; }

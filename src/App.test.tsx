@@ -59,6 +59,7 @@ describe("App", () => {
     render(<App />);
 
     expect(await screen.findByText("No projects connected yet. Add a local Git repository to get started.")).toBeTruthy();
+    expect(screen.getByText(/^v\d+\.\d+\.\d+$/)).toBeTruthy();
     expect(invokeMock).toHaveBeenCalledWith("list_projects");
     expect(invokeMock).toHaveBeenCalledWith("load_settings");
   });

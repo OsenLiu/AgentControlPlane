@@ -2,6 +2,7 @@ import { CSSProperties, FormEvent, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
+import appMetadata from "../package.json";
 import {
   ProjectDependenciesTab,
   ProjectDiffsTab,
@@ -1758,6 +1759,10 @@ function App() {
           </div>
           <div className="footer-stats">
             <span><strong>{projects.length}</strong> projects connected</span>
+          </div>
+          <div className="sidebar-app-version" aria-label={`App version ${appMetadata.version}`}>
+            <span>Version</span>
+            <strong>v{appMetadata.version}</strong>
           </div>
         </div>
       </aside>
