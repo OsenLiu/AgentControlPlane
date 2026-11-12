@@ -26,6 +26,7 @@ type ProjectTask = {
   sessionId: string | null;
   createdAt: string;
   updatedAt: string;
+  archived: boolean;
 };
 
 const COPILOT_MODEL_GROUPS = [
@@ -221,6 +222,7 @@ export function ProjectTasksTab({
   const [selectedTaskId, setSelectedTaskId] = useState("");
   const [filter, setFilter] = useState("");
   const [statusFilter, setStatusFilter] = useState<ProjectTask["status"] | "all">("all");
+  const [archivedView, setArchivedView] = useState(false);
   const [taskDialog, setTaskDialog] = useState<ProjectTask | "new" | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -234,21 +236,25 @@ export function ProjectTasksTab({
       const loadedTasks = await invoke<ProjectTask[]>("list_project_tasks", { projectId: project.id });
       setTasks(loadedTasks);
       setSelectedTaskId((current) =>
-        current && loadedTasks.some((task) => task.id === current) ? current : loadedTasks[0]?.id ?? "",
+        current && loadedTasks.some((task) => task.id === current && task.archived === archivedView)
+          ? current
+          : loadedTasks.find((task) => task.archived === archivedView)?.id ?? "",
       );
     } catch (loadError) {
       setError(messageFromError(loadError));
     } finally {
       setLoading(false);
     }
-  }, [project.id]);
+  }, [archivedView, project.id]);
 
-  const visibleTasks = tasks.filter((task) => {
+  const currentTasks = tasks.filter((task) => task.archived === archivedView);
+  const archivedTaskCount = tasks.filter((task) => task.archived).length;
+  const visibleTasks = currentTasks.filter((task) => {
     const searchable = `${task.title} ${task.description}`.toLowerCase();
     return searchable.includes(filter.trim().toLowerCase()) &&
       (statusFilter === "all" || task.status === statusFilter);
   });
-  const selectedTask = tasks.find((task) => task.id === selectedTaskId);
+  const selectedTask = tasks.find((task) => task.id === selectedTaskId && task.archived === archivedView);
 
   useEffect(() => {
     void loadTasks();
@@ -324,6 +330,20 @@ export function ProjectTasksTab({
     }
   }
 
+  async function setTaskArchived(task: ProjectTask, archived: boolean) {
+    setError("");
+    try {
+      await invoke("set_project_task_archived", {
+        projectId: project.id,
+        taskId: task.id,
+        archived,
+      });
+      await loadTasks();
+    } catch (archiveError) {
+      setError(messageFromError(archiveError));
+    }
+  }
+
   async function startTask(task: ProjectTask) {
     setStartingTaskId(task.id);
     setError("");
@@ -359,16 +379,27 @@ export function ProjectTasksTab({
         <aside className="project-task-sidebar" aria-label="Task list">
           <header className="project-task-sidebar-header">
             <div>
-              <h2>Tasks</h2>
-              <span>{tasks.length} {tasks.length === 1 ? "task" : "tasks"}</span>
+              <h2>{archivedView ? "Archived tasks" : "Tasks"}</h2>
+              <span>{currentTasks.length} {currentTasks.length === 1 ? "task" : "tasks"}</span>
             </div>
-            <button
-              className="project-feature-primary project-task-new-button"
-              type="button"
-              onClick={() => setTaskDialog("new")}
-            >
-              + New task
-            </button>
+            <div className="project-task-sidebar-actions">
+              <button
+                className="project-feature-button"
+                type="button"
+                onClick={() => setArchivedView((showArchived) => !showArchived)}
+              >
+                {archivedView ? "Active tasks" : `Archived tasks (${archivedTaskCount})`}
+              </button>
+              {!archivedView && (
+                <button
+                  className="project-feature-primary project-task-new-button"
+                  type="button"
+                  onClick={() => setTaskDialog("new")}
+                >
+                  + New task
+                </button>
+              )}
+            </div>
           </header>
 
           <div className="project-task-list-controls">
@@ -391,15 +422,23 @@ export function ProjectTasksTab({
             </select>
           </div>
 
-          {loading && tasks.length === 0 ? (
+          {loading && currentTasks.length === 0 && tasks.length === 0 ? (
             <p className="project-feature-state" role="status">Loading project tasks…</p>
-          ) : tasks.length === 0 ? (
+          ) : currentTasks.length === 0 ? (
             <div className="project-task-list-empty">
-              <h3>No tasks yet</h3>
-              <p>Add the first task to this project backlog.</p>
-              <button className="project-feature-quiet" type="button" onClick={() => setTaskDialog("new")}>
-                Create a task
-              </button>
+              <h3>{archivedView ? "No archived tasks" : tasks.length === 0 ? "No tasks yet" : "No active tasks"}</h3>
+              <p>
+                {archivedView
+                  ? "Tasks you archive will appear here, where you can restore them."
+                  : tasks.length === 0
+                    ? "Add the first task to this project backlog."
+                    : "All tasks are archived. Switch to archived tasks to restore one."}
+              </p>
+              {!archivedView && tasks.length === 0 && (
+                <button className="project-feature-quiet" type="button" onClick={() => setTaskDialog("new")}>
+                  Create a task
+                </button>
+              )}
             </div>
           ) : (
             <div className="project-task-list">
@@ -416,6 +455,7 @@ export function ProjectTasksTab({
                     <span className={`project-task-status ${task.status}`}>
                       {task.status.replace("_", " ")}
                     </span>
+                    {task.archived && <span className="project-task-row-archived">Archived</span>}
                     {task.loopEnabled && task.status === "backlog" && <span className="project-task-row-loop">In loop</span>}
                   </span>
                 </button>
@@ -433,6 +473,7 @@ export function ProjectTasksTab({
               confirmDelete={confirmDeleteId === selectedTask.id}
               starting={startingTaskId === selectedTask.id}
               onEdit={() => setTaskDialog(selectedTask)}
+              onSetArchived={(archived) => void setTaskArchived(selectedTask, archived)}
               onOpenSession={onOpenSession}
               onStart={() => void startTask(selectedTask)}
               onSetStatus={(status) => void setTaskStatus(selectedTask, status)}
@@ -444,7 +485,7 @@ export function ProjectTasksTab({
         ) : (
           <div className="project-task-detail project-task-detail-empty">
             <span className="project-task-detail-mark" aria-hidden="true">✓</span>
-            <h2>{tasks.length === 0 ? "Your backlog starts here" : "No task selected"}</h2>
+            <h2>{tasks.length === 0 ? "Your backlog starts here" : archivedView ? "No archived task selected" : "No active task selected"}</h2>
             <p>{tasks.length === 0 ? "Create a task to give your agent a clear goal, or add context for later." : "Choose a task from the list to see its details."}</p>
           </div>
         )}
@@ -678,6 +719,7 @@ function ProjectTaskDetail({
   confirmDelete,
   starting,
   onEdit,
+  onSetArchived,
   onOpenSession,
   onStart,
   onSetStatus,
@@ -690,6 +732,7 @@ function ProjectTaskDetail({
   confirmDelete: boolean;
   starting: boolean;
   onEdit: () => void;
+  onSetArchived: (archived: boolean) => void;
   onOpenSession: (sessionId: string) => void;
   onStart: () => void;
   onSetStatus: (status: ProjectTask["status"]) => void;
@@ -707,6 +750,7 @@ function ProjectTaskDetail({
           <h2 id="selected-task-title">{task.title}</h2>
           <div className="project-task-detail-badges">
             <span className={`project-task-status ${task.status}`}>{task.status.replace("_", " ")}</span>
+            {task.archived && <span className="project-task-archived-badge">Archived</span>}
             {task.origin === "agent" && <span className="project-task-origin">Agent proposal</span>}
             {task.status === "backlog" && (
               <span className={`project-task-loop-badge ${task.loopEnabled ? "enabled" : ""}`}>
@@ -717,6 +761,13 @@ function ProjectTaskDetail({
         </div>
         <div className="project-task-detail-header-actions">
           <button className="project-feature-button" type="button" onClick={onEdit}>Edit</button>
+          <button
+            className="project-feature-button"
+            type="button"
+            onClick={() => onSetArchived(!task.archived)}
+          >
+            {task.archived ? "Unarchive" : "Archive"}
+          </button>
           {confirmDelete ? (
             <div className="project-task-confirm">
               <span>Delete this task?</span>
@@ -759,44 +810,54 @@ function ProjectTaskDetail({
 
       <section className="project-task-actions-panel" aria-label="Task actions">
         <div className="project-task-actions-copy">
-          <h3>{task.status === "done" ? "Task complete" : task.status === "in_progress" ? "Work in progress" : "Ready to delegate"}</h3>
-          <p>
-            {task.status === "done"
-              ? "This task is complete. Reopen it if more work is needed."
+          <h3>{task.archived
+            ? "Task archived"
+            : task.status === "done"
+              ? "Task complete"
               : task.status === "in_progress"
-                ? "A session has been started for this task."
-                : "Start a Copilot session now, or keep this task in your project backlog."}
+                ? "Work in progress"
+                : "Ready to delegate"}</h3>
+          <p>
+            {task.archived
+              ? "This task is archived. Unarchive it to return it to the active task list."
+              : task.status === "done"
+                ? "This task is complete. Reopen it if more work is needed."
+                : task.status === "in_progress"
+                  ? "A session has been started for this task."
+                  : "Start a Copilot session now, or keep this task in your project backlog."}
           </p>
         </div>
-        <div className="project-task-action-controls">
-          {task.status === "backlog" && (
-            <label className="project-task-loop-toggle">
-              <input
-                type="checkbox"
-                checked={task.loopEnabled}
-                aria-label={`Include ${task.title} in project loop`}
-                onChange={(event) => onSetLoop(event.target.checked)}
-              />
-              <span>Include in project loop</span>
-            </label>
-          )}
-          <div className="project-task-action-buttons">
+        {!task.archived && (
+          <div className="project-task-action-controls">
             {task.status === "backlog" && (
-              <button className="project-feature-primary" type="button" disabled={starting} onClick={onStart}>
-                {starting ? "Starting…" : "Start session"}
-              </button>
+              <label className="project-task-loop-toggle">
+                <input
+                  type="checkbox"
+                  checked={task.loopEnabled}
+                  aria-label={`Include ${task.title} in project loop`}
+                  onChange={(event) => onSetLoop(event.target.checked)}
+                />
+                <span>Include in project loop</span>
+              </label>
             )}
-            {task.status !== "done" ? (
-              <button className="project-feature-button" type="button" onClick={() => onSetStatus("done")}>
-                Mark done
-              </button>
-            ) : (
-              <button className="project-feature-primary" type="button" onClick={() => onSetStatus("backlog")}>
-                Reopen task
-              </button>
-            )}
+            <div className="project-task-action-buttons">
+              {task.status === "backlog" && (
+                <button className="project-feature-primary" type="button" disabled={starting} onClick={onStart}>
+                  {starting ? "Starting…" : "Start session"}
+                </button>
+              )}
+              {task.status !== "done" ? (
+                <button className="project-feature-button" type="button" onClick={() => onSetStatus("done")}>
+                  Mark done
+                </button>
+              ) : (
+                <button className="project-feature-primary" type="button" onClick={() => onSetStatus("backlog")}>
+                  Reopen task
+                </button>
+              )}
+            </div>
           </div>
-        </div>
+        )}
       </section>
     </article>
   );

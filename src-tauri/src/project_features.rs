@@ -48,6 +48,7 @@ pub(crate) struct ProjectTask {
     session_id: Option<String>,
     created_at: String,
     updated_at: String,
+    archived: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -311,6 +312,23 @@ pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()>
                     }
                 })
         })
+        .and_then(|_| {
+            connection
+                .execute(
+                    "ALTER TABLE project_tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .or_else(|error| {
+                    if error
+                        .to_string()
+                        .contains("duplicate column name: archived")
+                    {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                })
+        })
         .map(|_| ())
 }
 
@@ -371,6 +389,7 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTask> {
         session_id: row.get(12)?,
         created_at: row.get(13)?,
         updated_at: row.get(14)?,
+        archived: row.get::<_, i64>(15)? != 0,
     })
 }
 
@@ -379,7 +398,7 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
     let mut statement = connection
         .prepare(
             "SELECT id, project_id, title, description, mode, model, step_budget, steps_used, auto_approve,
-                    status, loop_enabled, origin, session_id, created_at, updated_at
+                    status, loop_enabled, origin, session_id, created_at, updated_at, archived
              FROM project_tasks
              WHERE project_id = ?1
              ORDER BY CASE status WHEN 'backlog' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
@@ -391,6 +410,16 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
         .map_err(|error| format!("Unable to read project tasks: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode project tasks: {error}"))
+}
+
+fn task_by_id(connection: &Connection, task_id: &str) -> rusqlite::Result<ProjectTask> {
+    connection.query_row(
+        "SELECT id, project_id, title, description, mode, model, step_budget, steps_used, auto_approve,
+                status, loop_enabled, origin, session_id, created_at, updated_at, archived
+         FROM project_tasks WHERE id = ?1",
+        [task_id],
+        task_from_row,
+    )
 }
 
 #[tauri::command]
@@ -476,14 +505,7 @@ pub(crate) fn create_project_task(
             params![id, project_id, title, description.trim(), mode, model, step_budget, auto_approve],
         )
         .map_err(|error| format!("Unable to create project task: {error}"))?;
-    connection
-        .query_row(
-            "SELECT id, project_id, title, description, mode, model, step_budget, steps_used, auto_approve,
-                    status, loop_enabled, origin, session_id, created_at, updated_at
-             FROM project_tasks WHERE id = ?1",
-            [&id],
-            task_from_row,
-        )
+    task_by_id(&connection, &id)
         .map_err(|error| format!("Unable to read the new project task: {error}"))
 }
 
@@ -563,14 +585,7 @@ pub(crate) fn update_project_task(
     if changed == 0 {
         return Err("The task was not found in this project.".to_owned());
     }
-    connection
-        .query_row(
-            "SELECT id, project_id, title, description, mode, model, step_budget, steps_used, auto_approve,
-                    status, loop_enabled, origin, session_id, created_at, updated_at
-             FROM project_tasks WHERE id = ?1",
-            [&task_id],
-            task_from_row,
-        )
+    task_by_id(&connection, &task_id)
         .map_err(|error| format!("Unable to read the updated project task: {error}"))
 }
 
@@ -596,6 +611,32 @@ pub(crate) fn set_project_task_status(
             params![status, task_id, project_id],
         )
         .map_err(|error| format!("Unable to update project task: {error}"))?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err("The task was not found in this project.".to_owned())
+    }
+}
+
+#[tauri::command]
+pub(crate) fn set_project_task_archived(
+    project_id: String,
+    task_id: String,
+    archived: bool,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Project database is unavailable.".to_owned())?;
+    let changed = connection
+        .execute(
+            "UPDATE project_tasks
+             SET archived = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND project_id = ?3",
+            params![archived, task_id, project_id],
+        )
+        .map_err(|error| format!("Unable to archive project task: {error}"))?;
     if changed == 1 {
         Ok(())
     } else {
@@ -681,7 +722,7 @@ pub(crate) fn take_next_loop_task(
     let task = connection
         .query_row(
             "SELECT id, title, description FROM project_tasks
-             WHERE project_id = ?1 AND status = 'backlog' AND loop_enabled = 1
+             WHERE project_id = ?1 AND status = 'backlog' AND loop_enabled = 1 AND archived = 0
              ORDER BY created_at, id LIMIT 1",
             [project_id],
             |row| {
@@ -698,7 +739,7 @@ pub(crate) fn take_next_loop_task(
         connection
             .execute(
                 "UPDATE project_tasks SET status = 'in_progress', updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?1 AND project_id = ?2 AND status = 'backlog'",
+                 WHERE id = ?1 AND project_id = ?2 AND status = 'backlog' AND archived = 0",
                 params![task.id, project_id],
             )
             .map_err(|error| format!("Unable to claim the next loop task: {error}"))?;
@@ -800,7 +841,7 @@ pub(crate) fn create_agent_task_proposals(
         let duplicate = connection
             .query_row(
                 "SELECT 1 FROM project_tasks
-                 WHERE project_id = ?1 AND title = ?2 COLLATE NOCASE LIMIT 1",
+                 WHERE project_id = ?1 AND title = ?2 COLLATE NOCASE AND archived = 0 LIMIT 1",
                 params![project_id, title],
                 |_| Ok(()),
             )
@@ -1982,6 +2023,31 @@ mod tests {
         assert_eq!(name.as_deref(), Some("review"));
         assert_eq!(description.as_deref(), Some("Code review steps"));
         assert_eq!(parse_skill_frontmatter("No frontmatter"), (None, None));
+    }
+
+    #[test]
+    fn task_readback_includes_the_archived_state() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection
+            .execute_batch("CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);")
+            .expect("core schema");
+        initialize_schema(&connection).expect("feature schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, path) VALUES ('project-1', '/tmp/project-1')",
+                [],
+            )
+            .expect("project row");
+        connection
+            .execute(
+                "INSERT INTO project_tasks (id, project_id, title)
+                 VALUES ('task-1', 'project-1', 'Ship the feature')",
+                [],
+            )
+            .expect("task row");
+
+        let task = task_by_id(&connection, "task-1").expect("task readback");
+        assert!(!task.archived);
     }
 
     #[test]

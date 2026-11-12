@@ -218,6 +218,7 @@ describe("App", () => {
       sessionId: string | null;
       createdAt: string;
       updatedAt: string;
+      archived: boolean;
     } | null = null;
 
     invokeMock.mockImplementation(async (command, args) => {
@@ -249,6 +250,10 @@ describe("App", () => {
         if (task) task = { ...task, loopEnabled: Boolean(payload.enabled) };
         return undefined;
       }
+      if (command === "set_project_task_archived") {
+        if (task) task = { ...task, archived: Boolean(payload.archived) };
+        return undefined;
+      }
       if (command === "create_project_task") {
         task = {
           id: "task-1",
@@ -266,6 +271,7 @@ describe("App", () => {
           sessionId: null,
           createdAt: "2026-01-01",
           updatedAt: "2026-01-01",
+          archived: false,
         };
         return task;
       }
@@ -341,6 +347,25 @@ describe("App", () => {
       taskId: "task-1",
       enabled: false,
     }));
+    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_project_task_archived", {
+      projectId: "/work/website",
+      taskId: "task-1",
+      archived: true,
+    }));
+    expect(await screen.findByRole("heading", { name: "No active tasks" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Archived tasks (1)" }));
+    expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
+    expect(screen.getByText("Archived", { selector: ".project-task-archived-badge" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Unarchive" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("set_project_task_archived", {
+      projectId: "/work/website",
+      taskId: "task-1",
+      archived: false,
+    }));
+    expect(await screen.findByRole("heading", { name: "No archived tasks" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Active tasks" }));
+    expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Start session" }));
     expect(await screen.findByText("Linked session")).toBeTruthy();
     expect(await screen.findByText("session-1")).toBeTruthy();
