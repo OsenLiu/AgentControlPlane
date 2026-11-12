@@ -79,6 +79,7 @@ describe("App", () => {
       if (command === "list_agent_sessions") return [];
       if (command === "get_pending_session_permission") return null;
       if (command === "load_settings") return settings;
+      if (command === "list_project_tasks") return [];
       if (command === "get_project_pipelines") return {
         repository: "owner/website",
         configured: true,
@@ -102,6 +103,61 @@ describe("App", () => {
     expect(screen.queryByText("92")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Refresh pipeline health" }));
     await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "get_project_pipelines")).toHaveLength(2));
+  });
+
+  it("counts active backlog tasks across all projects", async () => {
+    const projects = [
+      {
+        id: "/work/alpha",
+        name: "alpha",
+        path: "/work/alpha",
+        branch: "main",
+        currentCommit: "abcdef0",
+        gitState: "clean" as const,
+        looping: false,
+        agentTaskCreation: false,
+      },
+      {
+        id: "/work/beta",
+        name: "beta",
+        path: "/work/beta",
+        branch: "main",
+        currentCommit: "1234567",
+        gitState: "clean" as const,
+        looping: false,
+        agentTaskCreation: false,
+      },
+    ];
+    const task = (status: "backlog" | "in_progress" | "done", archived = false) => ({ status, archived });
+    invokeMock.mockImplementation(async (command, args) => {
+      const projectId = (args as { projectId?: string } | undefined)?.projectId;
+      if (command === "list_projects") return projects;
+      if (command === "list_agent_sessions") return [];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "load_settings") return settings;
+      if (command === "list_project_tasks") {
+        return projectId === "/work/alpha"
+          ? [task("backlog"), task("in_progress"), task("backlog", true)]
+          : [task("backlog"), task("done")];
+      }
+      if (command === "get_project_pipelines") return {
+        repository: null,
+        configured: false,
+        error: "No GitHub pipeline is configured.",
+        runs: [],
+      };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+
+    const backlogCard = await screen.findByRole("article", { name: "Ready backlog summary" });
+    expect(await within(backlogCard).findByText("Ready to start across 2 projects")).toBeTruthy();
+    expect(within(backlogCard).getByText("2", { exact: true })).toBeTruthy();
+    expect(within(backlogCard).queryByText("Tasks arrive in Phase 1")).toBeNull();
+
+    fireEvent.click(within(backlogCard).getByRole("button", { name: "Refresh ready backlog" }));
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "list_project_tasks")).toHaveLength(4));
   });
 
   it("hides Gemini CLI from the agent provider settings", async () => {

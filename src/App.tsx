@@ -53,6 +53,11 @@ type ProjectPipelineStatus = {
   label: string;
 };
 
+type ProjectTaskSummary = {
+  status: "backlog" | "in_progress" | "done";
+  archived: boolean;
+};
+
 type ToolSettings = {
   enabled: boolean;
 };
@@ -1428,6 +1433,11 @@ function App() {
   const [pipelineHealthLoading, setPipelineHealthLoading] = useState(true);
   const [pipelineHealthErrors, setPipelineHealthErrors] = useState<string[]>([]);
   const [pipelineRefreshKey, setPipelineRefreshKey] = useState(0);
+  const [readyBacklogCount, setReadyBacklogCount] = useState<number | null>(null);
+  const [readyBacklogProjectCount, setReadyBacklogProjectCount] = useState(0);
+  const [readyBacklogLoading, setReadyBacklogLoading] = useState(true);
+  const [readyBacklogError, setReadyBacklogError] = useState("");
+  const [readyBacklogRefreshKey, setReadyBacklogRefreshKey] = useState(0);
 
   async function loadProjects() {
     setLoadingProjects(true);
@@ -1507,6 +1517,56 @@ function App() {
       disposed = true;
     };
   }, [activeNav, loadingProjects, pipelineRefreshKey, projects]);
+
+  useEffect(() => {
+    if (loadingProjects || activeNav !== "Dashboard") return;
+    if (projects.length === 0) {
+      setReadyBacklogCount(0);
+      setReadyBacklogProjectCount(0);
+      setReadyBacklogError("");
+      setReadyBacklogLoading(false);
+      return;
+    }
+
+    let disposed = false;
+    setReadyBacklogLoading(true);
+    setReadyBacklogError("");
+    void Promise.all(projects.map(async (project) => {
+      try {
+        const tasks = await invoke<ProjectTaskSummary[]>("list_project_tasks", { projectId: project.id });
+        return { project, tasks, error: "" };
+      } catch (reason) {
+        return {
+          project,
+          tasks: null,
+          error: `${project.name}: ${reason instanceof Error ? reason.message : String(reason)}`,
+        };
+      }
+    })).then((results) => {
+      if (disposed) return;
+      const errors = results.flatMap(({ error }) => error ? [error] : []);
+      if (errors.length > 0) {
+        setReadyBacklogCount(null);
+        setReadyBacklogProjectCount(0);
+        setReadyBacklogError(errors.join("\n"));
+      } else {
+        const projectsWithReadyTasks = results.filter(({ tasks }) =>
+          tasks?.some((task) => task.status === "backlog" && !task.archived),
+        ).length;
+        const taskCount = results.reduce((count, { tasks }) =>
+          count + (tasks?.filter((task) => task.status === "backlog" && !task.archived).length ?? 0),
+        0);
+        setReadyBacklogCount(taskCount);
+        setReadyBacklogProjectCount(projectsWithReadyTasks);
+        setReadyBacklogError("");
+      }
+      setReadyBacklogLoading(false);
+    });
+
+    return () => {
+      disposed = true;
+    };
+  }, [activeNav, loadingProjects, projects, readyBacklogRefreshKey]);
 
   useEffect(() => {
     void refreshAttentionItems();
@@ -1728,11 +1788,40 @@ function App() {
             <div className="metric-meta">{urgentAttentionCount} high priority item{urgentAttentionCount === 1 ? "" : "s"}</div>
             <div className="severity-bar">{attentionItems.slice(0, 4).map((item) => <i key={item.id} />)}{attentionItems.length === 0 && <i className="muted" />}</div>
           </article>
-          <article className="summary-card">
-            <div className="card-heading"><span>READY BACKLOG</span><span className="card-icon blue">≡</span></div>
-            <strong className="metric">—</strong>
-            <div className="metric-meta">Tasks arrive in Phase 1</div>
-            <div className="backlog-line"><span style={{ width: "72%" }} /></div>
+          <article className="summary-card" aria-label="Ready backlog summary">
+            <div className="card-heading">
+              <span>READY BACKLOG</span>
+              <div className="pipeline-health-actions">
+                <button
+                  className="pipeline-health-refresh"
+                  type="button"
+                  aria-label="Refresh ready backlog"
+                  onClick={() => {
+                    setReadyBacklogLoading(true);
+                    setReadyBacklogRefreshKey((current) => current + 1);
+                  }}
+                  disabled={readyBacklogLoading || loadingProjects || projects.length === 0}
+                >
+                  {readyBacklogLoading ? "Refreshing…" : "Refresh"}
+                </button>
+                <span className="card-icon blue" aria-hidden="true">≡</span>
+              </div>
+            </div>
+            <strong className="metric">
+              {readyBacklogLoading || readyBacklogError ? "—" : readyBacklogCount}
+            </strong>
+            <div className="metric-meta">
+              {readyBacklogLoading
+                ? "Loading project tasks…"
+                : readyBacklogError
+                  ? "Unable to load backlog"
+                  : readyBacklogCount === 0
+                    ? "No tasks ready to start"
+                    : `Ready to start across ${readyBacklogProjectCount} project${readyBacklogProjectCount === 1 ? "" : "s"}`}
+            </div>
+            {readyBacklogError && <div className="pipeline-health-error" role="alert" title={readyBacklogError}>
+              Could not load backlog for one or more projects
+            </div>}
           </article>
           <article className="summary-card">
             <div className="card-heading">
