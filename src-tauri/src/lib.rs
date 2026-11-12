@@ -22,11 +22,11 @@ mod project_features;
 use project_features::{
     TerminalManager, close_project_terminal, create_agent_task_proposals, create_project_task,
     create_project_terminal, delete_project_task, finish_project_task_session,
-    get_project_dependencies, get_project_diff, get_project_pipelines, increment_project_task_step,
-    link_project_task_session, list_project_skills, list_project_tasks, list_project_terminals,
-    project_task_step_usage, resize_project_terminal, set_project_task_archived,
-    set_project_task_loop_enabled, set_project_task_status, take_next_loop_task,
-    update_project_task, write_project_terminal,
+    get_project_dependencies, get_project_diff, get_project_pipelines, get_project_ref_diff,
+    increment_project_task_step, link_project_task_session, list_project_git_refs,
+    list_project_skills, list_project_tasks, list_project_terminals, project_task_step_usage,
+    resize_project_terminal, set_project_task_archived, set_project_task_loop_enabled,
+    set_project_task_status, take_next_loop_task, update_project_task, write_project_terminal,
 };
 
 #[derive(Clone)]
@@ -2633,6 +2633,8 @@ pub fn run() {
             link_project_task_session,
             delete_project_task,
             get_project_diff,
+            list_project_git_refs,
+            get_project_ref_diff,
             get_project_dependencies,
             list_project_skills,
             get_project_pipelines,

@@ -62,6 +62,15 @@ pub(crate) struct ProjectDiff {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ProjectGitRefs {
+    current_branch: Option<String>,
+    default_branch: Option<String>,
+    branches: Vec<String>,
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ProjectDependency {
     name: String,
     version: String,
@@ -1143,6 +1152,147 @@ pub(crate) fn get_project_diff(
         diff.truncate(end);
         truncated = true;
     }
+    Ok(ProjectDiff {
+        branch,
+        changed_files,
+        diff,
+        truncated,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn list_project_git_refs(
+    project_id: String,
+    database: State<'_, Database>,
+) -> Result<ProjectGitRefs, String> {
+    let path = project_path(&database, &project_id)?;
+    let refs = git_text(
+        &path,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    )?;
+    let mut branches = Vec::new();
+    let mut tags = Vec::new();
+    for reference in refs.lines() {
+        if reference.starts_with("refs/heads/") {
+            branches.push(reference.to_owned());
+        } else if reference.starts_with("refs/tags/") {
+            tags.push(reference.to_owned());
+        }
+    }
+
+    let current_branch = git_text(&path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .ok()
+        .filter(|branch| !branch.is_empty())
+        .map(|branch| format!("refs/heads/{branch}"));
+    let default_branch = git_text(
+        &path,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .ok()
+    .and_then(|reference| {
+        reference
+            .strip_prefix("refs/remotes/origin/")
+            .map(str::to_owned)
+    })
+    .map(|branch| format!("refs/heads/{branch}"))
+    .filter(|reference| branches.contains(reference))
+    .or_else(|| {
+        ["refs/heads/main", "refs/heads/master"]
+            .into_iter()
+            .find(|candidate| branches.iter().any(|branch| branch == candidate))
+            .map(str::to_owned)
+    });
+
+    Ok(ProjectGitRefs {
+        current_branch,
+        default_branch,
+        branches,
+        tags,
+    })
+}
+
+#[tauri::command]
+pub(crate) fn get_project_ref_diff(
+    project_id: String,
+    base: String,
+    head: String,
+    database: State<'_, Database>,
+) -> Result<ProjectDiff, String> {
+    let path = project_path(&database, &project_id)?;
+    let refs = git_text(
+        &path,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/heads",
+            "refs/tags",
+        ],
+    )?;
+    let allowed_refs: Vec<&str> = refs.lines().collect();
+    for reference in [&base, &head] {
+        if !allowed_refs.contains(&reference.as_str()) {
+            return Err(format!(
+                "Git reference {reference:?} is not available in this repository."
+            ));
+        }
+    }
+
+    let base_expression = format!("{base}^{{commit}}");
+    let head_expression = format!("{head}^{{commit}}");
+    let base_commit = git_text(
+        &path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &base_expression,
+        ],
+    )?;
+    let head_commit = git_text(
+        &path,
+        &[
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &head_expression,
+        ],
+    )?;
+    let changed_files = git_text(
+        &path,
+        &["diff", "--name-only", &base_commit, &head_commit, "--"],
+    )?
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    let mut diff = git_text(
+        &path,
+        &[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            &base_commit,
+            &head_commit,
+            "--",
+        ],
+    )?;
+    if !diff.is_empty() && !diff.ends_with('\n') {
+        diff.push('\n');
+    }
+    let mut truncated = false;
+    if diff.len() > MAX_DIFF_BYTES {
+        let mut end = MAX_DIFF_BYTES;
+        while !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        diff.truncate(end);
+        truncated = true;
+    }
+    let branch = git_text(&path, &["branch", "--show-current"]).unwrap_or_default();
     Ok(ProjectDiff {
         branch,
         changed_files,

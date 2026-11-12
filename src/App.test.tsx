@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import App from "./App";
+import { ProjectDiffsTab } from "./project/ProjectFeatureTabs";
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
@@ -60,6 +61,60 @@ describe("App", () => {
     expect(await screen.findByText("No projects connected yet. Add a local Git repository to get started.")).toBeTruthy();
     expect(invokeMock).toHaveBeenCalledWith("list_projects");
     expect(invokeMock).toHaveBeenCalledWith("load_settings");
+  });
+
+  it("renders a navigable diff and compares selected Git references", async () => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_project_git_refs") return {
+        currentBranch: "refs/heads/feature/diffs",
+        defaultBranch: "refs/heads/main",
+        branches: ["refs/heads/main", "refs/heads/feature/diffs"],
+        tags: [],
+      };
+      if (command === "get_project_diff") return {
+        branch: "feature/diffs",
+        changedFiles: [" M src/App.tsx"],
+        diff: [
+          "diff --git a/src/App.tsx b/src/App.tsx",
+          "index 1111111..2222222 100644",
+          "--- a/src/App.tsx",
+          "+++ b/src/App.tsx",
+          "@@ -1,2 +1,3 @@",
+          " unchanged",
+          "-old value",
+          "+new value",
+          "+another line",
+        ].join("\n"),
+        truncated: false,
+      };
+      if (command === "get_project_ref_diff") return {
+        branch: "feature/diffs",
+        changedFiles: ["src/App.tsx"],
+        diff: "diff --git a/src/App.tsx b/src/App.tsx\n--- a/src/App.tsx\n+++ b/src/App.tsx\n@@ -1 +1 @@\n-old value\n+new value\n",
+        truncated: false,
+      };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<ProjectDiffsTab project={{ id: "/work/project", name: "project" }} />);
+
+    expect(await screen.findByText("new value")).toBeTruthy();
+    expect(screen.getByText("+2")).toBeTruthy();
+    expect(screen.getByText("-1")).toBeTruthy();
+    fireEvent.click(screen.getByRole("checkbox", { name: "side by side" }));
+    expect(screen.getByText("another line")).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Base reference" }), {
+      target: { value: "refs/heads/main" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Head reference" }), {
+      target: { value: "refs/heads/feature/diffs" },
+    });
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("get_project_ref_diff", {
+      projectId: "/work/project",
+      base: "refs/heads/main",
+      head: "refs/heads/feature/diffs",
+    }));
   });
 
   it("supports selecting GitHub CLI authentication and saves without a token", async () => {
@@ -122,6 +177,12 @@ describe("App", () => {
       if (command === "load_settings") return settings;
       if (command === "list_project_tasks") return [];
       if (command === "get_project_diff") return { branch: "feature/refresh", changedFiles: [], diff: "", truncated: false };
+      if (command === "list_project_git_refs") return {
+        currentBranch: "refs/heads/feature/refresh",
+        defaultBranch: "refs/heads/main",
+        branches: ["refs/heads/main", "refs/heads/feature/refresh"],
+        tags: [],
+      };
       if (command === "list_project_terminals") return [];
       if (command === "get_project_pipelines") return {
         repository: null,

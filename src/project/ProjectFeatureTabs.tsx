@@ -1,4 +1,4 @@
-import { FormEvent, ReactNode, useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from "react";
+import { FormEvent, ReactNode, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -102,7 +102,30 @@ type ProjectDiff = {
 
 type DiffFile = {
   path: string;
-  content: string;
+  changeType: "added" | "modified" | "deleted" | "renamed";
+  binary: boolean;
+  additions: number;
+  deletions: number;
+  hunks: DiffHunk[];
+};
+
+type DiffLine = {
+  kind: "context" | "add" | "del";
+  oldLineNo: number | null;
+  newLineNo: number | null;
+  text: string;
+};
+
+type DiffHunk = {
+  header: string;
+  lines: DiffLine[];
+};
+
+type ProjectGitRefs = {
+  currentBranch: string | null;
+  defaultBranch: string | null;
+  branches: string[];
+  tags: string[];
 };
 
 type ProjectDependency = {
@@ -959,26 +982,132 @@ function ProjectTaskDetail({
   );
 }
 
+type DiffSource = { kind: "working-tree" } | { kind: "refs"; base: string; head: string };
+type DiffRow =
+  | { kind: "hunk"; text: string }
+  | { kind: "unified"; line: DiffLine }
+  | { kind: "split"; left: DiffLine | null; right: DiffLine | null };
+
+function unquoteDiffPath(path: string) {
+  return path.startsWith('"') && path.endsWith('"') ? path.slice(1, -1) : path;
+}
+
 function parseDiffFiles(diff: string): DiffFile[] {
-  const sections = diff.split(/(?=^diff --git )/m).filter((section) => section.trim());
-  if (sections.length === 0 && diff.trim()) return [{ path: "Working tree diff", content: diff }];
-  return sections.map((content) => {
-    const header = content.match(/^diff --git a\/(.+?) b\/(.+)$/m);
-    return { path: header?.[2] ?? "Changed file", content };
+  return diff.split(/(?=^diff --git )/m).filter((section) => section.trim()).flatMap((section) => {
+    const lines = section.split("\n");
+    const header = lines[0]?.match(/^diff --git a\/(.+?) b\/(.+)$/);
+    if (!header) return [];
+
+    let path = unquoteDiffPath(header[2]);
+    let changeType: DiffFile["changeType"] = "modified";
+    let binary = false;
+    const hunks: DiffHunk[] = [];
+    let oldLineNo = 0;
+    let newLineNo = 0;
+    let hunk: DiffHunk | null = null;
+    let additions = 0;
+    let deletions = 0;
+
+    for (const line of lines.slice(1)) {
+      if (line.startsWith("new file mode")) changeType = "added";
+      else if (line.startsWith("deleted file mode")) changeType = "deleted";
+      else if (line.startsWith("rename to ")) {
+        path = unquoteDiffPath(line.slice("rename to ".length));
+        changeType = "renamed";
+      } else if (line.startsWith("Binary files ") || line.startsWith("GIT binary patch")) binary = true;
+      else if (line.startsWith("+++ b/")) path = unquoteDiffPath(line.slice(6));
+
+      const hunkHeader = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (hunkHeader) {
+        hunk = { header: line, lines: [] };
+        hunks.push(hunk);
+        oldLineNo = Number(hunkHeader[1]);
+        newLineNo = Number(hunkHeader[2]);
+      } else if (hunk && line.startsWith("+")) {
+        hunk.lines.push({ kind: "add", oldLineNo: null, newLineNo: newLineNo++, text: line.slice(1) });
+        additions += 1;
+      } else if (hunk && line.startsWith("-")) {
+        hunk.lines.push({ kind: "del", oldLineNo: oldLineNo++, newLineNo: null, text: line.slice(1) });
+        deletions += 1;
+      } else if (hunk && line.startsWith(" ")) {
+        hunk.lines.push({ kind: "context", oldLineNo: oldLineNo++, newLineNo: newLineNo++, text: line.slice(1) });
+      }
+    }
+
+    return [{ path, changeType, binary, additions, deletions, hunks }];
   });
 }
 
+function directoryFor(path: string) {
+  const separator = path.lastIndexOf("/");
+  return separator < 0 ? "." : path.slice(0, separator);
+}
+
+function baseName(path: string) {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
+function rowsForFile(file: DiffFile, split: boolean): DiffRow[] {
+  const rows: DiffRow[] = [];
+  for (const hunk of file.hunks) {
+    rows.push({ kind: "hunk", text: hunk.header });
+    if (!split) {
+      rows.push(...hunk.lines.map((line) => ({ kind: "unified" as const, line })));
+      continue;
+    }
+
+    for (let index = 0; index < hunk.lines.length;) {
+      const current = hunk.lines[index];
+      if (current.kind === "context") {
+        rows.push({ kind: "split", left: current, right: current });
+        index += 1;
+        continue;
+      }
+      const changes: DiffLine[] = [];
+      while (index < hunk.lines.length && hunk.lines[index].kind !== "context") {
+        changes.push(hunk.lines[index]);
+        index += 1;
+      }
+      const removed = changes.filter((line) => line.kind === "del");
+      const added = changes.filter((line) => line.kind === "add");
+      for (let row = 0; row < Math.max(removed.length, added.length); row += 1) {
+        rows.push({ kind: "split", left: removed[row] ?? null, right: added[row] ?? null });
+      }
+    }
+  }
+  return rows;
+}
+
+function displayRef(reference: string) {
+  return reference.replace(/^refs\/(?:heads|tags)\//, "");
+}
+
 export function ProjectDiffsTab({ project }: { project: ProjectReference }) {
+  const [source, setSource] = useState<DiffSource>({ kind: "working-tree" });
+  const [refs, setRefs] = useState<ProjectGitRefs | null>(null);
   const [snapshot, setSnapshot] = useState<ProjectDiff | null>(null);
   const [selectedPath, setSelectedPath] = useState("");
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [split, setSplit] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [refsError, setRefsError] = useState("");
 
   const loadDiff = useCallback(async () => {
     setLoading(true);
     setError("");
     try {
-      const result = await invoke<ProjectDiff>("get_project_diff", { projectId: project.id });
+      if (source.kind === "refs" && (!source.base || !source.head)) {
+        setSnapshot(null);
+        return;
+      }
+      const result = source.kind === "working-tree"
+        ? await invoke<ProjectDiff>("get_project_diff", { projectId: project.id })
+        : await invoke<ProjectDiff>("get_project_ref_diff", {
+          projectId: project.id,
+          base: source.base,
+          head: source.head,
+        });
       setSnapshot(result);
       const files = parseDiffFiles(result.diff);
       setSelectedPath((current) => files.some((file) => file.path === current) ? current : files[0]?.path ?? "");
@@ -987,30 +1116,137 @@ export function ProjectDiffsTab({ project }: { project: ProjectReference }) {
     } finally {
       setLoading(false);
     }
-  }, [project.id]);
+  }, [project.id, source]);
 
   useEffect(() => {
     void loadDiff();
   }, [loadDiff]);
 
-  const files = parseDiffFiles(snapshot?.diff ?? "");
+  useEffect(() => {
+    let disposed = false;
+    void invoke<ProjectGitRefs>("list_project_git_refs", { projectId: project.id }).then((result) => {
+      if (!disposed) {
+        setRefs(result);
+        setRefsError("");
+      }
+    }).catch((loadError: unknown) => {
+      if (!disposed) setRefsError(messageFromError(loadError));
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [project.id]);
+
+  const files = useMemo(() => {
+    const parsed = parseDiffFiles(snapshot?.diff ?? "");
+    if (parsed.length || !snapshot?.changedFiles.length) return parsed;
+    return snapshot.changedFiles.map((entry) => {
+      const status = source.kind === "working-tree" ? entry.slice(0, 2) : "";
+      const pathParts = source.kind === "working-tree" ? entry.slice(3).split(" -> ") : [entry];
+      const path = pathParts[pathParts.length - 1].trim();
+      return {
+        path,
+        changeType: status.includes("A") || status === "??" ? "added" as const : status.includes("D") ? "deleted" as const : status.includes("R") ? "renamed" as const : "modified" as const,
+        binary: false,
+        additions: 0,
+        deletions: 0,
+        hunks: [],
+      };
+    });
+  }, [snapshot?.changedFiles, snapshot?.diff, source.kind]);
+  const groupedFiles = useMemo(() => {
+    const groups = new Map<string, DiffFile[]>();
+    for (const file of files) {
+      const directory = directoryFor(file.path);
+      groups.set(directory, [...(groups.get(directory) ?? []), file]);
+    }
+    return [...groups.entries()].sort(([left], [right]) => left.localeCompare(right));
+  }, [files]);
   const selectedFile = files.find((file) => file.path === selectedPath);
+  const rows = selectedFile ? rowsForFile(selectedFile, split) : [];
+
+  function chooseBase(base: string) {
+    setSource((previous) => ({
+      kind: "refs",
+      base,
+      head: previous.kind === "refs" ? previous.head : refs?.currentBranch ?? "",
+    }));
+  }
+
+  function chooseHead(head: string) {
+    setSource((previous) => ({
+      kind: "refs",
+      base: previous.kind === "refs" ? previous.base : refs?.defaultBranch ?? "",
+      head,
+    }));
+  }
 
   return (
-    <FeatureFrame
-      eyebrow="WORKING TREE"
-      title="Diffs"
-      description={snapshot?.branch ? `Review uncommitted changes on ${snapshot.branch}.` : "Review uncommitted changes in this repository."}
-      action={<button className="project-feature-button" type="button" onClick={() => void loadDiff()} disabled={loading}>Refresh diff</button>}
-    >
-      <Feedback error={error} />
+    <section className="project-diffs" aria-label="Git diff viewer">
+      <div className="project-diff-toolbar">
+        <span className="project-diff-branch" title="Current branch">⑂ {snapshot?.branch || "No branch"}</span>
+        <button
+          className={`project-diff-source ${source.kind === "working-tree" ? "active" : ""}`}
+          type="button"
+          onClick={() => setSource({ kind: "working-tree" })}
+        >
+          Working tree
+        </button>
+        <label className="project-diff-ref-picker">
+          <span className="sr-only">Base reference</span>
+          <select
+            aria-label="Base reference"
+            value={source.kind === "refs" ? source.base : ""}
+            onChange={(event) => event.target.value && chooseBase(event.target.value)}
+            disabled={!refs}
+          >
+            <option value="">base</option>
+            {refs?.branches.length ? (
+              <optgroup label="Branches">
+                {refs.branches.map((reference) => <option key={reference} value={reference}>{displayRef(reference)}</option>)}
+              </optgroup>
+            ) : null}
+            {refs?.tags.length ? (
+              <optgroup label="Tags">
+                {refs.tags.map((reference) => <option key={reference} value={reference}>{displayRef(reference)}</option>)}
+              </optgroup>
+            ) : null}
+          </select>
+        </label>
+        <span className="project-diff-ref-divider" aria-hidden="true">…</span>
+        <label className="project-diff-ref-picker">
+          <span className="sr-only">Head reference</span>
+          <select
+            aria-label="Head reference"
+            value={source.kind === "refs" ? source.head : ""}
+            onChange={(event) => event.target.value && chooseHead(event.target.value)}
+            disabled={!refs}
+          >
+            <option value="">head</option>
+            {refs?.branches.length ? (
+              <optgroup label="Branches">
+                {refs.branches.map((reference) => <option key={reference} value={reference}>{displayRef(reference)}</option>)}
+              </optgroup>
+            ) : null}
+            {refs?.tags.length ? (
+              <optgroup label="Tags">
+                {refs.tags.map((reference) => <option key={reference} value={reference}>{displayRef(reference)}</option>)}
+              </optgroup>
+            ) : null}
+          </select>
+        </label>
+        <button className="project-diff-refresh" type="button" onClick={() => void loadDiff()} disabled={loading}>
+          <span aria-hidden="true">↻</span> Refresh
+        </button>
+      </div>
+      <Feedback error={error || refsError} />
       {loading && !snapshot ? (
         <p className="project-feature-state" role="status">Reading Git changes…</p>
+      ) : source.kind === "refs" && (!source.base || !source.head) ? (
+        <div className="project-diff-empty"><h3>Choose a base and head reference to compare</h3></div>
       ) : !snapshot || (snapshot.changedFiles.length === 0 && !snapshot.diff) ? (
-        <div className="project-feature-empty">
-          <span className="project-feature-empty-mark" aria-hidden="true">✓</span>
-          <h3>Working tree is clean</h3>
-          <p>Uncommitted changes will appear here for review.</p>
+        <div className="project-diff-empty" role="status">
+          <h3>{source.kind === "working-tree" ? "Working tree is clean" : "These references have no differences"}</h3>
         </div>
       ) : (
         <>
@@ -1018,29 +1254,89 @@ export function ProjectDiffsTab({ project }: { project: ProjectReference }) {
           <div className="project-diff-layout">
             <aside className="project-diff-files" aria-label="Changed files">
               <div className="project-diff-files-heading">
-                <strong>Changed files</strong><span>{snapshot.changedFiles.length}</span>
+                <strong>Changed files</strong><span>{files.length}</span>
               </div>
-              {files.length ? files.map((file) => (
-                <button
-                  type="button"
-                  className={selectedPath === file.path ? "active" : ""}
-                  key={file.path}
-                  onClick={() => setSelectedPath(file.path)}
-                  title={file.path}
-                >
-                  <span aria-hidden="true">▤</span>{file.path}
-                </button>
-              )) : snapshot.changedFiles.map((file) => (
-                <div className="project-diff-unavailable-file" key={file}>{file}</div>
+              {groupedFiles.map(([directory, group]) => (
+                <div className="project-diff-group" key={directory}>
+                  <button
+                    className="project-diff-group-heading"
+                    type="button"
+                    aria-expanded={!collapsed.has(directory)}
+                    onClick={() => setCollapsed((previous) => {
+                      const next = new Set(previous);
+                      if (next.has(directory)) next.delete(directory);
+                      else next.add(directory);
+                      return next;
+                    })}
+                  >
+                    <span aria-hidden="true">{collapsed.has(directory) ? "▸" : "▾"}</span>
+                    <strong>{directory === "." ? "root" : directory}</strong>
+                    <span>{group.length}</span>
+                  </button>
+                  {!collapsed.has(directory) && group.map((file) => (
+                    <button
+                      type="button"
+                      className={`project-diff-file ${selectedPath === file.path ? "active" : ""}`}
+                      key={file.path}
+                      onClick={() => setSelectedPath(file.path)}
+                      title={file.path}
+                    >
+                      <span className={`project-diff-change project-diff-change-${file.changeType}`}>
+                        {file.changeType === "added" ? "A" : file.changeType === "deleted" ? "D" : file.changeType === "renamed" ? "R" : "M"}
+                      </span>
+                      <span className="project-diff-file-name">{baseName(file.path)}</span>
+                      <span className="project-diff-counts">
+                        {file.additions > 0 && <span className="add">+{file.additions}</span>}
+                        {file.deletions > 0 && <span className="del">-{file.deletions}</span>}
+                      </span>
+                    </button>
+                  ))}
+                </div>
               ))}
             </aside>
-            <pre className="project-diff-content" aria-label="Unified diff">
-              {selectedFile?.content ?? "Select a changed file to inspect its diff."}
-            </pre>
+            <section className="project-diff-detail" aria-label="Selected file diff">
+              {selectedFile ? (
+                <>
+                  <div className="project-diff-detail-header">
+                    <code>{selectedFile.path}</code>
+                    <label className="project-diff-split-toggle">
+                      <input type="checkbox" checked={split} onChange={(event) => setSplit(event.target.checked)} />
+                      side by side
+                    </label>
+                  </div>
+                  {selectedFile.binary ? (
+                    <div className="project-diff-empty">Binary file, no text diff.</div>
+                  ) : (
+                    <div className={`project-diff-content ${split ? "split" : ""}`} role="region" aria-label="Unified diff" tabIndex={0}>
+                      {rows.map((row, index) => row.kind === "hunk" ? (
+                        <div className="project-diff-hunk" key={`hunk-${index}`}>{row.text}</div>
+                      ) : row.kind === "unified" ? (
+                        <div className={`project-diff-line project-diff-line-${row.line.kind}`} key={`line-${index}`}>
+                          <span className="project-diff-line-number">{row.line.oldLineNo ?? ""}</span>
+                          <span className="project-diff-line-number">{row.line.newLineNo ?? ""}</span>
+                          <span className="project-diff-line-sign">{row.line.kind === "add" ? "+" : row.line.kind === "del" ? "-" : " "}</span>
+                          <code>{row.line.text}</code>
+                        </div>
+                      ) : (
+                        <div className="project-diff-split-row" key={`split-${index}`}>
+                          <span className={`project-diff-line-number ${row.left ? `project-diff-line-number-${row.left.kind}` : ""}`}>{row.left?.oldLineNo ?? ""}</span>
+                          <code className={`project-diff-split-code ${row.left ? `project-diff-line-${row.left.kind}` : "empty"}`}>{row.left?.text ?? ""}</code>
+                          <span className={`project-diff-line-number ${row.right ? `project-diff-line-number-${row.right.kind}` : ""}`}>{row.right?.newLineNo ?? ""}</span>
+                          <code className={`project-diff-split-code ${row.right ? `project-diff-line-${row.right.kind}` : "empty"}`}>{row.right?.text ?? ""}</code>
+                        </div>
+                      ))}
+                      {rows.length === 0 && <div className="project-diff-empty">No text changes in this file.</div>}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="project-diff-empty">No text diff is available for these files.</div>
+              )}
+            </section>
           </div>
         </>
       )}
-    </FeatureFrame>
+    </section>
   );
 }
 
