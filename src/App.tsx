@@ -244,12 +244,11 @@ function SettingsView({
   onSave: (event: FormEvent<HTMLFormElement>) => void;
   saving: boolean;
 }) {
-  const updateTool = (key: "copilot" | "gemini" | "claudeCode", field: keyof ToolSettings, value: boolean) => {
+  const updateTool = (key: "copilot" | "claudeCode", field: keyof ToolSettings, value: boolean) => {
     setSettings({ ...settings, [key]: { ...settings[key], [field]: value } });
   };
   const tools = [
     { key: "copilot" as const, label: "GitHub Copilot CLI", command: "copilot login", description: "Run copilot login in a terminal to start the browser-based GitHub sign-in flow." },
-    { key: "gemini" as const, label: "Gemini CLI", command: "gemini", description: "Start Gemini and choose Sign in with Google. API key and Vertex AI modes are also supported." },
     { key: "claudeCode" as const, label: "Claude Code CLI", command: "claude", description: "Start Claude and follow the sign-in flow. Use /login inside Claude Code to switch accounts." },
   ];
 

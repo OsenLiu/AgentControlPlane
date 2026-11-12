@@ -63,6 +63,15 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("load_settings");
   });
 
+  it("hides Gemini CLI from the agent provider settings", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+
+    expect(screen.queryByText("Gemini CLI")).toBeNull();
+    expect(screen.getByRole("radio", { name: /GitHub Copilot CLI/ })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: /Claude Code CLI/ })).toBeTruthy();
+  });
+
   it("renders a navigable diff and compares selected Git references", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_project_git_refs") return {
