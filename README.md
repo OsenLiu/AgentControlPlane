@@ -9,7 +9,10 @@ frontend commands/events.
 
 Agent Control Plane stores its session list and chat transcripts in its own
 SQLite database. Copilot CLI interaction uses its supported Agent Client
-Protocol; the app does not open Copilot CLI or VS Code private session stores.
+Protocol. Claude Code runs through its local headless CLI with structured
+stream output; the app uses Claude's CLI session IDs to resume conversations.
+Enable the desired providers in Settings and choose an enabled CLI when
+starting a session. The app does not open either CLI's private session stores.
 
 ## Development
 

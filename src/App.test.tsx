@@ -1018,6 +1018,55 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions", { archived: false });
   });
 
+  it.each([
+    ["claudeCode", "Start Claude Code session"],
+    ["copilot", "Start GitHub Copilot session"],
+  ] as const)("starts a session with the selected enabled provider (%s)", async (provider, buttonName) => {
+    const project = {
+      id: "/work/project",
+      name: "project",
+      path: "/work/project",
+      branch: "main",
+      currentCommit: "abcdef0",
+      gitState: "clean" as const,
+      looping: false,
+      agentTaskCreation: false,
+    };
+    const bothProvidersEnabled = {
+      ...settings,
+      copilot: { enabled: true },
+      claudeCode: { enabled: true },
+      defaultProvider: "claudeCode" as const,
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [project];
+      if (command === "list_agent_sessions") return [];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "load_settings") return bothProvidersEnabled;
+      if (command === "start_agent_session") return undefined;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+
+    const providerSelect = await screen.findByRole("combobox", { name: "AGENT PROVIDER" });
+    expect(providerSelect).toHaveProperty("value", "claudeCode");
+    if (provider === "copilot") {
+      fireEvent.change(providerSelect, { target: { value: "copilot" } });
+    }
+    fireEvent.change(screen.getByLabelText("TASK PROMPT"), {
+      target: { value: "Add the feature" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: new RegExp(buttonName) }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("start_agent_session", {
+      provider,
+      projectId: project.id,
+      task: "Add the feature",
+    }));
+  });
+
   it("renders a read-only session returned by the local backend", async () => {
     const session = {
       id: "observed-copilot-abc",
@@ -1132,7 +1181,7 @@ describe("App", () => {
       }];
       if (command === "get_pending_session_permission") return null;
       if (command === "get_session_transcript") return [];
-      if (command === "start_copilot_session") {
+      if (command === "start_agent_session") {
         resumed = true;
         return { ...session, status: "idle" };
       }
@@ -1144,7 +1193,8 @@ describe("App", () => {
     expect(await screen.findByRole("button", { name: "Resume session" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
-    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("start_copilot_session", {
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("start_agent_session", {
+      provider: "copilot",
       projectId: null,
       task: "",
       resumeSessionId: "session-to-resume",

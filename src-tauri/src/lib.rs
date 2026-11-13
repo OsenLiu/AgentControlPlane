@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     fs,
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::{
@@ -112,6 +112,17 @@ struct CopilotObservation {
     status: Option<String>,
     step: Option<String>,
     last_event: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct ClaudeObservation {
+    session_id: Option<String>,
+    text: Option<String>,
+    step: Option<String>,
+    result: Option<String>,
+    completed: bool,
+    failed: bool,
+    token_count: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -284,12 +295,122 @@ fn copilot_command() -> Command {
     Command::new(copilot_executable())
 }
 
+fn claude_executable() -> PathBuf {
+    if let Some(executable) = std::env::var_os("CLAUDE_CODE_CLI_PATH") {
+        return PathBuf::from(executable);
+    }
+
+    if let Some(path) = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join("claude"))
+            .find(|candidate| candidate.is_file())
+    }) {
+        return path;
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        for candidate in [
+            home.join(".local/bin/claude"),
+            home.join(".claude/local/claude"),
+            home.join(".npm-global/bin/claude"),
+        ] {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+
+        let nvm_nodes = home.join(".nvm/versions/node");
+        if let Ok(entries) = fs::read_dir(nvm_nodes) {
+            let mut candidates = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join("bin/claude"))
+                .filter(|candidate| candidate.is_file())
+                .collect::<Vec<_>>();
+            candidates.sort();
+            if let Some(candidate) = candidates.pop() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from("claude")
+}
+
+fn claude_command() -> Command {
+    Command::new(claude_executable())
+}
+
 fn copilot_session_id() -> String {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     format!("copilot-{timestamp:x}")
+}
+
+fn claude_observation_from_line(line: &str) -> Result<ClaudeObservation, String> {
+    let message: Value = serde_json::from_str(line)
+        .map_err(|error| format!("Claude Code returned invalid stream JSON: {error}"))?;
+    let event_type = message["type"].as_str().unwrap_or_default();
+    let session_id = message["session_id"].as_str().map(str::to_owned);
+
+    match event_type {
+        "system" => Ok(ClaudeObservation {
+            session_id,
+            ..ClaudeObservation::default()
+        }),
+        "stream_event" => {
+            let event = &message["event"];
+            let text = (event["type"].as_str() == Some("content_block_delta")
+                && event["delta"]["type"].as_str() == Some("text_delta"))
+            .then(|| event["delta"]["text"].as_str().map(str::to_owned))
+            .flatten();
+            Ok(ClaudeObservation {
+                session_id,
+                text,
+                ..ClaudeObservation::default()
+            })
+        }
+        "assistant" => {
+            let step = message["message"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|block| block["type"].as_str() == Some("tool_use"))
+                .and_then(|block| block["name"].as_str())
+                .map(|name| format!("Claude Code is using {name}"));
+            Ok(ClaudeObservation {
+                session_id,
+                step,
+                ..ClaudeObservation::default()
+            })
+        }
+        "result" => {
+            let usage = &message["usage"];
+            let token_count = [
+                usage["input_tokens"].as_u64(),
+                usage["output_tokens"].as_u64(),
+                usage["cache_read_input_tokens"].as_u64(),
+                usage["cache_creation_input_tokens"].as_u64(),
+            ]
+            .into_iter()
+            .flatten()
+            .fold(0_u64, u64::saturating_add);
+            Ok(ClaudeObservation {
+                session_id,
+                result: message["result"].as_str().map(str::to_owned),
+                completed: true,
+                failed: message["subtype"].as_str() != Some("success"),
+                token_count: i64::try_from(token_count).ok(),
+                ..ClaudeObservation::default()
+            })
+        }
+        _ => Ok(ClaudeObservation {
+            session_id,
+            ..ClaudeObservation::default()
+        }),
+    }
 }
 
 fn copilot_content_text(content: &Value) -> Option<String> {
@@ -736,14 +857,12 @@ fn github_token_configured() -> bool {
 
 #[tauri::command]
 fn get_current_username() -> Option<String> {
-    ["USER", "USERNAME"]
-        .iter()
-        .find_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|username| username.trim().to_owned())
-                .filter(|username| !username.is_empty())
-        })
+    ["USER", "USERNAME"].iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|username| username.trim().to_owned())
+            .filter(|username| !username.is_empty())
+    })
 }
 
 #[tauri::command]
@@ -1464,6 +1583,19 @@ async fn send_session_message(
     let database = Database(database.0.clone());
     let processes = SessionProcesses(processes.0.clone());
     run_agent_operation(move || {
+        let provider: String = database
+            .0
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?
+            .query_row(
+                "SELECT provider FROM agent_sessions WHERE id = ?1 AND origin = 'managed'",
+                [&session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to find managed agent session: {error}"))?;
+        if provider == "claudeCode" {
+            return send_claude_message(&database, &session_id, &message, &app, &processes);
+        }
         let control = processes
             .0
             .lock()
@@ -1589,9 +1721,9 @@ fn stop_agent_session(
     control
         .child
         .lock()
-        .map_err(|_| "Copilot process state is unavailable.".to_owned())?
+        .map_err(|_| "Agent process state is unavailable.".to_owned())?
         .kill()
-        .map_err(|error| format!("Unable to stop Copilot session: {error}"))?;
+        .map_err(|error| format!("Unable to stop agent session: {error}"))?;
     update_session_status(
         &database.0,
         &session_id,
@@ -2024,6 +2156,73 @@ async fn start_copilot_session(
     .await
 }
 
+#[tauri::command]
+async fn start_agent_session(
+    provider: String,
+    project_id: Option<String>,
+    task: String,
+    resume_session_id: Option<String>,
+    database: State<'_, Database>,
+    processes: State<'_, SessionProcesses>,
+    app: tauri::AppHandle,
+) -> Result<AgentSession, String> {
+    let database = Database(database.0.clone());
+    let processes = SessionProcesses(processes.0.clone());
+    run_agent_operation(move || {
+        let settings_provider = match provider.as_str() {
+            "copilot" => "copilot",
+            "claudeCode" => "claude_code",
+            _ => return Err(format!("Unsupported agent provider: {provider}")),
+        };
+        if resume_session_id.is_none() {
+            let settings = {
+                let connection = database
+                    .0
+                    .lock()
+                    .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+                read_tool_settings(&connection, settings_provider)?
+            };
+            if !settings.enabled {
+                return Err(format!(
+                    "{} is disabled. Enable it in Settings before starting a session.",
+                    provider_label(&provider)
+                ));
+            }
+        }
+
+        match provider.as_str() {
+            "copilot" => start_copilot_session_blocking(
+                project_id,
+                task,
+                resume_session_id,
+                None,
+                false,
+                database,
+                processes,
+                app,
+            ),
+            "claudeCode" => start_claude_code_session_blocking(
+                project_id,
+                task,
+                resume_session_id,
+                database,
+                processes,
+                app,
+            ),
+            _ => unreachable!("provider was validated above"),
+        }
+    })
+    .await
+}
+
+fn provider_label(provider: &str) -> &'static str {
+    match provider {
+        "copilot" => "GitHub Copilot CLI",
+        "claudeCode" => "Claude Code CLI",
+        _ => "Agent CLI",
+    }
+}
+
 fn reset_task_after_start_failure(
     database: &Database,
     task_id: Option<&str>,
@@ -2423,6 +2622,563 @@ fn start_copilot_session_blocking(
         .ok_or_else(|| "Copilot session was started but could not be read back.".to_owned())
 }
 
+fn claude_session_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("claude-{timestamp:x}")
+}
+
+fn check_claude_cli() -> Result<(), String> {
+    let version = claude_command()
+        .arg("--version")
+        .output()
+        .map_err(|error| format!("Unable to start Claude Code CLI: {error}"))?;
+    if !version.status.success() {
+        let detail = String::from_utf8_lossy(&version.stderr).trim().to_owned();
+        return Err(if detail.is_empty() {
+            "Claude Code CLI rejected the version check.".to_owned()
+        } else {
+            format!("Claude Code CLI rejected the version check: {detail}")
+        });
+    }
+    Ok(())
+}
+
+fn start_claude_code_session_blocking(
+    project_id: Option<String>,
+    task: String,
+    resume_session_id: Option<String>,
+    database: Database,
+    processes: SessionProcesses,
+    app: tauri::AppHandle,
+) -> Result<AgentSession, String> {
+    check_claude_cli()?;
+    if let Some(session_id) = resume_session_id.as_deref() {
+        if processes
+            .0
+            .lock()
+            .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+            .contains_key(session_id)
+        {
+            return Err("This Claude Code session is already connected.".to_owned());
+        }
+        let (project_id, external_id, task): (String, Option<String>, String) = {
+            let connection = database
+                .0
+                .lock()
+                .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+            let (project_id, external_id, stored_task): (String, Option<String>, String) =
+                connection
+                    .query_row(
+                        "SELECT project_id, external_session_id, task
+                     FROM agent_sessions
+                     WHERE id = ?1 AND provider = 'claudeCode'",
+                        [session_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .map_err(|error| {
+                        format!("Unable to find Claude Code session to resume: {error}")
+                    })?;
+            (
+                project_id,
+                external_id,
+                if task.trim().is_empty() {
+                    stored_task
+                } else {
+                    task
+                },
+            )
+        };
+        if external_id.is_none() {
+            return Err(
+                "Claude Code did not return a session ID, so this session cannot be resumed."
+                    .to_owned(),
+            );
+        }
+        {
+            let connection = database
+                .0
+                .lock()
+                .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+            connection
+                .execute(
+                    "UPDATE agent_sessions
+                     SET project_id = ?2, task = ?3, status = 'idle',
+                         status_reason = '', current_step = 'Ready for your message',
+                         origin = 'managed', archived = 0, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?1 AND provider = 'claudeCode'",
+                    params![session_id, project_id, task],
+                )
+                .map_err(|error| format!("Unable to resume Claude Code session: {error}"))?;
+        }
+        app.emit("agent-session-updated", session_id)
+            .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        return list_agent_sessions_from_connection(&connection, None, None, Some(false))?
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .ok_or_else(|| {
+                "Claude Code session was resumed but could not be read back.".to_owned()
+            });
+    }
+
+    let project_id = project_id
+        .ok_or_else(|| "A project is required to start a Claude Code session.".to_owned())?;
+    let mut task = task.trim().to_owned();
+    if task.is_empty() {
+        return Err("Describe the task before starting a Claude Code session.".to_owned());
+    }
+    if task.len() > 16_000 {
+        return Err("Messages must be 16,000 bytes or fewer.".to_owned());
+    }
+    let (project_path, branch, allow_agent_tasks) = {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Project database is unavailable.".to_owned())?;
+        connection
+            .query_row(
+                "SELECT path, branch, agent_task_creation FROM projects WHERE id = ?1",
+                [&project_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                    ))
+                },
+            )
+            .map_err(|error| format!("Unable to find project for Claude Code session: {error}"))?
+    };
+    if allow_agent_tasks {
+        task.push_str(
+            "\n\n# Agent-proposed backlog tasks\nThis project allows you to propose separate follow-up work. When useful, add a fenced `apt-task` JSON block with a short `title`, a `purpose`, and optional `acceptanceCriteria` string array. Example:\n```apt-task\n{\"title\":\"Add example\",\"purpose\":\"Describe the follow-up work\",\"acceptanceCriteria\":[\"A verifiable outcome\"]}\n```\nProposed tasks are added to the backlog and do not interrupt this session. Do not propose work that is part of the task you were asked to complete.",
+        );
+    }
+
+    let session_id = claude_session_id();
+    {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        connection
+            .execute(
+                "INSERT INTO agent_sessions
+                 (id, project_id, provider, task, branch, status, status_reason,
+                  current_step, permission_mode, origin, loop_owned, last_event)
+                 VALUES (?1, ?2, 'claudeCode', ?3, ?4, 'starting', '',
+                         'Starting Claude Code session', 'plan', 'managed', 0, '')",
+                params![session_id, project_id, task, branch],
+            )
+            .map_err(|error| format!("Unable to persist Claude Code session: {error}"))?;
+    }
+
+    let processes_ref = processes.0.clone();
+    let result = start_claude_turn(
+        &database.0,
+        &processes_ref,
+        &app,
+        &session_id,
+        &project_path,
+        None,
+        "plan",
+        &task,
+        true,
+    );
+    if let Err(error) = result {
+        let _ = update_session_status(
+            &database.0,
+            &session_id,
+            "failed",
+            "Unable to start Claude Code",
+            &error,
+        );
+        return Err(error);
+    }
+    app.emit("agent-session-updated", &session_id)
+        .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    list_agent_sessions_from_connection(&connection, None, None, Some(false))?
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| "Claude Code session was started but could not be read back.".to_owned())
+}
+
+fn start_claude_turn(
+    database: &Arc<Mutex<Connection>>,
+    processes: &Arc<Mutex<HashMap<String, SessionControl>>>,
+    app: &tauri::AppHandle,
+    session_id: &str,
+    project_path: &str,
+    external_session_id: Option<&str>,
+    permission_mode: &str,
+    prompt: &str,
+    is_initial_prompt: bool,
+) -> Result<mpsc::Receiver<Result<(), String>>, String> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("Enter a message before sending it to Claude Code.".to_owned());
+    }
+    if prompt.len() > 16_000 {
+        return Err("Messages must be 16,000 bytes or fewer.".to_owned());
+    }
+    let cli_permission_mode = match permission_mode {
+        "plan" => "plan",
+        "acceptEdits" => "acceptEdits",
+        "auto" => "bypassPermissions",
+        other => return Err(format!("Unsupported Claude Code permission mode: {other}")),
+    };
+    if processes
+        .lock()
+        .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+        .contains_key(session_id)
+    {
+        return Err("This agent session already has an active process.".to_owned());
+    }
+
+    let assistant_message_id = {
+        let connection = database
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        let status: String = connection
+            .query_row(
+                "SELECT status FROM agent_sessions WHERE id = ?1 AND provider = 'claudeCode'",
+                [session_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Unable to find Claude Code session: {error}"))?;
+        validate_session_message_status(&status, is_initial_prompt, false)?;
+        insert_session_message(&connection, session_id, "user", prompt)?;
+        let assistant_message_id =
+            insert_session_message(&connection, session_id, "assistant", "")?;
+        connection
+            .execute(
+                "UPDATE agent_sessions
+                 SET status = 'running', status_reason = '',
+                     current_step = 'Sending message', last_event = ?2,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                params![session_id, prompt],
+            )
+            .map_err(|error| format!("Unable to update Claude Code session: {error}"))?;
+        assistant_message_id
+    };
+
+    let mut command = claude_command();
+    command
+        .arg("--print")
+        .arg("--output-format")
+        .arg("stream-json")
+        .arg("--verbose")
+        .arg("--permission-mode")
+        .arg(cli_permission_mode);
+    if let Some(external_session_id) = external_session_id {
+        command.arg("--resume").arg(external_session_id);
+    }
+    let mut child = match command
+        .arg(prompt)
+        .current_dir(project_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            let message = format!("Unable to start Claude Code CLI: {error}");
+            let _ = update_session_status(
+                database,
+                session_id,
+                "failed",
+                "Unable to start Claude Code",
+                &message,
+            );
+            return Err(message);
+        }
+    };
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Claude Code did not provide an output stream.".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Claude Code did not provide an error stream.".to_owned())?;
+    let child = Arc::new(Mutex::new(child));
+    let (input, _input_rx) = mpsc::channel::<String>();
+    let control = SessionControl {
+        input,
+        pending: Arc::new(Mutex::new(HashMap::new())),
+        permission_requests: Arc::new(Mutex::new(HashMap::new())),
+        next_request_id: Arc::new(AtomicU64::new(1)),
+        stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        child: child.clone(),
+        assistant_message_id: Arc::new(Mutex::new(Some(assistant_message_id.clone()))),
+    };
+    let pid = child
+        .lock()
+        .map_err(|_| "Claude Code process state is unavailable.".to_owned())?
+        .id();
+    {
+        let connection = database
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        connection
+            .execute(
+                "UPDATE agent_sessions SET pid = ?2 WHERE id = ?1",
+                params![session_id, pid],
+            )
+            .map_err(|error| format!("Unable to save Claude Code process ID: {error}"))?;
+    }
+    processes
+        .lock()
+        .map_err(|_| "Agent session process list is unavailable.".to_owned())?
+        .insert(session_id.to_owned(), control.clone());
+
+    let (done_sender, done_receiver) = mpsc::channel();
+    let reader_database = database.clone();
+    let reader_processes = processes.clone();
+    let reader_app = app.clone();
+    let reader_session_id = session_id.to_owned();
+    thread::spawn(move || {
+        let stderr_reader = thread::spawn(move || {
+            let mut output = String::new();
+            let read_result = BufReader::new(stderr).read_to_string(&mut output);
+            (read_result, output)
+        });
+        let mut stream_error = None;
+        let mut result_text = None;
+        let mut external_id = None;
+        let mut got_result = false;
+        let mut failed_result = false;
+        let mut saw_text = false;
+        for line in BufReader::new(stdout).lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    stream_error = Some(format!("Unable to read Claude Code output: {error}"));
+                    break;
+                }
+            };
+            let observation = match claude_observation_from_line(&line) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    stream_error = Some(error);
+                    continue;
+                }
+            };
+            if let Some(id) = observation.session_id {
+                external_id = Some(id);
+            }
+            if let Some(step) = observation.step {
+                let _ = update_session_status(
+                    &reader_database,
+                    &reader_session_id,
+                    "running",
+                    &step,
+                    "",
+                );
+            }
+            if let Some(text) = observation.text {
+                if !text.is_empty() {
+                    saw_text = true;
+                    let _ = append_assistant_chunk(
+                        &reader_database,
+                        &reader_session_id,
+                        &assistant_message_id,
+                        &text,
+                    );
+                    let _ = reader_app.emit("agent-session-updated", &reader_session_id);
+                }
+            }
+            if observation.completed {
+                got_result = true;
+                failed_result = observation.failed;
+                result_text = observation.result;
+                if let Some(token_count) = observation.token_count {
+                    let _ = update_session_token_count(
+                        &reader_database,
+                        &reader_session_id,
+                        token_count,
+                    );
+                }
+            }
+        }
+
+        let stderr = match stderr_reader.join() {
+            Ok((Ok(_), output)) => output.trim().to_owned(),
+            Ok((Err(error), _)) => {
+                stream_error.get_or_insert_with(|| {
+                    format!("Unable to read Claude Code error output: {error}")
+                });
+                String::new()
+            }
+            Err(_) => {
+                stream_error.get_or_insert_with(|| {
+                    "Claude Code error-output reader stopped unexpectedly.".to_owned()
+                });
+                String::new()
+            }
+        };
+        let exit_success = child
+            .lock()
+            .map_err(|_| "Claude Code process state is unavailable.".to_owned())
+            .and_then(|mut process| {
+                process
+                    .wait()
+                    .map(|status| status.success())
+                    .map_err(|error| format!("Unable to wait for Claude Code: {error}"))
+            });
+        let stopped = control.stop_requested.load(Ordering::Relaxed);
+        let mut failure = stream_error
+            .or_else(|| exit_success.as_ref().err().cloned())
+            .or_else(|| {
+                if !exit_success.unwrap_or(false) {
+                    Some(if stderr.is_empty() {
+                        "Claude Code exited unsuccessfully.".to_owned()
+                    } else {
+                        stderr
+                    })
+                } else if !got_result {
+                    Some("Claude Code exited without a result event.".to_owned())
+                } else if failed_result {
+                    Some(result_text.clone().unwrap_or_else(|| {
+                        "Claude Code reported that the request failed.".to_owned()
+                    }))
+                } else if external_id.is_none() {
+                    Some("Claude Code did not return a session ID.".to_owned())
+                } else {
+                    None
+                }
+            });
+        if let Some(external_id) = external_id.as_deref() {
+            let persist_result = reader_database
+                .lock()
+                .map_err(|_| "Agent session database is unavailable.".to_owned())
+                .and_then(|connection| {
+                    connection
+                        .execute(
+                            "UPDATE agent_sessions SET external_session_id = ?2 WHERE id = ?1",
+                            params![reader_session_id, external_id],
+                        )
+                        .map(|_| ())
+                        .map_err(|error| format!("Unable to save Claude Code session ID: {error}"))
+                });
+            if let Err(error) = persist_result {
+                if let Some(existing) = failure.as_mut() {
+                    existing.push_str(&format!("; additionally, {error}"));
+                } else {
+                    failure = Some(error);
+                }
+            }
+        }
+        if !saw_text {
+            if let Some(text) = result_text.as_deref().filter(|text| !text.is_empty()) {
+                let _ = append_assistant_chunk(
+                    &reader_database,
+                    &reader_session_id,
+                    &assistant_message_id,
+                    text,
+                );
+            }
+        }
+
+        let (status, step, reason) = if stopped {
+            ("completed", "Stopped by user.", "Stopped by user.")
+        } else if let Some(error) = failure.as_deref() {
+            ("failed", "Claude Code request failed", error)
+        } else {
+            ("idle", "Ready for your message", "")
+        };
+        let _ = update_session_status(&reader_database, &reader_session_id, status, step, reason);
+        if let Ok(mut active) = reader_processes.lock() {
+            active.remove(&reader_session_id);
+        }
+        if failure.is_none() && !stopped {
+            if let Ok(connection) = reader_database.lock() {
+                let _ = increment_project_task_step(&connection, &reader_session_id);
+            }
+            handle_project_task_turn(
+                &reader_database,
+                &reader_session_id,
+                &SessionProcesses(reader_processes),
+                &reader_app,
+            );
+        } else {
+            fail_project_task(&reader_database, &reader_session_id, &reader_app);
+        }
+        let _ = reader_app.emit("agent-session-updated", &reader_session_id);
+        let _ = done_sender.send(if stopped {
+            Ok(())
+        } else if let Some(error) = failure {
+            Err(error)
+        } else {
+            Ok(())
+        });
+    });
+    Ok(done_receiver)
+}
+
+fn send_claude_message(
+    database: &Database,
+    session_id: &str,
+    message: &str,
+    app: &tauri::AppHandle,
+    processes: &SessionProcesses,
+) -> Result<(), String> {
+    check_claude_cli()?;
+    let (project_path, external_id, permission_mode) = {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        connection
+            .query_row(
+                "SELECT p.path, s.external_session_id, s.permission_mode
+                 FROM agent_sessions s
+                 JOIN projects p ON p.id = s.project_id
+                 WHERE s.id = ?1 AND s.provider = 'claudeCode' AND s.origin = 'managed'",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("Unable to read Claude Code session: {error}"))?
+    };
+    let external_id = external_id.ok_or_else(|| {
+        "Claude Code did not return a session ID, so this session cannot receive messages."
+            .to_owned()
+    })?;
+    let receiver = start_claude_turn(
+        &database.0,
+        &processes.0,
+        app,
+        session_id,
+        &project_path,
+        Some(&external_id),
+        &permission_mode,
+        message,
+        false,
+    )?;
+    match receiver.recv_timeout(Duration::from_secs(600)) {
+        Ok(result) => result,
+        Err(_) => Err("Claude Code did not finish responding within 10 minutes.".to_owned()),
+    }
+}
+
 #[tauri::command]
 fn register_project(path: String, database: State<'_, Database>) -> Result<Project, String> {
     let requested_path = PathBuf::from(path.trim());
@@ -2670,6 +3426,7 @@ pub fn run() {
             rename_agent_session,
             get_session_transcript,
             start_copilot_session,
+            start_agent_session,
             register_project,
             list_project_tasks,
             create_project_task,
@@ -2912,7 +3669,10 @@ mod tests {
         assert!(!sessions[0].task_archived);
 
         connection
-            .execute("UPDATE project_tasks SET status = 'done' WHERE id = 'task-1'", [])
+            .execute(
+                "UPDATE project_tasks SET status = 'done' WHERE id = 'task-1'",
+                [],
+            )
             .expect("complete linked task");
         let completed = list_agent_sessions_from_connection(&connection, None, None, None)
             .expect("completed task session query");
@@ -3136,5 +3896,37 @@ mod tests {
     #[test]
     fn malformed_copilot_output_is_an_error() {
         assert!(copilot_observation_from_line("not-json").is_err());
+    }
+
+    #[test]
+    fn claude_text_stream_events_are_mapped_to_transcript_chunks() {
+        let observation = claude_observation_from_line(
+            r#"{"type":"stream_event","session_id":"claude-session","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello"}}}"#,
+        )
+        .expect("valid Claude stream event");
+
+        assert_eq!(observation.session_id.as_deref(), Some("claude-session"));
+        assert_eq!(observation.text.as_deref(), Some("Hello"));
+        assert!(!observation.completed);
+    }
+
+    #[test]
+    fn claude_result_events_report_session_usage_and_failures() {
+        let success = claude_observation_from_line(
+            r#"{"type":"result","subtype":"success","session_id":"claude-session","result":"Done","usage":{"input_tokens":10,"output_tokens":5}}"#,
+        )
+        .expect("valid Claude result event");
+        assert!(success.completed);
+        assert!(!success.failed);
+        assert_eq!(success.result.as_deref(), Some("Done"));
+        assert_eq!(success.token_count, Some(15));
+
+        let failure = claude_observation_from_line(
+            r#"{"type":"result","subtype":"error_during_execution","session_id":"claude-session","result":"Tool failed"}"#,
+        )
+        .expect("valid Claude error result event");
+        assert!(failure.completed);
+        assert!(failure.failed);
+        assert_eq!(failure.result.as_deref(), Some("Tool failed"));
     }
 }

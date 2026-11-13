@@ -81,6 +81,8 @@ type Settings = {
   transcriptFontSize: number;
 };
 
+type AgentProvider = "copilot" | "claudeCode";
+
 type SettingsForm = Settings & { githubToken: string };
 
 type SessionStatus = "starting" | "running" | "waiting" | "idle" | "paused" | "completed" | "failed" | "orphaned" | "unknown";
@@ -442,10 +444,12 @@ function SessionStatusBadge({ status }: { status: SessionStatus }) {
 }
 
 function AgentSessionsView({
+  settings,
   transcriptFontSize,
   initialSessionId,
   projectId,
 }: {
+  settings: Settings;
   transcriptFontSize: number;
   initialSessionId?: string;
   projectId?: string;
@@ -459,7 +463,8 @@ function AgentSessionsView({
   const [refreshing, setRefreshing] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState(projectId ?? "");
-  const [task, setTask] = useState("Start a new Copilot session");
+  const [task, setTask] = useState("");
+  const [selectedProvider, setSelectedProvider] = useState<AgentProvider | null>(null);
   const [starting, setStarting] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [sendingMessage, setSendingMessage] = useState(false);
@@ -473,6 +478,35 @@ function AgentSessionsView({
   const [sessionNameDraft, setSessionNameDraft] = useState("");
   const [savingSessionName, setSavingSessionName] = useState(false);
   const selectedSession = sessions.find((session) => session.id === selectedId) ?? sessions[0];
+  const enabledProviders: { id: AgentProvider; label: string }[] = [
+    ...(settings.copilot.enabled ? [{ id: "copilot" as const, label: "GitHub Copilot CLI" }] : []),
+    ...(settings.claudeCode.enabled ? [{ id: "claudeCode" as const, label: "Claude Code CLI" }] : []),
+  ];
+  const activeProvider = selectedProvider && enabledProviders.some((provider) => provider.id === selectedProvider)
+    ? selectedProvider
+    : enabledProviders.find((provider) => provider.id === settings.defaultProvider)?.id
+      ?? enabledProviders[0]?.id
+      ?? null;
+  const activeProviderLabel = activeProvider ? providerLabel(activeProvider) : "Agent";
+  const selectedSessionProviderName = selectedSession?.provider === "copilot"
+    ? "Copilot"
+    : selectedSession ? providerLabel(selectedSession.provider) : "Agent";
+  const providerPicker = <div className="session-provider-picker">
+    <label className="field-label" htmlFor="session-provider">AGENT PROVIDER</label>
+    <select
+      id="session-provider"
+      className="settings-input"
+      value={activeProvider ?? ""}
+      disabled={enabledProviders.length < 2}
+      onChange={(event) => {
+        const value = event.currentTarget.value;
+        if (value === "copilot" || value === "claudeCode") setSelectedProvider(value);
+      }}
+    >
+      {enabledProviders.map((provider) => <option value={provider.id} key={provider.id}>{provider.label}</option>)}
+    </select>
+    {enabledProviders.length === 0 && <span className="session-provider-help">Enable Copilot CLI or Claude Code CLI in Settings to start an agent session.</span>}
+  </div>;
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all" || session.status === filter;
     const searchable = `${session.project} ${session.task} ${session.branch}`.toLowerCase();
@@ -610,7 +644,8 @@ function AgentSessionsView({
     setResuming(true);
     setLoadError("");
     try {
-      await invoke("start_copilot_session", {
+      await invoke("start_agent_session", {
+        provider: selectedSession.provider,
         projectId: null,
         task: "",
         resumeSessionId: selectedSession.id,
@@ -626,11 +661,12 @@ function AgentSessionsView({
 
   async function startSession(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedProjectId || !task.trim()) return;
+    if (!activeProvider || !selectedProjectId || !task.trim()) return;
     setStarting(true);
     setLoadError("");
     try {
-      await invoke("start_copilot_session", {
+      await invoke("start_agent_session", {
+        provider: activeProvider,
         projectId: selectedProjectId,
         task: task.trim(),
       });
@@ -701,8 +737,9 @@ function AgentSessionsView({
       </header>
       <div className="empty-sessions-state">
         <h2>{loading ? "Loading agent sessions…" : "No agent sessions yet"}</h2>
-        <p>{loadError || "Start a Copilot CLI session here to create a locally managed conversation."}</p>
+        <p>{loadError || "Start an agent session here to create a locally managed conversation."}</p>
         {!loading && projects.length > 0 && <form className="session-launch-card" onSubmit={startSession}>
+          {providerPicker}
           {projectId ? <div className="session-project-context"><span>PROJECT</span><strong>{projects.find((project) => project.id === projectId)?.name ?? "Selected project"}</strong></div> : <>
             <label className="field-label" htmlFor="session-project">PROJECT</label>
             <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)}>
@@ -710,8 +747,8 @@ function AgentSessionsView({
             </select>
           </>}
           <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
-          <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
-          <button className="primary-button" type="submit" disabled={starting || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
+          <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder={`Describe what ${activeProviderLabel} should work on`} rows={3} />
+          <button className="primary-button" type="submit" disabled={starting || !activeProvider || !task.trim()}>{starting ? `Starting ${activeProviderLabel}…` : `Start ${activeProviderLabel} session`} <span>↗</span></button>
         </form>}
       </div>
     </div>;
@@ -727,12 +764,13 @@ function AgentSessionsView({
         </div>
         <div className="session-header-actions">
           <span className="connection-pill"><span /> Supervisor online</span>
-          <button className="primary-button" onClick={() => setLauncherOpen((open) => !open)}>Start Copilot session <span>↗</span></button>
+          <button className="primary-button" onClick={() => setLauncherOpen((open) => !open)}>Start agent session <span>↗</span></button>
           <button className="secondary-button" onClick={() => setArchivedView(!archivedView)}>{archivedView ? "Active sessions" : "Archived sessions"}</button>
           <button className="secondary-button" onClick={() => void refreshSessions()} disabled={refreshing}><span className="refresh-glyph">↻</span> {refreshing ? "Refreshing…" : "Refresh"}</button>
         </div>
       </header>
       {launcherOpen && <form className="session-launch-card" onSubmit={startSession}>
+        {providerPicker}
         {projectId ? <div className="session-project-context"><span>PROJECT</span><strong>{projects.find((project) => project.id === projectId)?.name ?? "Selected project"}</strong></div> : <>
           <label className="field-label" htmlFor="session-project">PROJECT</label>
           <select id="session-project" className="settings-input" value={selectedProjectId} onChange={(event) => setSelectedProjectId(event.currentTarget.value)} disabled={projects.length === 0}>
@@ -740,8 +778,8 @@ function AgentSessionsView({
           </select>
         </>}
         <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
-        <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder="Describe what Copilot should work on" rows={3} />
-        <button className="primary-button" type="submit" disabled={starting || projects.length === 0 || !task.trim()}>{starting ? "Starting Copilot…" : "Start Copilot session"} <span>↗</span></button>
+        <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder={`Describe what ${activeProviderLabel} should work on`} rows={3} />
+        <button className="primary-button" type="submit" disabled={starting || !activeProvider || projects.length === 0 || !task.trim()}>{starting ? `Starting ${activeProviderLabel}…` : `Start ${activeProviderLabel} session`} <span>↗</span></button>
       </form>}
       {loadError && <p className="session-error" role="alert">{loadError}</p>}
 
@@ -790,7 +828,7 @@ function AgentSessionsView({
             <div className="detail-actions">
               <button className="secondary-button" onClick={beginRenameSession} disabled={savingSessionName}>Rename</button>
               <button className="secondary-button archive-button" onClick={() => void updateArchiveState()} disabled={resuming}>{archivedView ? "Unarchive session" : "Archive session"}</button>
-              {selectedSession.managed && selectedSession.provider === "copilot" && ["completed", "failed", "orphaned"].includes(selectedSession.status) && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
+              {selectedSession.managed && ["copilot", "claudeCode"].includes(selectedSession.provider) && ["completed", "failed", "orphaned"].includes(selectedSession.status) && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
             </div>
           </div>
           {renamingSession && <form className="session-rename-form" onSubmit={renameSession}>
@@ -817,10 +855,10 @@ function AgentSessionsView({
           </div>
 
           <div className="control-panel">
-            <div className="control-panel-heading"><div><h3>Chat with Copilot</h3><span>Messages and responses are saved in Agent Control Plane.</span></div><span className={`managed-state ${selectedSession.managed ? "managed" : ""}`}><span /> {selectedSession.managed ? "App managed" : "Read only"}</span></div>
-            {permissionRequest && <div className="permission-request" role="group" aria-label="Copilot permission request">
+            <div className="control-panel-heading"><div><h3>Chat with {selectedSessionProviderName}</h3><span>Messages and responses are saved in Agent Control Plane.</span></div><span className={`managed-state ${selectedSession.managed ? "managed" : ""}`}><span /> {selectedSession.managed ? "App managed" : "Read only"}</span></div>
+            {permissionRequest && <div className="permission-request" role="group" aria-label={`${selectedSessionProviderName} permission request`}>
               <strong>{permissionRequest.title}</strong>
-              <span>Choose an option to let Copilot continue.</span>
+              <span>Choose an option to let {selectedSessionProviderName} continue.</span>
               <div>{permissionRequest.options.map((option) => <button key={option.optionId} className="secondary-button" onClick={() => void respondToPermission(option.optionId)}>{option.name}</button>)}
                 <button className="danger-button" onClick={() => void respondToPermission(null)}>Cancel request</button>
               </div>
@@ -830,8 +868,8 @@ function AgentSessionsView({
                 value={messageDraft}
                 onChange={(event) => setMessageDraft(event.currentTarget.value)}
                 disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting"}
-                placeholder={selectedSession.managed ? selectedSession.status === "waiting" ? "Reply to Copilot…" : "Message Copilot…" : "This session is read only"}
-                aria-label="Message Copilot"
+                placeholder={selectedSession.managed ? selectedSession.status === "waiting" ? `Reply to ${selectedSessionProviderName}…` : `Message ${selectedSessionProviderName}…` : "This session is read only"}
+                aria-label={`Message ${selectedSessionProviderName}`}
               />
               <button
                 className="primary-button"
@@ -1441,11 +1479,13 @@ function ProjectsView({
 
 function ProjectWorkspaceView({
   project,
+  settings,
   transcriptFontSize,
   onProjectUpdated,
   onTaskOutcomesRefresh,
 }: {
   project: Project;
+  settings: Settings;
   transcriptFontSize: number;
   onProjectUpdated: (project: Project) => void;
   onTaskOutcomesRefresh: () => void;
@@ -1578,6 +1618,7 @@ function ProjectWorkspaceView({
       {activeSection === "sessions" ? (
         <div className="project-section-content">
           <AgentSessionsView
+            settings={settings}
             transcriptFontSize={transcriptFontSize}
             projectId={project.id}
             initialSessionId={sessionToOpen}
@@ -1998,7 +2039,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} transcriptFontSize={settings.transcriptFontSize} onProjectUpdated={updateProject} onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView settings={settings} transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} settings={settings} transcriptFontSize={settings.transcriptFontSize} onProjectUpdated={updateProject} onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
