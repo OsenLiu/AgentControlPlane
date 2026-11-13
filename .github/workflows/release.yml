@@ -72,7 +72,7 @@ jobs:
           const cargoLockPath = "src-tauri/Cargo.lock";
           const cargoLock = fs.readFileSync(cargoLockPath, "utf8");
           const updatedLock = cargoLock.replace(
-            /(\[\[package\]\]\nname = "agent-control-plane"\nversion = ")[^"]+(")/,
+            /(\[\[package\]\]\r?\nname = "agent-control-plane"\r?\nversion = ")[^"]+(")/,
             `$1${version}$2`,
           );
           if (updatedLock === cargoLock) {
