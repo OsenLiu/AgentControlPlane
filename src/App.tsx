@@ -116,6 +116,20 @@ type TranscriptMessage = {
   timestamp: string;
 };
 
+function stripTaskCompletionProtocol(content: string): string {
+  return content.replace(
+    /\n\n# Task completion protocol\nEnd your response with one fenced apt-status JSON block\.[\s\S]*$/,
+    "",
+  );
+}
+
+function getTranscriptDisplayContent(message: TranscriptMessage): string {
+  if (message.role === "assistant") {
+    return message.content.replace(/```apt-status\b[\s\S]*?```/gi, "").trim();
+  }
+  return stripTaskCompletionProtocol(message.content);
+}
+
 type PermissionRequest = {
   requestId: string;
   title: string;
@@ -512,6 +526,9 @@ function AgentSessionsView({
     const searchable = `${session.project} ${session.task} ${session.branch}`.toLowerCase();
     return matchesFilter && searchable.includes(query.toLowerCase());
   });
+  const visibleTranscript = transcript
+    .map((message) => ({ ...message, content: getTranscriptDisplayContent(message) }))
+    .filter((message) => message.role !== "assistant" || message.content.length > 0);
 
   useEffect(() => {
     void loadSessions(archivedView);
@@ -841,14 +858,14 @@ function AgentSessionsView({
 
           <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
           <div className="transcript" style={{ "--transcript-font-size": `${transcriptFontSize}px` } as CSSProperties}>
-            {transcript.length === 0 && <div className="transcript-line active-line"><time>{formatLocalTimestamp(selectedSession.elapsed)}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
-            {transcript.map((message, index) => (
-              <div className={`transcript-line ${index === transcript.length - 1 ? "active-line" : ""}`} key={`${message.timestamp}-${index}`}>
+            {visibleTranscript.length === 0 && <div className="transcript-line active-line"><time>{formatLocalTimestamp(selectedSession.elapsed)}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
+            {visibleTranscript.map((message, index) => (
+              <div className={`transcript-line ${index === visibleTranscript.length - 1 ? "active-line" : ""}`} key={`${message.timestamp}-${index}`}>
                 <time>{formatLocalTimestamp(message.timestamp)}</time>
                 <div>
                   <span className={`transcript-label ${message.role === "user" ? "user-label" : "agent-label"}`}>{message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase()}</span>
                   <p>{message.content}</p>
-                  {index === transcript.length - 1 && selectedSession.status === "running" && <span className="typing-indicator"><i /><i /><i /> Working</span>}
+                  {index === visibleTranscript.length - 1 && selectedSession.status === "running" && <span className="typing-indicator"><i /><i /><i /> Working</span>}
                 </div>
               </div>
             ))}
@@ -1174,7 +1191,7 @@ function TaskOutcomesView({
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all"
       || (filter === "review" ? isReadyForReview(session) : session.status === filter && !isReadyForReview(session));
-    const searchable = `${session.task} ${session.project} ${session.branch} ${session.provider} ${session.statusReason} ${session.lastEvent}`.toLowerCase();
+    const searchable = `${stripTaskCompletionProtocol(session.task)} ${session.project} ${session.branch} ${session.provider} ${session.statusReason} ${session.lastEvent}`.toLowerCase();
     return matchesFilter && searchable.includes(normalizedQuery);
   });
   const selectedSession = visibleSessions.find((session) => session.id === selectedId) ?? visibleSessions[0];
@@ -1266,7 +1283,7 @@ function TaskOutcomesView({
                   {session.status === "completed" ? "✓" : "!"}
                 </span>
                 <span className="task-outcome-copy">
-                  <strong>{session.task}</strong>
+                  <strong>{stripTaskCompletionProtocol(session.task)}</strong>
                   <span>{session.project} <i>·</i> {providerLabel(session.provider)}</span>
                   <span className="task-outcome-row-meta">
                     {isReadyForReview(session)
@@ -1301,7 +1318,7 @@ function TaskOutcomesView({
                   ? <span className="task-outcome-review-badge">Ready for review</span>
                   : <SessionStatusBadge status={selectedSession.status} />}
               </div>
-              <h3>{selectedSession.task}</h3>
+              <h3>{stripTaskCompletionProtocol(selectedSession.task)}</h3>
               <p className="task-outcome-detail-summary">
                 {selectedSession.statusReason || selectedSession.lastEvent || selectedSession.step || (selectedSession.status === "completed" ? "The session finished successfully." : "The session stopped before completing the task.")}
               </p>

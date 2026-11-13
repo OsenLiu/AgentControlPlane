@@ -770,7 +770,7 @@ describe("App", () => {
       {
         id: "completed-session",
         project: "demo",
-        task: "Update the docs",
+        task: "Hi hello, this is a test. \n\n# Task completion protocol\nEnd your response with one fenced apt-status JSON block. Use state `working` or `complete`.",
         branch: "docs/setup",
         provider: "copilot",
         status: "completed",
@@ -872,18 +872,21 @@ describe("App", () => {
     expect(await screen.findByRole("heading", { name: "Task history 3" })).toBeTruthy();
     const outcomesList = within(screen.getByRole("region", { name: "Completed and failed sessions" }));
     const filters = within(screen.getByRole("group", { name: "Filter task outcomes" }));
-    expect(outcomesList.getByRole("button", { name: /Update the docs/ })).toBeTruthy();
+    expect(outcomesList.getByRole("button", { name: /Hi hello, this is a test\./ })).toBeTruthy();
     expect(outcomesList.getByRole("button", { name: /Write release notes/ })).toBeTruthy();
     expect(outcomesList.getByRole("button", { name: /Build the app/ })).toBeTruthy();
+    fireEvent.click(outcomesList.getByRole("button", { name: /Hi hello, this is a test\./ }));
+    expect(screen.getByRole("heading", { level: 3, name: "Hi hello, this is a test." })).toBeTruthy();
+    expect(screen.queryByText(/Task completion protocol/)).toBeNull();
     expect(outcomesList.queryByRole("button", { name: /Already accepted task/ })).toBeNull();
     expect(outcomesList.queryByRole("button", { name: /Archived task/ })).toBeNull();
 
     fireEvent.click(filters.getByRole("button", { name: /^Ready for review/ }));
     expect(outcomesList.getByRole("button", { name: /Write release notes/ })).toBeTruthy();
-    expect(outcomesList.queryByRole("button", { name: /Update the docs/ })).toBeNull();
+    expect(outcomesList.queryByRole("button", { name: /Hi hello, this is a test\./ })).toBeNull();
     expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();
     fireEvent.click(filters.getByRole("button", { name: /^Completed/ }));
-    expect(outcomesList.getByRole("button", { name: /Update the docs/ })).toBeTruthy();
+    expect(outcomesList.getByRole("button", { name: /Hi hello, this is a test\./ })).toBeTruthy();
     expect(outcomesList.queryByRole("button", { name: /Write release notes/ })).toBeNull();
     expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();
     fireEvent.click(filters.getByRole("button", { name: /^Failed/ }));
@@ -1247,8 +1250,16 @@ describe("App", () => {
       archived: false,
     };
     const transcript = [
-      { role: "user", content: "What changed?", timestamp: "2026-11-09 11:21:00" },
-      { role: "assistant", content: "The session store is local.", timestamp: "2026-11-09 11:21:01" },
+      {
+        role: "user",
+        content: "What changed?\n\n# Task completion protocol\nEnd your response with one fenced apt-status JSON block. Use state `working` or `complete`.",
+        timestamp: "2026-11-09 11:21:00",
+      },
+      {
+        role: "assistant",
+        content: "The session store is local.\n\n```apt-status\n{\"state\":\"complete\",\"note\":\"Ready\",\"gatePassed\":true}\n```",
+        timestamp: "2026-11-09 11:21:01",
+      },
     ];
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_projects") return [];
@@ -1270,7 +1281,9 @@ describe("App", () => {
       sessionId: "managed-session",
       message: "What changed?",
     }));
+    expect(await screen.findByText("What changed?")).toBeTruthy();
     expect(await screen.findByText("The session store is local.")).toBeTruthy();
+    expect(screen.queryByText(/apt-status|gatePassed/)).toBeNull();
   });
 
   it("allows replying to a managed session waiting for user input", async () => {
