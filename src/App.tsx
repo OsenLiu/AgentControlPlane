@@ -1496,6 +1496,11 @@ function ProjectWorkspaceView({
   const [openingEditor, setOpeningEditor] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [openAutomationHelp, setOpenAutomationHelp] = useState<"looping" | "agentTasks" | null>(null);
+  const taskProviderSettings = {
+    copilotEnabled: settings.copilot.enabled,
+    claudeCodeEnabled: settings.claudeCode.enabled,
+    defaultProvider: settings.defaultProvider === "claudeCode" ? "claudeCode" as const : "copilot" as const,
+  };
 
   async function updateAutomation(looping: boolean, agentTaskCreation: boolean) {
     setSavingAutomation(true);
@@ -1629,6 +1634,7 @@ function ProjectWorkspaceView({
           {activeSection === "tasks" && (
             <ProjectTasksTab
               project={project}
+              providerSettings={taskProviderSettings}
               onTaskUpdated={onTaskOutcomesRefresh}
               onOpenSession={(sessionId) => {
                 setSessionToOpen(sessionId);

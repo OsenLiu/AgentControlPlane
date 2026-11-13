@@ -1206,16 +1206,37 @@ fn maybe_start_next_loop_task(
     let task_prompt = format!("{}\n\n{}", task.title, task.description)
         .trim()
         .to_owned();
-    if let Err(error) = start_copilot_session_blocking(
-        Some(project_id.clone()),
-        task_prompt,
-        None,
-        Some(task.id.clone()),
-        true,
-        database.clone(),
-        processes,
-        app.clone(),
-    ) {
+    let task_id = task.id.clone();
+    let start_result = match task.provider.as_str() {
+        "copilot" => start_copilot_session_blocking(
+            Some(project_id.clone()),
+            task_prompt,
+            None,
+            Some(task_id.clone()),
+            true,
+            database.clone(),
+            processes,
+            app.clone(),
+        )
+        .map(|_| ()),
+        "claudeCode" => ensure_agent_provider_enabled(&database, "claudeCode").and_then(|_| {
+            start_claude_code_session_blocking(
+                Some(project_id.clone()),
+                task_prompt,
+                None,
+                Some(task_id.clone()),
+                true,
+                database.clone(),
+                processes,
+                app.clone(),
+            )
+            .map(|_| ())
+        }),
+        provider => Err(format!(
+            "Unsupported agent provider on project task: {provider}"
+        )),
+    };
+    if let Err(error) = start_result {
         let reset_result = database
             .0
             .lock()
@@ -1226,7 +1247,7 @@ fn maybe_start_next_loop_task(
                         "UPDATE project_tasks SET status = 'backlog', session_id = NULL,
                          updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND project_id = ?2
                            AND status = 'in_progress'",
-                        params![task.id, project_id],
+                        params![task_id, project_id],
                     )
                     .map(|_| ())
                     .map_err(|reset_error| format!("Unable to reset the loop task: {reset_error}"))
@@ -2162,6 +2183,7 @@ async fn start_agent_session(
     project_id: Option<String>,
     task: String,
     resume_session_id: Option<String>,
+    task_id: Option<String>,
     database: State<'_, Database>,
     processes: State<'_, SessionProcesses>,
     app: tauri::AppHandle,
@@ -2169,25 +2191,8 @@ async fn start_agent_session(
     let database = Database(database.0.clone());
     let processes = SessionProcesses(processes.0.clone());
     run_agent_operation(move || {
-        let settings_provider = match provider.as_str() {
-            "copilot" => "copilot",
-            "claudeCode" => "claude_code",
-            _ => return Err(format!("Unsupported agent provider: {provider}")),
-        };
         if resume_session_id.is_none() {
-            let settings = {
-                let connection = database
-                    .0
-                    .lock()
-                    .map_err(|_| "Agent session database is unavailable.".to_owned())?;
-                read_tool_settings(&connection, settings_provider)?
-            };
-            if !settings.enabled {
-                return Err(format!(
-                    "{} is disabled. Enable it in Settings before starting a session.",
-                    provider_label(&provider)
-                ));
-            }
+            ensure_agent_provider_enabled(&database, &provider)?;
         }
 
         match provider.as_str() {
@@ -2195,7 +2200,7 @@ async fn start_agent_session(
                 project_id,
                 task,
                 resume_session_id,
-                None,
+                task_id,
                 false,
                 database,
                 processes,
@@ -2205,6 +2210,8 @@ async fn start_agent_session(
                 project_id,
                 task,
                 resume_session_id,
+                task_id,
+                false,
                 database,
                 processes,
                 app,
@@ -2220,6 +2227,29 @@ fn provider_label(provider: &str) -> &'static str {
         "copilot" => "GitHub Copilot CLI",
         "claudeCode" => "Claude Code CLI",
         _ => "Agent CLI",
+    }
+}
+
+fn ensure_agent_provider_enabled(database: &Database, provider: &str) -> Result<(), String> {
+    let settings_provider = match provider {
+        "copilot" => "copilot",
+        "claudeCode" => "claude_code",
+        _ => return Err(format!("Unsupported agent provider: {provider}")),
+    };
+    let enabled = {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+        read_tool_settings(&connection, settings_provider)?.enabled
+    };
+    if enabled {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} is disabled. Enable it in Settings before starting a session.",
+            provider_label(provider)
+        ))
     }
 }
 
@@ -2650,6 +2680,8 @@ fn start_claude_code_session_blocking(
     project_id: Option<String>,
     task: String,
     resume_session_id: Option<String>,
+    task_id: Option<String>,
+    loop_owned: bool,
     database: Database,
     processes: SessionProcesses,
     app: tauri::AppHandle,
@@ -2755,28 +2787,81 @@ fn start_claude_code_session_blocking(
             )
             .map_err(|error| format!("Unable to find project for Claude Code session: {error}"))?
     };
+    let (permission_mode, model) = if let Some(task_id) = task_id.as_deref() {
+        let connection = database
+            .0
+            .lock()
+            .map_err(|_| "Project database is unavailable.".to_owned())?;
+        let (provider, mode, model): (String, String, String) = connection
+            .query_row(
+                "SELECT provider, mode, model FROM project_tasks
+                 WHERE id = ?1 AND project_id = ?2",
+                params![task_id, project_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| format!("Unable to read project task settings: {error}"))?;
+        if provider != "claudeCode" {
+            return Err("The task is assigned to a different agent.".to_owned());
+        }
+        (mode, model)
+    } else {
+        ("plan".to_owned(), "auto".to_owned())
+    };
     if allow_agent_tasks {
         task.push_str(
             "\n\n# Agent-proposed backlog tasks\nThis project allows you to propose separate follow-up work. When useful, add a fenced `apt-task` JSON block with a short `title`, a `purpose`, and optional `acceptanceCriteria` string array. Example:\n```apt-task\n{\"title\":\"Add example\",\"purpose\":\"Describe the follow-up work\",\"acceptanceCriteria\":[\"A verifiable outcome\"]}\n```\nProposed tasks are added to the backlog and do not interrupt this session. Do not propose work that is part of the task you were asked to complete.",
         );
     }
+    if task_id.is_some() {
+        task.push_str(
+            "\n\n# Task completion protocol\nEnd your response with one fenced apt-status JSON block. Use state `working` with a brief note when unfinished, `question` when you need a human decision, `blocked` when you cannot proceed, or `complete` when the task is done. A `complete` report must include `gatePassed: true` and a brief `gateSummary` only after all available relevant checks pass. Example: ```apt-status\n{\"state\":\"complete\",\"note\":\"Implemented and verified the task\",\"gatePassed\":true,\"gateSummary\":\"Tests passed\"}\n``` Do not report complete when checks fail or were not run.",
+        );
+    }
 
     let session_id = claude_session_id();
     {
-        let connection = database
+        let mut connection = database
             .0
             .lock()
             .map_err(|_| "Agent session database is unavailable.".to_owned())?;
-        connection
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("Unable to start session transaction: {error}"))?;
+        transaction
             .execute(
                 "INSERT INTO agent_sessions
                  (id, project_id, provider, task, branch, status, status_reason,
                   current_step, permission_mode, origin, loop_owned, last_event)
                  VALUES (?1, ?2, 'claudeCode', ?3, ?4, 'starting', '',
-                         'Starting Claude Code session', 'plan', 'managed', 0, '')",
-                params![session_id, project_id, task, branch],
+                         'Starting Claude Code session', ?5, 'managed', ?6, '')",
+                params![
+                    session_id,
+                    project_id,
+                    task,
+                    branch,
+                    permission_mode,
+                    loop_owned
+                ],
             )
             .map_err(|error| format!("Unable to persist Claude Code session: {error}"))?;
+        if let Some(task_id) = task_id.as_deref() {
+            let changed = transaction
+                .execute(
+                    "UPDATE project_tasks SET status = 'in_progress', session_id = ?1,
+                     updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?2 AND project_id = ?3 AND provider = 'claudeCode' AND
+                      ((status = 'backlog' AND ?4 = 0) OR
+                       (status = 'in_progress' AND session_id IS NULL AND ?4 = 1))",
+                    params![session_id, task_id, project_id, loop_owned],
+                )
+                .map_err(|error| format!("Unable to link task to Claude Code session: {error}"))?;
+            if changed != 1 {
+                return Err("The task is no longer available to start.".to_owned());
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("Unable to save Claude Code task session: {error}"))?;
     }
 
     let processes_ref = processes.0.clone();
@@ -2787,7 +2872,8 @@ fn start_claude_code_session_blocking(
         &session_id,
         &project_path,
         None,
-        "plan",
+        &permission_mode,
+        (model != "auto").then_some(model.as_str()),
         &task,
         true,
     );
@@ -2799,6 +2885,8 @@ fn start_claude_code_session_blocking(
             "Unable to start Claude Code",
             &error,
         );
+        reset_task_after_start_failure(&database, task_id.as_deref())
+            .map_err(|cleanup_error| format!("{error}; additionally, {cleanup_error}"))?;
         return Err(error);
     }
     app.emit("agent-session-updated", &session_id)
@@ -2821,6 +2909,7 @@ fn start_claude_turn(
     project_path: &str,
     external_session_id: Option<&str>,
     permission_mode: &str,
+    model: Option<&str>,
     prompt: &str,
     is_initial_prompt: bool,
 ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
@@ -2883,6 +2972,9 @@ fn start_claude_turn(
         .arg(cli_permission_mode);
     if let Some(external_session_id) = external_session_id {
         command.arg("--resume").arg(external_session_id);
+    }
+    if let Some(model) = model.filter(|model| *model != "auto") {
+        command.arg("--model").arg(model);
     }
     let mut child = match command
         .arg(prompt)
@@ -3136,14 +3228,15 @@ fn send_claude_message(
     processes: &SessionProcesses,
 ) -> Result<(), String> {
     check_claude_cli()?;
-    let (project_path, external_id, permission_mode) = {
+    let (project_path, external_id, permission_mode, model) = {
         let connection = database
             .0
             .lock()
             .map_err(|_| "Agent session database is unavailable.".to_owned())?;
         connection
             .query_row(
-                "SELECT p.path, s.external_session_id, s.permission_mode
+                "SELECT p.path, s.external_session_id, s.permission_mode,
+                        COALESCE((SELECT t.model FROM project_tasks t WHERE t.session_id = s.id), 'auto')
                  FROM agent_sessions s
                  JOIN projects p ON p.id = s.project_id
                  WHERE s.id = ?1 AND s.provider = 'claudeCode' AND s.origin = 'managed'",
@@ -3153,6 +3246,7 @@ fn send_claude_message(
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -3170,6 +3264,7 @@ fn send_claude_message(
         &project_path,
         Some(&external_id),
         &permission_mode,
+        (model != "auto").then_some(model.as_str()),
         message,
         false,
     )?;

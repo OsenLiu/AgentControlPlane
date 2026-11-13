@@ -446,6 +446,23 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .task-dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
 .task-dialog-header h2 { color: #e2e9f6; font-size: 16px; }
 .task-dialog > form { display: grid; gap: 15px; }
+.task-agent-picker { min-width: 0; margin: 0; padding: 0; border: 0; }
+.task-agent-picker legend { margin-bottom: 8px; color: #aab6cd; font-size: 11px; font-weight: 600; }
+.task-agent-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+.task-agent-option { position: relative; display: grid; grid-template-columns: 18px 30px minmax(0, 1fr); align-items: center; gap: 9px; min-height: 67px; padding: 10px; border: 1px solid #34415d; border-radius: 7px; color: #aab6cd; background: #0c1423; cursor: pointer; transition: border-color .15s ease, background .15s ease, box-shadow .15s ease; }
+.task-agent-option:hover { border-color: #59698a; }
+.task-agent-option.selected { border-color: #8b7ce0; background: #211e3b; box-shadow: inset 0 0 0 1px #8b7ce044; }
+.task-agent-option:focus-within { outline: 2px solid #a99bff; outline-offset: 2px; }
+.task-agent-option input { width: 15px; height: 15px; margin: 0; accent-color: #9685ff; }
+.task-agent-mark { display: grid; place-items: center; width: 30px; height: 30px; border-radius: 7px; color: #d8d1ff; background: #463a91; font-size: 10px; font-weight: 700; }
+.task-agent-mark.claudeCode { color: #ffd9bf; background: #76503a; }
+.task-agent-copy { display: grid; gap: 4px; min-width: 0; }
+.task-agent-copy strong { color: #e2e9f6; font-size: 10px; font-weight: 600; }
+.task-agent-copy small { color: #7583a1; font-size: 9px; }
+.task-agent-default { position: absolute; top: 5px; right: 7px; color: #a99bff; font-size: 8px; }
+.task-agent-availability { grid-column: 2 / -1; color: #e2b87d; font-size: 8px; }
+.task-agent-availability.enabled { color: #58d7a1; }
+.task-agent-help { margin: 8px 0 0; color: #8491aa; font-size: 9px; line-height: 1.5; }
 .task-dialog-field { display: grid; gap: 7px; color: #aab6cd; font-size: 11px; font-weight: 600; }
 .task-dialog-field input, .task-dialog-field textarea, .task-dialog-setting select, .task-dialog-setting > input:not([type="checkbox"]) { width: 100%; min-height: 40px; padding: 9px 10px; border: 1px solid #34415d; border-radius: 5px; outline: none; color: #e1e8f6; color-scheme: dark; background: #0c1423; font: inherit; font-size: 11px; }
 .task-dialog-setting select option { color: #e1e8f6; background-color: #0c1423; }
@@ -478,6 +495,7 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 }
 @media (max-width: 620px) {
   .project-feature-header { flex-direction: column; }
+  .task-agent-options { grid-template-columns: 1fr; }
   .project-task-form { grid-template-columns: 1fr; }
   .project-task-form > button { grid-column: 1; justify-self: stretch; }
   .project-task-card { flex-direction: column; }

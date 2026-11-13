@@ -11,11 +11,20 @@ type ProjectReference = {
   name: string;
 };
 
+type AgentProvider = "copilot" | "claudeCode";
+
+type AgentProviderSettings = {
+  copilotEnabled: boolean;
+  claudeCodeEnabled: boolean;
+  defaultProvider: AgentProvider;
+};
+
 type ProjectTask = {
   id: string;
   projectId: string;
   title: string;
   description: string;
+  provider: AgentProvider;
   mode: "acceptEdits" | "auto";
   model: string;
   stepBudget: number;
@@ -92,6 +101,9 @@ const COPILOT_MODEL_GROUPS = [
 
 const COPILOT_MODEL_IDS = new Set<string>(
   COPILOT_MODEL_GROUPS.flatMap(({ models }) => models.map(({ id }) => id)),
+);
+const ANTHROPIC_MODEL_IDS = new Set<string>(
+  COPILOT_MODEL_GROUPS.find(({ provider }) => provider === "Anthropic")?.models.map(({ id }) => id) ?? [],
 );
 
 type ProjectDiff = {
@@ -238,10 +250,12 @@ function Feedback({ error }: { error: string }) {
 
 export function ProjectTasksTab({
   project,
+  providerSettings,
   onOpenSession,
   onTaskUpdated,
 }: {
   project: ProjectReference;
+  providerSettings: AgentProviderSettings;
   onOpenSession: (sessionId: string) => void;
   onTaskUpdated?: () => void;
 }) {
@@ -377,7 +391,8 @@ export function ProjectTasksTab({
     setStartingTaskId(task.id);
     setError("");
     try {
-      await invoke<{ id: string }>("start_copilot_session", {
+      await invoke<{ id: string }>("start_agent_session", {
+        provider: task.provider,
         projectId: project.id,
         task: `${task.title}\n\n${task.description}`.trim(),
         taskId: task.id,
@@ -500,6 +515,7 @@ export function ProjectTasksTab({
         {selectedTask ? (
             <ProjectTaskDetail
               task={selectedTask}
+              providerSettings={providerSettings}
               confirmDelete={confirmDeleteId === selectedTask.id}
               starting={startingTaskId === selectedTask.id}
               onEdit={() => setTaskDialog(selectedTask)}
@@ -523,6 +539,7 @@ export function ProjectTasksTab({
       {taskDialog && (
         <ProjectTaskDialog
           initial={taskDialog === "new" ? null : taskDialog}
+          providerSettings={providerSettings}
           error={error}
           saving={saving}
           onClose={() => {
@@ -539,6 +556,7 @@ export function ProjectTasksTab({
 type ProjectTaskInput = {
   title: string;
   description: string;
+  provider: AgentProvider;
   mode: ProjectTask["mode"];
   model: string;
   stepBudget: number;
@@ -656,12 +674,14 @@ function TaskSettingHelp({ label, text }: { label: string; text: string }) {
 
 function ProjectTaskDialog({
   initial,
+  providerSettings,
   error,
   saving,
   onClose,
   onSave,
 }: {
   initial: ProjectTask | null;
+  providerSettings: AgentProviderSettings;
   error: string;
   saving: boolean;
   onClose: () => void;
@@ -670,13 +690,21 @@ function ProjectTaskDialog({
   const dialogRef = useRef<HTMLElement>(null);
   const [title, setTitle] = useState(initial?.title ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
+  const [provider, setProvider] = useState<AgentProvider>(initial?.provider ?? providerSettings.defaultProvider);
   const [mode, setMode] = useState<ProjectTask["mode"]>(initial?.mode ?? "acceptEdits");
   const initialModel = initial?.model ?? "auto";
+  const initialModelChoice = initialModel === "auto"
+    ? "auto"
+    : provider === "claudeCode" && !ANTHROPIC_MODEL_IDS.has(initialModel) && /^(gpt-|gemini-|mai-|grok-|kimi-)/i.test(initialModel)
+      ? "auto"
+      : COPILOT_MODEL_IDS.has(initialModel) || initialModel.startsWith("claude-")
+        ? initialModel
+        : "custom";
   const [modelChoice, setModelChoice] = useState(
-    initialModel === "auto" || COPILOT_MODEL_IDS.has(initialModel) ? initialModel : "custom",
+    initialModelChoice,
   );
   const [customModel, setCustomModel] = useState(
-    initialModel !== "auto" && !COPILOT_MODEL_IDS.has(initialModel) ? initialModel : "",
+    initialModelChoice === "custom" ? initialModel : "",
   );
   const [stepBudget, setStepBudget] = useState(initial?.stepBudget ?? 30);
   const [autoApprove, setAutoApprove] = useState(initial?.autoApprove ?? false);
@@ -690,6 +718,9 @@ function ProjectTaskDialog({
   }, [onClose, saving]);
 
   const model = modelChoice === "custom" ? customModel.trim() : modelChoice;
+  const modelGroups = provider === "claudeCode"
+    ? COPILOT_MODEL_GROUPS.filter(({ provider: group }) => group === "Anthropic")
+    : COPILOT_MODEL_GROUPS;
   const valid = title.trim().length > 0 &&
     description.trim().length > 0 &&
     model.length > 0 &&
@@ -699,7 +730,20 @@ function ProjectTaskDialog({
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (valid) onSave({ title, description, mode, model, stepBudget, autoApprove });
+    if (valid) onSave({ title, description, provider, mode, model, stepBudget, autoApprove });
+  }
+
+  function chooseProvider(nextProvider: AgentProvider) {
+    setProvider(nextProvider);
+    if (
+      nextProvider === "claudeCode" &&
+      modelChoice !== "auto" &&
+      modelChoice !== "custom" &&
+      !ANTHROPIC_MODEL_IDS.has(modelChoice)
+    ) {
+      setModelChoice("auto");
+      setCustomModel("");
+    }
   }
 
   return (
@@ -737,6 +781,50 @@ function ProjectTaskDialog({
           <button className="project-feature-quiet" type="button" disabled={saving} onClick={onClose}>Close</button>
         </header>
         <form onSubmit={submit}>
+          <fieldset className="task-agent-picker">
+            <legend>Agent</legend>
+            <div className="task-agent-options">
+              {([
+                { id: "copilot", title: "GitHub Copilot", subtitle: "Copilot CLI", enabled: providerSettings.copilotEnabled },
+                { id: "claudeCode", title: "Claude Code", subtitle: "Claude Code CLI", enabled: providerSettings.claudeCodeEnabled },
+              ] as const).map((agent) => (
+                <label
+                  className={`task-agent-option ${provider === agent.id ? "selected" : ""}`}
+                  key={agent.id}
+                >
+                  <input
+                    type="radio"
+                    name="project-task-provider"
+                    value={agent.id}
+                    checked={provider === agent.id}
+                    onChange={() => chooseProvider(agent.id)}
+                  />
+                  <span className={`task-agent-mark ${agent.id}`} aria-hidden="true">
+                    {agent.id === "copilot" ? "Co" : "Cl"}
+                  </span>
+                  <span className="task-agent-copy">
+                    <strong>{agent.title}</strong>
+                    <small>{agent.subtitle}</small>
+                  </span>
+                  {agent.id === providerSettings.defaultProvider && (
+                    <span className="task-agent-default">Default</span>
+                  )}
+                  <span className={`task-agent-availability ${agent.enabled ? "enabled" : ""}`}>
+                    {agent.enabled ? "Enabled" : "Not enabled"}
+                  </span>
+                </label>
+              ))}
+            </div>
+            <p className="task-agent-help" role="note">
+              {provider === "copilot"
+                ? providerSettings.copilotEnabled
+                  ? "This task will use GitHub Copilot CLI. You can change the agent later; running sessions stay unchanged."
+                  : "This task is saved for GitHub Copilot CLI. Enable it in Settings → Integrations before starting the task."
+                : providerSettings.claudeCodeEnabled
+                  ? "This task will use Claude Code CLI. You can change the agent later; running sessions stay unchanged."
+                  : "This task is saved for Claude Code CLI. Enable it in Settings → Integrations before starting the task."}
+            </p>
+          </fieldset>
           <label className="task-dialog-field">
             <span>Task title</span>
             <input
@@ -774,12 +862,14 @@ function ProjectTaskDialog({
             <label htmlFor="project-task-model">Model</label>
             <TaskSettingHelp
               label="Model"
-              text="The model choices follow GitHub Copilot's supported-model catalog. Availability depends on your Copilot plan and the model support in your Copilot CLI/ACP version. Auto uses the CLI default; enter a custom model ID if needed."
+              text={provider === "claudeCode"
+                ? "Choose Auto to use Claude Code's configured default, or select a Claude model. Availability depends on your Claude Code plan."
+                : "The model choices follow GitHub Copilot's supported-model catalog. Availability depends on your Copilot plan and the model support in your Copilot CLI/ACP version. Auto uses the CLI default; enter a custom model ID if needed."}
             />
             <select id="project-task-model" value={modelChoice} onChange={(event) => setModelChoice(event.target.value)}>
               <option value="auto">Auto (default)</option>
-              {COPILOT_MODEL_GROUPS.map(({ provider, models }) => (
-                <optgroup key={provider} label={provider}>
+              {modelGroups.map(({ provider: groupProvider, models }) => (
+                <optgroup key={groupProvider} label={groupProvider}>
                   {models.map(({ id, label }) => <option key={id} value={id}>{label}</option>)}
                 </optgroup>
               ))}
@@ -792,8 +882,8 @@ function ProjectTaskDialog({
                 maxLength={120}
                 value={customModel}
                 onChange={(event) => setCustomModel(event.target.value)}
-                placeholder="Copilot model ID"
-                aria-label="Custom Copilot model ID"
+                placeholder={provider === "claudeCode" ? "Claude model ID" : "Copilot model ID"}
+                aria-label={`Custom ${provider === "claudeCode" ? "Claude Code" : "Copilot"} model ID`}
               />
             )}
           </div>
@@ -817,7 +907,7 @@ function ProjectTaskDialog({
             <label htmlFor="project-task-auto-approve">Auto-approve</label>
             <TaskSettingHelp
               label="Auto-approve"
-              text="Automatically mark this task done when Copilot reports completion and the required quality gate passes. This does not auto-approve tool permission requests."
+              text="Automatically mark this task done when its agent reports completion and the required quality gate passes. This does not change the task's tool permission mode."
             />
             <input
               id="project-task-auto-approve"
@@ -841,6 +931,7 @@ function ProjectTaskDialog({
 
 function ProjectTaskDetail({
   task,
+  providerSettings,
   confirmDelete,
   starting,
   onEdit,
@@ -854,6 +945,7 @@ function ProjectTaskDetail({
   onCancelDelete,
 }: {
   task: ProjectTask;
+  providerSettings: AgentProviderSettings;
   confirmDelete: boolean;
   starting: boolean;
   onEdit: () => void;
@@ -937,6 +1029,17 @@ function ProjectTaskDetail({
         </header>
         <div className="project-task-settings-grid">
           <div className="project-task-setting">
+            <span className="project-task-setting-label">Agent</span>
+            <strong className="project-task-setting-value">
+              {task.provider === "copilot" ? "GitHub Copilot CLI" : "Claude Code CLI"}
+            </strong>
+            <span className="project-task-setting-detail">
+              {task.provider === "copilot"
+                ? providerSettings.copilotEnabled ? "Enabled in Integrations." : "Enable in Integrations before starting."
+                : providerSettings.claudeCodeEnabled ? "Enabled in Integrations." : "Enable in Integrations before starting."}
+            </span>
+          </div>
+          <div className="project-task-setting">
             <span className="project-task-setting-label">Permission mode</span>
             <strong className="project-task-setting-value">{task.mode === "acceptEdits" ? "Accept edits" : "Auto"}</strong>
             <span className="project-task-setting-detail">
@@ -949,7 +1052,9 @@ function ProjectTaskDetail({
             <span className="project-task-setting-label">Model</span>
             <strong className="project-task-setting-value">{task.model === "auto" ? "Automatic" : task.model}</strong>
             <span className="project-task-setting-detail">
-              {task.model === "auto" ? "Uses the Copilot CLI default." : "Selected Copilot model."}
+              {task.model === "auto"
+                ? `Uses the ${task.provider === "copilot" ? "Copilot" : "Claude Code"} CLI default.`
+                : `Selected ${task.provider === "copilot" ? "Copilot" : "Claude Code"} model.`}
             </span>
           </div>
           <div className="project-task-setting">
@@ -997,7 +1102,7 @@ function ProjectTaskDetail({
                 ? "This task is complete. Reopen it if more work is needed."
                 : task.status === "in_progress"
                   ? "A session has been started for this task."
-                  : "Start a Copilot session now, or keep this task in your project backlog."}
+                  : `Start a ${task.provider === "copilot" ? "GitHub Copilot" : "Claude Code"} session now, or keep this task in your project backlog.`}
           </p>
         </div>
         {!task.archived && (

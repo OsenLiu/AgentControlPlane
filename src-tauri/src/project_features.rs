@@ -37,6 +37,7 @@ pub(crate) struct ProjectTask {
     project_id: String,
     title: String,
     description: String,
+    provider: String,
     mode: String,
     model: String,
     step_budget: i64,
@@ -196,6 +197,7 @@ pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()>
            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
            title TEXT NOT NULL,
            description TEXT NOT NULL DEFAULT '',
+           provider TEXT NOT NULL DEFAULT 'copilot',
            mode TEXT NOT NULL DEFAULT 'acceptEdits',
            model TEXT NOT NULL DEFAULT 'auto',
            step_budget INTEGER NOT NULL DEFAULT 30,
@@ -212,6 +214,23 @@ pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()>
          CREATE INDEX IF NOT EXISTS idx_project_tasks_project
            ON project_tasks(project_id, updated_at DESC);",
         )
+        .and_then(|_| {
+            connection
+                .execute(
+                    "ALTER TABLE project_tasks ADD COLUMN provider TEXT NOT NULL DEFAULT 'copilot'",
+                    [],
+                )
+                .or_else(|error| {
+                    if error
+                        .to_string()
+                        .contains("duplicate column name: provider")
+                    {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                })
+        })
         .and_then(|_| {
             connection
                 .execute(
@@ -388,19 +407,20 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTask> {
         project_id: row.get(1)?,
         title: row.get(2)?,
         description: row.get(3)?,
-        mode: row.get(4)?,
-        model: row.get(5)?,
-        step_budget: row.get(6)?,
-        steps_used: row.get(7)?,
-        auto_approve: row.get::<_, i64>(8)? != 0,
-        status: row.get(9)?,
-        loop_enabled: row.get::<_, i64>(10)? != 0,
-        origin: row.get(11)?,
-        session_id: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
-        archived: row.get::<_, i64>(15)? != 0,
-        review_pending: row.get::<_, i64>(16)? != 0,
+        provider: row.get(4)?,
+        mode: row.get(5)?,
+        model: row.get(6)?,
+        step_budget: row.get(7)?,
+        steps_used: row.get(8)?,
+        auto_approve: row.get::<_, i64>(9)? != 0,
+        status: row.get(10)?,
+        loop_enabled: row.get::<_, i64>(11)? != 0,
+        origin: row.get(12)?,
+        session_id: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
+        archived: row.get::<_, i64>(16)? != 0,
+        review_pending: row.get::<_, i64>(17)? != 0,
     })
 }
 
@@ -408,7 +428,7 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
     ensure_project_exists(connection, project_id)?;
     let mut statement = connection
         .prepare(
-            "SELECT id, project_id, title, description, mode, model, step_budget, steps_used, auto_approve,
+            "SELECT id, project_id, title, description, provider, mode, model, step_budget, steps_used, auto_approve,
                     status, loop_enabled, origin, session_id, created_at, updated_at, archived,
                     CASE WHEN project_tasks.status = 'in_progress' AND EXISTS (
                       SELECT 1 FROM agent_sessions s
@@ -430,7 +450,7 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
 
 fn task_by_id(connection: &Connection, task_id: &str) -> rusqlite::Result<ProjectTask> {
     connection.query_row(
-        "SELECT id, project_id, title, description, mode, model, step_budget, steps_used, auto_approve,
+        "SELECT id, project_id, title, description, provider, mode, model, step_budget, steps_used, auto_approve,
                 status, loop_enabled, origin, session_id, created_at, updated_at, archived,
                 CASE WHEN project_tasks.status = 'in_progress' AND EXISTS (
                   SELECT 1 FROM agent_sessions s
@@ -493,6 +513,7 @@ pub(crate) fn create_project_task(
     project_id: String,
     title: String,
     description: String,
+    provider: String,
     mode: String,
     model: String,
     step_budget: i64,
@@ -510,6 +531,7 @@ pub(crate) fn create_project_task(
             "Task brief must be between 1 and {MAX_TASK_DESCRIPTION} characters."
         ));
     }
+    let provider = validate_task_provider(&provider)?;
     let mode = validate_task_mode(&mode)?;
     let model = validate_task_model(&model)?;
     validate_task_step_budget(step_budget)?;
@@ -521,13 +543,20 @@ pub(crate) fn create_project_task(
     ensure_project_exists(&connection, &project_id)?;
     connection
         .execute(
-            "INSERT INTO project_tasks (id, project_id, title, description, mode, model, step_budget, auto_approve)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![id, project_id, title, description.trim(), mode, model, step_budget, auto_approve],
+            "INSERT INTO project_tasks (id, project_id, title, description, provider, mode, model, step_budget, auto_approve)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, project_id, title, description.trim(), provider, mode, model, step_budget, auto_approve],
         )
         .map_err(|error| format!("Unable to create project task: {error}"))?;
     task_by_id(&connection, &id)
         .map_err(|error| format!("Unable to read the new project task: {error}"))
+}
+
+fn validate_task_provider(provider: &str) -> Result<&str, String> {
+    match provider {
+        "copilot" | "claudeCode" => Ok(provider),
+        _ => Err("Choose GitHub Copilot CLI or Claude Code CLI for this task.".to_owned()),
+    }
 }
 
 fn validate_task_mode(mode: &str) -> Result<&str, String> {
@@ -560,6 +589,7 @@ pub(crate) fn update_project_task(
     task_id: String,
     title: String,
     description: String,
+    provider: String,
     mode: String,
     model: String,
     step_budget: i64,
@@ -577,6 +607,7 @@ pub(crate) fn update_project_task(
             "Task brief must be between 1 and {MAX_TASK_DESCRIPTION} characters."
         ));
     }
+    let provider = validate_task_provider(&provider)?;
     let mode = validate_task_mode(&mode)?;
     let model = validate_task_model(&model)?;
     validate_task_step_budget(step_budget)?;
@@ -588,12 +619,13 @@ pub(crate) fn update_project_task(
     let changed = connection
         .execute(
             "UPDATE project_tasks
-             SET title = ?1, description = ?2, mode = ?3, model = ?4,
-                 step_budget = ?5, auto_approve = ?6, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?7 AND project_id = ?8",
+             SET title = ?1, description = ?2, provider = ?3, mode = ?4, model = ?5,
+                 step_budget = ?6, auto_approve = ?7, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?8 AND project_id = ?9",
             params![
                 title,
                 description.trim(),
+                provider,
                 mode,
                 model,
                 step_budget,
@@ -695,6 +727,7 @@ pub(crate) struct LoopTask {
     pub(crate) id: String,
     pub(crate) title: String,
     pub(crate) description: String,
+    pub(crate) provider: String,
 }
 
 pub(crate) fn take_next_loop_task(
@@ -742,7 +775,7 @@ pub(crate) fn take_next_loop_task(
     }
     let task = connection
         .query_row(
-            "SELECT id, title, description FROM project_tasks
+            "SELECT id, title, description, provider FROM project_tasks
              WHERE project_id = ?1 AND status = 'backlog' AND loop_enabled = 1 AND archived = 0
              ORDER BY created_at, id LIMIT 1",
             [project_id],
@@ -751,6 +784,7 @@ pub(crate) fn take_next_loop_task(
                     id: row.get(0)?,
                     title: row.get(1)?,
                     description: row.get(2)?,
+                    provider: row.get(3)?,
                 })
             },
         )
@@ -2346,6 +2380,7 @@ mod tests {
         initialize_schema(&connection).expect("task migration");
         let tasks = list_tasks(&connection, "project-1").expect("migrated tasks");
         assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].provider, "copilot");
         assert!(tasks[0].loop_enabled);
         assert_eq!(tasks[0].origin, "user");
     }
@@ -2378,7 +2413,8 @@ mod tests {
                 "INSERT INTO project_tasks (id, project_id, title) VALUES
                    ('task-a', 'project-1', 'First'),
                    ('task-b', 'project-1', 'Second');
-                 UPDATE project_tasks SET loop_enabled = 0 WHERE id = 'task-b';",
+                UPDATE project_tasks SET provider = 'claudeCode' WHERE id = 'task-a';
+                UPDATE project_tasks SET loop_enabled = 0 WHERE id = 'task-b';",
             )
             .expect("task rows");
         connection
@@ -2404,6 +2440,7 @@ mod tests {
             .expect("select task")
             .expect("eligible task");
         assert_eq!(first.id, "task-a");
+        assert_eq!(first.provider, "claudeCode");
         assert!(
             take_next_loop_task(&connection, "project-1")
                 .expect("active task prevents a second selection")

@@ -445,6 +445,7 @@ describe("App", () => {
       projectId: string;
       title: string;
       description: string;
+      provider: "copilot" | "claudeCode";
       mode: "acceptEdits" | "auto";
       model: string;
       stepBudget: number;
@@ -459,6 +460,12 @@ describe("App", () => {
       archived: boolean;
       reviewPending: boolean;
     } | null = null;
+    const bothProvidersEnabled = {
+      ...settings,
+      copilot: { enabled: true },
+      claudeCode: { enabled: true },
+      defaultProvider: "copilot" as const,
+    };
 
     invokeMock.mockImplementation(async (command, args) => {
       const payload = args as Record<string, string>;
@@ -469,7 +476,7 @@ describe("App", () => {
         project: "website",
         task: task.title,
         branch: "main",
-        provider: "copilot",
+        provider: task.provider,
         status: "running",
         step: "Working",
         elapsed: "2026-11-12 10:00:00",
@@ -483,7 +490,7 @@ describe("App", () => {
       }] : [];
       if (command === "get_pending_session_permission") return null;
       if (command === "get_session_transcript") return [];
-      if (command === "load_settings") return settings;
+      if (command === "load_settings") return bothProvidersEnabled;
       if (command === "list_project_tasks") return task ? [task] : [];
       if (command === "set_project_task_loop_enabled") {
         if (task) task = { ...task, loopEnabled: Boolean(payload.enabled) };
@@ -499,6 +506,7 @@ describe("App", () => {
           projectId: payload.projectId,
           title: payload.title,
           description: payload.description,
+          provider: payload.provider as "copilot" | "claudeCode",
           mode: payload.mode as "acceptEdits" | "auto",
           model: payload.model,
           stepBudget: Number(payload.stepBudget),
@@ -521,6 +529,7 @@ describe("App", () => {
             ...task,
             title: payload.title,
             description: payload.description,
+            provider: payload.provider as "copilot" | "claudeCode",
             mode: payload.mode as "acceptEdits" | "auto",
             model: payload.model,
             stepBudget: Number(payload.stepBudget),
@@ -529,7 +538,7 @@ describe("App", () => {
         }
         return task;
       }
-      if (command === "start_copilot_session") {
+      if (command === "start_agent_session") {
         if (task) task = { ...task, status: "in_progress", sessionId: "session-1" };
         return undefined;
       }
@@ -541,6 +550,7 @@ describe("App", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Open workspace" }));
 
     fireEvent.click(await screen.findByRole("button", { name: /New task/ }));
+    expect(screen.getByRole("radio", { name: /GitHub Copilot/ })).toHaveProperty("checked", true);
     const modeHelp = screen.getByRole("button", { name: "Mode help" });
     fireEvent.mouseEnter(modeHelp);
     const helpTooltip = screen.getByRole("tooltip");
@@ -570,6 +580,7 @@ describe("App", () => {
       projectId: "/work/website",
       title: "Ship onboarding flow",
       description: "Add the welcome screens.",
+      provider: "copilot",
       mode: "auto",
       model: "gpt-5.6-sol",
       stepBudget: 6,
@@ -577,6 +588,9 @@ describe("App", () => {
     });
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     expect(screen.getByRole("combobox", { name: "Model" })).toHaveProperty("value", "gpt-5.6-sol");
+    fireEvent.click(screen.getByRole("radio", { name: /Claude Code/ }));
+    expect(screen.getByRole("combobox", { name: "Model" })).toHaveProperty("value", "auto");
+    expect(screen.queryByRole("option", { name: "GPT-6.1 Terra" })).toBeNull();
     fireEvent.change(screen.getByLabelText("Brief"), { target: { value: "Add the welcome and sign-in screens." } });
     fireEvent.click(screen.getByRole("button", { name: "Save task" }));
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("update_project_task", {
@@ -584,8 +598,9 @@ describe("App", () => {
       taskId: "task-1",
       title: "Ship onboarding flow",
       description: "Add the welcome and sign-in screens.",
+      provider: "claudeCode",
       mode: "auto",
-      model: "gpt-5.6-sol",
+      model: "auto",
       stepBudget: 6,
       autoApprove: true,
     }));
@@ -628,7 +643,8 @@ describe("App", () => {
     await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("get_session_transcript", {
       sessionId: "session-1",
     }));
-    expect(invokeMock).toHaveBeenCalledWith("start_copilot_session", {
+    expect(invokeMock).toHaveBeenCalledWith("start_agent_session", {
+      provider: "claudeCode",
       projectId: "/work/website",
       task: "Ship onboarding flow\n\nAdd the welcome and sign-in screens.",
       taskId: "task-1",
@@ -709,6 +725,7 @@ describe("App", () => {
         projectId: "/work/demo",
         title: "Write release notes",
         description: "Summarize this release.",
+        provider: "copilot",
         mode: "acceptEdits",
         model: "auto",
         stepBudget: 10,
@@ -728,7 +745,18 @@ describe("App", () => {
       throw new Error(`Unexpected command: ${command}`);
     });
 
-    render(<ProjectTasksTab project={{ id: "/work/demo", name: "demo" }} onOpenSession={vi.fn()} onTaskUpdated={onTaskUpdated} />);
+    render(
+      <ProjectTasksTab
+        project={{ id: "/work/demo", name: "demo" }}
+        providerSettings={{
+          copilotEnabled: true,
+          claudeCodeEnabled: true,
+          defaultProvider: "copilot",
+        }}
+        onOpenSession={vi.fn()}
+        onTaskUpdated={onTaskUpdated}
+      />,
+    );
 
     expect(await screen.findByRole("heading", { name: "Ready for review" })).toBeTruthy();
     expect(screen.getByText(/Review the session, then mark the task done/)).toBeTruthy();
