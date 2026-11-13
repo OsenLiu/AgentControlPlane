@@ -1000,7 +1000,7 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("list_project_tasks", { projectId: "project-1" });
   });
 
-  it("shows pending permissions and failed sessions but excludes completed and orphaned sessions", async () => {
+  it.each(["waiting", "running"])("shows pending permissions for %s sessions and failures but excludes completed and orphaned sessions", async (status) => {
     const sessions = [
       {
         id: "waiting-session",
@@ -1008,7 +1008,7 @@ describe("App", () => {
         task: "Run the checks",
         branch: "feat/checks",
         provider: "copilot",
-        status: "waiting",
+        status,
         step: "Waiting for permission",
         elapsed: "2026-11-09 11:20:00",
         tokens: "0.0k",
@@ -1076,7 +1076,7 @@ describe("App", () => {
       if (command === "list_projects") return [];
       if (command === "load_settings") return settings;
       if (command === "get_pending_session_permission") {
-        return permissionPending ? {
+        return permissionPending && args && "sessionId" in args && args.sessionId === "waiting-session" ? {
           requestId: "permission-1",
           title: "Run npm test",
           options: [{ optionId: "allow-once", name: "Allow once", kind: "allow_once" }],

@@ -522,7 +522,10 @@ fn copilot_content_text(content: &Value) -> Option<String> {
     })
 }
 
-fn copilot_observation_from_line(line: &str) -> Result<Option<CopilotObservation>, String> {
+fn copilot_observation_from_line(
+    line: &str,
+    permission_pending: bool,
+) -> Result<Option<CopilotObservation>, String> {
     let message: Value = serde_json::from_str(line)
         .map_err(|error| format!("Copilot returned invalid ACP JSON: {error}"))?;
 
@@ -561,7 +564,7 @@ fn copilot_observation_from_line(line: &str) -> Result<Option<CopilotObservation
 
     let update = &message["params"]["update"];
     let update_type = update["sessionUpdate"].as_str().unwrap_or_default();
-    let observation = match update_type {
+    let mut observation = match update_type {
         "agent_message_chunk" => {
             copilot_content_text(&update["content"]).map(|text| CopilotObservation {
                 status: Some("running".to_owned()),
@@ -588,6 +591,13 @@ fn copilot_observation_from_line(line: &str) -> Result<Option<CopilotObservation
         }),
         _ => None,
     };
+
+    if permission_pending {
+        if let Some(observation) = observation.as_mut() {
+            observation.status = Some("waiting".to_owned());
+            observation.step = Some("Waiting for permission".to_owned());
+        }
+    }
 
     Ok(observation)
 }
@@ -2210,7 +2220,11 @@ fn spawn_copilot_acp(
                 continue;
             }
 
-            match copilot_observation_from_line(&line) {
+            let pending_permissions = reader_control.permission_requests.lock().ok();
+            let permission_pending = pending_permissions
+                .as_ref()
+                .is_some_and(|requests| !requests.is_empty());
+            match copilot_observation_from_line(&line, permission_pending) {
                 Ok(Some(observation)) => {
                     if message["params"]["update"]["sessionUpdate"].as_str()
                         == Some("agent_message_chunk")
@@ -4125,7 +4139,7 @@ mod tests {
     fn copilot_agent_message_is_mapped_to_running_observation() {
         let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Checking the repository"}}}}"#;
 
-        let observation = copilot_observation_from_line(line)
+        let observation = copilot_observation_from_line(line, false)
             .expect("valid ACP message")
             .expect("agent message observation");
 
@@ -4143,7 +4157,7 @@ mod tests {
     fn copilot_agent_message_array_content_is_mapped_to_running_observation() {
         let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":[{"type":"text","text":"Checking "},{"type":"text","text":"the repository"}]}}}"#;
 
-        let observation = copilot_observation_from_line(line)
+        let observation = copilot_observation_from_line(line, false)
             .expect("valid ACP message")
             .expect("agent message observation");
 
@@ -4157,12 +4171,41 @@ mod tests {
     fn copilot_permission_request_is_waiting_observation() {
         let line = r#"{"jsonrpc":"2.0","id":9,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"title":"Run tests"}}}"#;
 
-        let observation = copilot_observation_from_line(line)
+        let observation = copilot_observation_from_line(line, false)
             .expect("valid ACP message")
             .expect("permission observation");
 
         assert_eq!(observation.status.as_deref(), Some("waiting"));
         assert_eq!(observation.step.as_deref(), Some("Waiting for permission"));
+    }
+
+    #[test]
+    fn copilot_updates_preserve_pending_permission_attention() {
+        for update_type in ["tool_call", "tool_call_update", "agent_message_chunk", "user_message_chunk"] {
+            let line = serde_json::json!({
+                "method": "session/update",
+                "params": { "update": {
+                    "sessionUpdate": update_type,
+                    "title": "Run tests",
+                    "content": { "type": "text", "text": "Checking the repository" }
+                } }
+            }).to_string();
+            let observation = copilot_observation_from_line(&line, true)
+                .expect("valid update")
+                .expect("update observation");
+            assert_eq!(observation.status.as_deref(), Some("waiting"), "{update_type}");
+            assert_eq!(observation.step.as_deref(), Some("Waiting for permission"));
+
+            let resumed = copilot_observation_from_line(&line, false)
+                .expect("valid update")
+                .expect("resumed observation");
+            assert_eq!(resumed.status.as_deref(), Some("running"));
+        }
+
+        let error = copilot_observation_from_line(r#"{"error":{"message":"Tool failed"}}"#, true)
+            .expect("valid error")
+            .expect("error observation");
+        assert_eq!(error.status.as_deref(), Some("failed"));
     }
 
     #[test]
@@ -4234,7 +4277,7 @@ mod tests {
 
     #[test]
     fn malformed_copilot_output_is_an_error() {
-        assert!(copilot_observation_from_line("not-json").is_err());
+        assert!(copilot_observation_from_line("not-json", false).is_err());
     }
 
     #[test]

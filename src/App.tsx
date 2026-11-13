@@ -167,8 +167,7 @@ async function loadAttentionItemsFromBackend(sessions?: AgentSession[]): Promise
 }
 
 async function attentionItemsFromSessions(sessions: AgentSession[]): Promise<AttentionItem[]> {
-  const waitingSessions = sessions.filter((session) => session.status === "waiting");
-  const permissionResults = await Promise.all(waitingSessions.map(async (session) => [
+  const permissionResults = await Promise.all(sessions.map(async (session) => [
     session.id,
     await invoke<PermissionRequest | null>("get_pending_session_permission", { sessionId: session.id }),
   ] as const));
