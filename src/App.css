@@ -774,7 +774,8 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .task-outcome-detail h3 { margin-top: 17px; color: #e8ecf8; font-size: 16px; line-height: 1.45; overflow-wrap: anywhere; }
 .task-outcome-detail-summary { margin-top: 9px; color: #9ba8c2; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .task-outcome-metadata { margin-top: 20px; }
-.task-outcome-open { align-self: flex-start; min-height: 40px; margin-top: auto; }
+.task-outcome-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: auto; padding-top: 24px; }
+.task-outcome-actions button { min-height: 40px; }
 .task-outcomes-empty, .task-outcome-detail-empty { display: grid; align-content: center; justify-items: center; gap: 9px; min-height: 220px; padding: 28px; color: #8795af; text-align: center; }
 .task-outcomes-empty > span { color: #6d7da0; font-size: 24px; }
 .task-outcomes-empty strong { color: #c8d0e2; font-size: 12px; }

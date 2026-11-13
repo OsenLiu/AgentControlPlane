@@ -80,6 +80,8 @@ struct Project {
 #[serde(rename_all = "camelCase")]
 struct AgentSession {
     id: String,
+    project_id: String,
+    task_id: Option<String>,
     external_session_id: Option<String>,
     project: String,
     task: String,
@@ -232,6 +234,8 @@ fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSess
     let token_count: i64 = row.get(8)?;
     Ok(AgentSession {
         id: row.get(0)?,
+        project_id: row.get(18)?,
+        task_id: row.get(19)?,
         project: row.get(1)?,
         task: row.get(2)?,
         branch: row.get(3)?,
@@ -1509,7 +1513,12 @@ fn list_agent_sessions_from_connection(
                    EXISTS(
                      SELECT 1 FROM project_tasks t
                      WHERE t.session_id = s.id AND t.archived = 1
-                   )
+                   ),
+                   s.project_id,
+                   (SELECT t.id FROM project_tasks t
+                    WHERE t.session_id = s.id
+                    ORDER BY t.updated_at DESC, t.id
+                    LIMIT 1)
              FROM agent_sessions s
              JOIN projects p ON p.id = s.project_id
              WHERE (?1 IS NULL OR s.project_id = ?1)
@@ -3750,6 +3759,8 @@ mod tests {
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "session-1");
+        assert_eq!(sessions[0].project_id, "project-1");
+        assert_eq!(sessions[0].task_id.as_deref(), Some("task-1"));
         assert_eq!(
             sessions[0].external_session_id.as_deref(),
             Some("sess_external_1")

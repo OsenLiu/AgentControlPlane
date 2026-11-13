@@ -251,11 +251,13 @@ function Feedback({ error }: { error: string }) {
 export function ProjectTasksTab({
   project,
   providerSettings,
+  initialTaskId,
   onOpenSession,
   onTaskUpdated,
 }: {
   project: ProjectReference;
   providerSettings: AgentProviderSettings;
+  initialTaskId?: string;
   onOpenSession: (sessionId: string) => void;
   onTaskUpdated?: () => void;
 }) {
@@ -270,6 +272,7 @@ export function ProjectTasksTab({
   const [error, setError] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState("");
   const [startingTaskId, setStartingTaskId] = useState("");
+  const initialTaskSelectionApplied = useRef(false);
 
   const loadTasks = useCallback(async () => {
     setError("");
@@ -300,6 +303,15 @@ export function ProjectTasksTab({
   useEffect(() => {
     void loadTasks();
   }, [loadTasks]);
+
+  useEffect(() => {
+    if (initialTaskSelectionApplied.current || !initialTaskId) return;
+    const task = tasks.find((item) => item.id === initialTaskId);
+    if (!task) return;
+    initialTaskSelectionApplied.current = true;
+    setArchivedView(task.archived);
+    setSelectedTaskId(task.id);
+  }, [initialTaskId, tasks]);
 
   useEffect(() => {
     let disposed = false;

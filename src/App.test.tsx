@@ -769,6 +769,8 @@ describe("App", () => {
     const sessions = [
       {
         id: "completed-session",
+        projectId: "project-1",
+        taskId: "task-1",
         project: "demo",
         task: "Hi hello, this is a test. \n\n# Task completion protocol\nEnd your response with one fenced apt-status JSON block. Use state `working` or `complete`.",
         branch: "docs/setup",
@@ -857,9 +859,41 @@ describe("App", () => {
         taskArchived: true,
       },
     ];
+    const project = {
+      id: "project-1",
+      name: "demo",
+      path: "/tmp/demo",
+      branch: "main",
+      currentCommit: "abc123",
+      gitState: "clean" as const,
+      looping: false,
+      agentTaskCreation: false,
+    };
+    const linkedTask = {
+      id: "task-1",
+      projectId: "project-1",
+      title: "Linked project task",
+      description: "",
+      provider: "copilot",
+      mode: "acceptEdits",
+      model: "auto",
+      stepBudget: 30,
+      stepsUsed: 1,
+      autoApprove: false,
+      status: "done",
+      loopEnabled: false,
+      origin: "user",
+      sessionId: "completed-session",
+      createdAt: "2026-11-09 11:00:00",
+      updatedAt: "2026-11-10 08:00:00",
+      archived: false,
+      reviewPending: false,
+    };
     const defaultImplementation = invokeMock.getMockImplementation();
     invokeMock.mockImplementation(async (command, args) => {
       if (command === "list_agent_sessions") return sessions;
+      if (command === "list_projects") return [project];
+      if (command === "list_project_tasks") return [linkedTask];
       if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
       return defaultImplementation(command, args);
     });
@@ -892,6 +926,31 @@ describe("App", () => {
     fireEvent.click(filters.getByRole("button", { name: /^Failed/ }));
     expect(outcomesList.getByRole("button", { name: /Build the app/ })).toBeTruthy();
     expect(outcomesList.queryByRole("button", { name: /Update the docs/ })).toBeNull();
+
+    fireEvent.click(filters.getByRole("button", { name: /^All outcomes/ }));
+    fireEvent.click(outcomesList.getByRole("button", { name: /Hi hello, this is a test\./ }));
+    fireEvent.click(screen.getByRole("button", { name: "Open session" }));
+    expect(await screen.findByRole("heading", { name: "demo" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Sessions" })).toHaveAttribute("aria-current", "page");
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("list_agent_sessions", {
+        archived: false,
+        projectId: "project-1",
+      });
+      expect(invokeMock).toHaveBeenCalledWith("get_session_transcript", {
+        sessionId: "completed-session",
+      });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /^Task outcomes/ }));
+    expect(await screen.findByRole("heading", { name: "Task history 3" })).toBeTruthy();
+    const reopenedOutcomesList = within(screen.getByRole("region", { name: "Completed and failed sessions" }));
+    fireEvent.click(reopenedOutcomesList.getByRole("button", { name: /Hi hello, this is a test\./ }));
+    expect(screen.getByRole("button", { name: "Open task" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "Open task" }));
+    expect(await screen.findByRole("heading", { name: "demo" })).toBeTruthy();
+    expect(await screen.findByRole("button", { name: /Linked project task/ })).toHaveAttribute("aria-pressed", "true");
+    expect(invokeMock).toHaveBeenCalledWith("list_project_tasks", { projectId: "project-1" });
   });
 
   it("shows pending permissions and failed sessions but excludes completed and orphaned sessions", async () => {

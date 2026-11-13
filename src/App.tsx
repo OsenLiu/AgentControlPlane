@@ -108,6 +108,8 @@ type AgentSession = {
   updatedAt: string;
   taskDone: boolean;
   taskArchived: boolean;
+  projectId?: string;
+  taskId?: string | null;
 };
 
 type TranscriptMessage = {
@@ -1175,12 +1177,14 @@ function TaskOutcomesView({
   error,
   onRefresh,
   onOpenSession,
+  onOpenTask,
 }: {
   sessions: AgentSession[];
   loading: boolean;
   error: string;
   onRefresh: () => Promise<void>;
-  onOpenSession: (sessionId: string) => void;
+  onOpenSession: (session: AgentSession) => void;
+  onOpenTask: (session: AgentSession) => void;
 }) {
   const [filter, setFilter] = useState<"all" | "review" | "completed" | "failed">("all");
   const [query, setQuery] = useState("");
@@ -1328,9 +1332,26 @@ function TaskOutcomesView({
                 <div><dt>AGENT</dt><dd>{providerLabel(selectedSession.provider)}</dd></div>
                 <div><dt>LAST UPDATED</dt><dd>{formatLocalTimestamp(selectedSession.updatedAt)}</dd></div>
               </dl>
-              <button className="primary-button task-outcome-open" type="button" onClick={() => onOpenSession(selectedSession.id)}>
-                Open session
-              </button>
+              <div className="task-outcome-actions">
+                <button
+                  className="primary-button"
+                  type="button"
+                  disabled={!selectedSession.projectId}
+                  title={!selectedSession.projectId ? "This session is not linked to a project." : undefined}
+                  onClick={() => onOpenSession(selectedSession)}
+                >
+                  Open session
+                </button>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={!selectedSession.projectId || !selectedSession.taskId}
+                  title={!selectedSession.taskId ? "This session is not linked to a project task." : undefined}
+                  onClick={() => onOpenTask(selectedSession)}
+                >
+                  Open task
+                </button>
+              </div>
             </article>
           ) : (
             <div className="task-outcome-detail-empty">
@@ -1498,17 +1519,21 @@ function ProjectWorkspaceView({
   project,
   settings,
   transcriptFontSize,
+  initialTaskId,
+  initialSessionId,
   onProjectUpdated,
   onTaskOutcomesRefresh,
 }: {
   project: Project;
   settings: Settings;
   transcriptFontSize: number;
+  initialTaskId?: string;
+  initialSessionId?: string;
   onProjectUpdated: (project: Project) => void;
   onTaskOutcomesRefresh: () => void;
 }) {
-  const [activeSection, setActiveSection] = useState<ProjectSection>("tasks");
-  const [sessionToOpen, setSessionToOpen] = useState("");
+  const [activeSection, setActiveSection] = useState<ProjectSection>(initialSessionId ? "sessions" : "tasks");
+  const [sessionToOpen, setSessionToOpen] = useState(initialSessionId ?? "");
   const [savingAutomation, setSavingAutomation] = useState(false);
   const [openingEditor, setOpeningEditor] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
@@ -1652,6 +1677,7 @@ function ProjectWorkspaceView({
             <ProjectTasksTab
               project={project}
               providerSettings={taskProviderSettings}
+              initialTaskId={initialTaskId}
               onTaskUpdated={onTaskOutcomesRefresh}
               onOpenSession={(sessionId) => {
                 setSessionToOpen(sessionId);
@@ -1675,6 +1701,8 @@ function App() {
   const [userName, setUserName] = useState("");
   const [greeting, setGreeting] = useState(() => getGreetingForLocalTime(new Date()));
   const [sessionToOpen, setSessionToOpen] = useState("");
+  const [taskToOpen, setTaskToOpen] = useState<{ projectId: string; taskId: string } | null>(null);
+  const [projectSessionToOpen, setProjectSessionToOpen] = useState<{ projectId: string; sessionId: string } | null>(null);
   const [showAddProject, setShowAddProject] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
@@ -1973,7 +2001,25 @@ function App() {
   }
 
   function openProjectWorkspace(projectId: string) {
+    setTaskToOpen(null);
+    setProjectSessionToOpen(null);
     setSelectedProjectId(projectId);
+    setActiveNav("Project workspace");
+  }
+
+  function openProjectSession(session: AgentSession) {
+    if (!session.projectId) return;
+    setTaskToOpen(null);
+    setProjectSessionToOpen({ projectId: session.projectId, sessionId: session.id });
+    setSelectedProjectId(session.projectId);
+    setActiveNav("Project workspace");
+  }
+
+  function openProjectTask(session: AgentSession) {
+    if (!session.projectId || !session.taskId) return;
+    setProjectSessionToOpen(null);
+    setTaskToOpen({ projectId: session.projectId, taskId: session.taskId });
+    setSelectedProjectId(session.projectId);
     setActiveNav("Project workspace");
   }
 
@@ -2062,7 +2108,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView settings={settings} transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} settings={settings} transcriptFontSize={settings.transcriptFontSize} onProjectUpdated={updateProject} onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView settings={settings} transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openProjectSession} onOpenTask={openProjectTask} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} settings={settings} transcriptFontSize={settings.transcriptFontSize} initialTaskId={taskToOpen?.projectId === selectedProject.id ? taskToOpen.taskId : undefined} initialSessionId={projectSessionToOpen?.projectId === selectedProject.id ? projectSessionToOpen.sessionId : undefined} onProjectUpdated={updateProject} onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
