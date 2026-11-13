@@ -339,8 +339,46 @@ fn copilot_executable() -> Result<PathBuf, String> {
     })
 }
 
+// CLI shims use `#!/usr/bin/env node`; GUI apps on macOS have a minimal PATH,
+// so add the executable's directory and common node locations.
+fn with_node_path(command: &mut Command, executable: &std::path::Path) {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(parent) = executable.parent() {
+        dirs.push(parent.to_path_buf());
+        if let Ok(real) = fs::canonicalize(executable) {
+            if let Some(parent) = real.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".volta/bin"));
+        dirs.push(home.join(".local/bin"));
+        dirs.push(home.join(".bun/bin"));
+        if let Ok(entries) = fs::read_dir(home.join(".nvm/versions/node")) {
+            let mut nodes = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join("bin"))
+                .collect::<Vec<_>>();
+            nodes.sort();
+            dirs.extend(nodes.pop());
+        }
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+    if let Some(existing) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&existing));
+    }
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        command.env("PATH", joined);
+    }
+}
+
 fn copilot_command() -> Result<Command, String> {
-    Ok(Command::new(copilot_executable()?))
+    let executable = copilot_executable()?;
+    let mut command = Command::new(&executable);
+    with_node_path(&mut command, &executable);
+    Ok(command)
 }
 
 fn claude_executable() -> PathBuf {
@@ -386,7 +424,10 @@ fn claude_executable() -> PathBuf {
 }
 
 fn claude_command() -> Command {
-    Command::new(claude_executable())
+    let executable = claude_executable();
+    let mut command = Command::new(&executable);
+    with_node_path(&mut command, &executable);
+    command
 }
 
 fn copilot_session_id() -> String {
@@ -1958,7 +1999,7 @@ fn spawn_copilot_acp(
     processes: Arc<Mutex<HashMap<String, SessionControl>>>,
     app: tauri::AppHandle,
 ) -> Result<SessionControl, String> {
-    let mut child = Command::new(copilot_executable()?)
+    let mut child = copilot_command()?
         .arg("--acp")
         .arg("--model")
         .arg(model)
@@ -2003,10 +2044,18 @@ fn spawn_copilot_acp(
             }
         }
     });
-    thread::spawn(move || {
+    let stderr_tail = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stderr_writer = stderr_tail.clone();
+    let stderr_thread = thread::spawn(move || {
         for line in BufReader::new(stderr).lines() {
-            if line.is_err() {
+            let Ok(line) = line else {
                 break;
+            };
+            if let Ok(mut tail) = stderr_writer.lock() {
+                tail.push(line);
+                if tail.len() > 20 {
+                    tail.remove(0);
+                }
             }
         }
     });
@@ -2199,13 +2248,6 @@ fn spawn_copilot_acp(
             }
         }
 
-        if let Ok(mut pending) = reader_control.pending.lock() {
-            for (_, sender) in pending.drain() {
-                let _ = sender.send(serde_json::json!({
-                    "error": { "message": "Copilot ACP process exited before responding." }
-                }));
-            }
-        }
         let success = child
             .lock()
             .map(|mut process| {
@@ -2215,6 +2257,23 @@ fn spawn_copilot_acp(
                     .unwrap_or(false)
             })
             .unwrap_or(false);
+        let _ = stderr_thread.join();
+        let stderr_text = stderr_tail
+            .lock()
+            .map(|tail| tail.join("\n"))
+            .unwrap_or_default();
+        let exit_message = if stderr_text.trim().is_empty() {
+            "Copilot ACP process exited before responding.".to_owned()
+        } else {
+            format!("Copilot ACP process exited before responding: {stderr_text}")
+        };
+        if let Ok(mut pending) = reader_control.pending.lock() {
+            for (_, sender) in pending.drain() {
+                let _ = sender.send(serde_json::json!({
+                    "error": { "message": exit_message }
+                }));
+            }
+        }
         let stopped = reader_control.stop_requested.load(Ordering::Relaxed);
         let status = if success || stopped {
             "completed"
