@@ -28,6 +28,13 @@ in.
   Protocol; Claude Code runs through its local headless CLI with structured
   stream output. The app does not open either CLI's private session stores.
 
+## Agent CLI setup
+
+Install GitHub Copilot CLI separately before enabling it in Settings. The
+desktop app searches `PATH`, common per-user install locations such as
+`~/.local/bin`, and standard Homebrew locations. For a custom install location,
+set `COPILOT_CLI_PATH` to the executable path.
+
 ## Screenshots
 
 <p align="center">

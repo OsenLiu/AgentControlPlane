@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    ffi::OsStr,
     fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -264,21 +265,40 @@ fn validate_session_status(status: &str) -> Result<(), String> {
     }
 }
 
-fn copilot_executable() -> PathBuf {
-    if let Some(executable) = std::env::var_os("COPILOT_CLI_PATH") {
-        return PathBuf::from(executable);
+fn copilot_executable_from(
+    override_path: Option<&OsStr>,
+    search_path: Option<&OsStr>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(executable) = override_path {
+        return Some(PathBuf::from(executable));
     }
 
-    if let Some(path) = std::env::var_os("PATH").and_then(|path| {
-        std::env::split_paths(&path)
+    if let Some(path) = search_path.and_then(|path| {
+        std::env::split_paths(path)
             .map(|directory| directory.join("copilot"))
             .find(|candidate| candidate.is_file())
     }) {
-        return path;
+        return Some(path);
     }
 
-    if let Some(home) = std::env::var_os("HOME") {
-        let nvm_nodes = PathBuf::from(home).join(".nvm/versions/node");
+    if let Some(home) = home {
+        for candidate in [
+            home.join(".local/bin/copilot"),
+            home.join(".npm-global/bin/copilot"),
+            home.join(".volta/bin/copilot"),
+            home.join(".bun/bin/copilot"),
+            home.join(".local/share/pnpm/copilot"),
+            home.join("Library/pnpm/copilot"),
+            home.join(".yarn/bin/copilot"),
+            home.join(".linuxbrew/bin/copilot"),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+
+        let nvm_nodes = home.join(".nvm/versions/node");
         if let Ok(entries) = fs::read_dir(nvm_nodes) {
             let mut candidates = entries
                 .filter_map(Result::ok)
@@ -287,16 +307,40 @@ fn copilot_executable() -> PathBuf {
                 .collect::<Vec<_>>();
             candidates.sort();
             if let Some(candidate) = candidates.pop() {
-                return candidate;
+                return Some(candidate);
             }
         }
     }
 
-    PathBuf::from("copilot")
+    for candidate in [
+        PathBuf::from("/opt/homebrew/bin/copilot"),
+        PathBuf::from("/usr/local/bin/copilot"),
+    ] {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+
+    None
 }
 
-fn copilot_command() -> Command {
-    Command::new(copilot_executable())
+fn copilot_executable() -> Result<PathBuf, String> {
+    let override_path = std::env::var_os("COPILOT_CLI_PATH");
+    let search_path = std::env::var_os("PATH");
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    copilot_executable_from(
+        override_path.as_deref(),
+        search_path.as_deref(),
+        home.as_deref(),
+    )
+    .ok_or_else(|| {
+        "GitHub Copilot CLI was not found. Install it or set COPILOT_CLI_PATH to its executable. See https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli"
+            .to_owned()
+    })
+}
+
+fn copilot_command() -> Result<Command, String> {
+    Ok(Command::new(copilot_executable()?))
 }
 
 fn claude_executable() -> PathBuf {
@@ -1914,7 +1958,7 @@ fn spawn_copilot_acp(
     processes: Arc<Mutex<HashMap<String, SessionControl>>>,
     app: tauri::AppHandle,
 ) -> Result<SessionControl, String> {
-    let mut child = Command::new(copilot_executable())
+    let mut child = Command::new(copilot_executable()?)
         .arg("--acp")
         .arg("--model")
         .arg(model)
@@ -2446,7 +2490,7 @@ fn start_copilot_session_blocking(
         );
     }
 
-    let version = copilot_command()
+    let version = copilot_command()?
         .arg("--version")
         .output()
         .map_err(|error| format!("Unable to start Copilot CLI: {error}"))?;
@@ -3617,6 +3661,35 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copilot_executable_preserves_path_precedence_over_user_install() {
+        let home = std::env::temp_dir().join(format!(
+            "agent-control-plane-copilot-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let executable = home.join(".local/bin/copilot");
+        let path_shim = home.join("app-path/copilot");
+        fs::create_dir_all(executable.parent().expect("copilot parent"))
+            .expect("create user-local bin");
+        fs::create_dir_all(path_shim.parent().expect("shim parent")).expect("create app PATH");
+        fs::write(&executable, "").expect("create copilot fixture");
+        fs::write(&path_shim, "").expect("create app PATH shim");
+
+        let result = copilot_executable_from(
+            None,
+            Some(path_shim.parent().expect("shim parent").as_os_str()),
+            Some(&home),
+        );
+        let fallback = copilot_executable_from(None, None, Some(&home));
+
+        fs::remove_dir_all(&home).expect("remove copilot fixture");
+        assert_eq!(result, Some(path_shim));
+        assert_eq!(fallback, Some(executable));
+    }
 
     #[test]
     fn blocking_agent_operations_run_off_the_calling_thread() {
