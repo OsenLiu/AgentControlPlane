@@ -177,6 +177,18 @@ struct LiveTerminal {
 #[derive(Default)]
 pub(crate) struct TerminalManager(Arc<Mutex<HashMap<String, Arc<LiveTerminal>>>>);
 
+impl TerminalManager {
+    pub(crate) fn has_live_project_terminal(&self, project_id: &str) -> Result<bool, String> {
+        let terminals = self
+            .0
+            .lock()
+            .map_err(|_| "Terminal list is unavailable.".to_owned())?;
+        Ok(terminals.values().any(|terminal| {
+            terminal.project_id == project_id && terminal.alive.load(Ordering::Acquire)
+        }))
+    }
+}
+
 impl Drop for TerminalManager {
     fn drop(&mut self) {
         if let Ok(terminals) = self.0.lock() {

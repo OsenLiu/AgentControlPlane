@@ -1015,7 +1015,7 @@ fn list_projects(database: State<'_, Database>) -> Result<Vec<Project>, String> 
     let mut statement = connection
         .prepare(
             "SELECT id, name, path, branch, current_commit, git_state, looping, agent_task_creation
-             FROM projects ORDER BY name COLLATE NOCASE",
+             FROM projects WHERE connected = 1 ORDER BY name COLLATE NOCASE",
         )
         .map_err(|error| format!("Unable to read projects: {error}"))?;
 
@@ -1024,6 +1024,44 @@ fn list_projects(database: State<'_, Database>) -> Result<Vec<Project>, String> 
         .map_err(|error| format!("Unable to read projects: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode project data: {error}"))
+}
+
+fn disconnect_project(connection: &Connection, project_id: &str) -> Result<(), String> {
+    let active: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_sessions WHERE project_id = ?1
+         AND origin = 'managed' AND status IN ('starting', 'running', 'waiting', 'idle'))",
+            [project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to check project sessions: {error}"))?;
+    if active {
+        return Err("Stop the project's active agent sessions before removing it.".to_owned());
+    }
+    let updated = connection.execute(
+        "UPDATE projects SET connected = 0, looping = 0, agent_task_creation = 0, updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?1 AND connected = 1", [project_id],
+    ).map_err(|error| format!("Unable to remove project: {error}"))?;
+    if updated == 0 {
+        return Err("Project was not found.".to_owned());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn remove_project(
+    project_id: String,
+    database: State<'_, Database>,
+    terminals: State<'_, TerminalManager>,
+) -> Result<(), String> {
+    if terminals.has_live_project_terminal(&project_id)? {
+        return Err("Close the project's open terminals before removing it.".to_owned());
+    }
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Project database is unavailable.".to_owned())?;
+    disconnect_project(&connection, &project_id)
 }
 
 #[tauri::command]
@@ -1521,7 +1559,7 @@ fn list_agent_sessions_from_connection(
                     LIMIT 1)
              FROM agent_sessions s
              JOIN projects p ON p.id = s.project_id
-             WHERE (?1 IS NULL OR s.project_id = ?1)
+             WHERE p.connected = 1 AND (?1 IS NULL OR s.project_id = ?1)
                AND (?2 IS NULL OR s.status = ?2)
                AND s.archived = COALESCE(?3, 0)
              ORDER BY s.updated_at DESC, s.started_at DESC, s.id DESC",
@@ -3328,6 +3366,7 @@ fn register_project(path: String, database: State<'_, Database>) -> Result<Proje
                branch = excluded.branch,
                current_commit = excluded.current_commit,
                git_state = excluded.git_state,
+               connected = 1,
                updated_at = CURRENT_TIMESTAMP",
             params![
                 project.id,
@@ -3362,6 +3401,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            git_state TEXT NOT NULL,
            looping INTEGER NOT NULL DEFAULT 0,
            agent_task_creation INTEGER NOT NULL DEFAULT 0,
+           connected INTEGER NOT NULL DEFAULT 1,
            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
          );
@@ -3424,6 +3464,21 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            UNIQUE(session_id, sequence)
          );",
     )?;
+    connection
+        .execute(
+            "ALTER TABLE projects ADD COLUMN connected INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .or_else(|error| {
+            if error
+                .to_string()
+                .contains("duplicate column name: connected")
+            {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
     connection
         .execute(
             "ALTER TABLE projects ADD COLUMN looping INTEGER NOT NULL DEFAULT 0",
@@ -3518,6 +3573,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_current_username,
             list_projects,
+            remove_project,
             set_project_automation,
             continue_project_loop,
             open_project_in_vscode,
@@ -3581,6 +3637,51 @@ mod tests {
             .expect("session query");
 
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn disconnect_project_preserves_history_and_blocks_running_sessions() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        connection.execute_batch(
+            "INSERT INTO projects (id, name, path, branch, current_commit, git_state, looping, agent_task_creation)
+             VALUES ('project-1', 'Project', '/tmp/project', 'main', 'abc', 'clean', 1, 1);
+             INSERT INTO project_tasks (id, project_id, title) VALUES ('task-1', 'project-1', 'Task');
+             INSERT INTO agent_sessions (id, project_id, provider, task, status, origin)
+             VALUES ('session-1', 'project-1', 'copilot', 'Task', 'running', 'managed');"
+        ).expect("project and session");
+
+        assert!(
+            disconnect_project(&connection, "project-1")
+                .unwrap_err()
+                .contains("active agent sessions")
+        );
+        connection
+            .execute("UPDATE agent_sessions SET status = 'completed'", [])
+            .expect("finish session");
+        disconnect_project(&connection, "project-1").expect("disconnect project");
+        let state: (i64, i64, i64, i64) = connection.query_row(
+            "SELECT connected, looping, agent_task_creation, (SELECT count(*) FROM project_tasks) FROM projects WHERE id = 'project-1'",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).expect("preserved project");
+        assert_eq!(state, (0, 0, 0, 1));
+        assert!(
+            list_agent_sessions_from_connection(&connection, None, None, None)
+                .expect("sessions")
+                .is_empty()
+        );
+        connection
+            .execute(
+                "UPDATE projects SET connected = 1 WHERE id = 'project-1'",
+                [],
+            )
+            .expect("reconnect project");
+        assert_eq!(
+            list_agent_sessions_from_connection(&connection, None, None, None)
+                .expect("sessions")
+                .len(),
+            1
+        );
     }
 
     #[test]

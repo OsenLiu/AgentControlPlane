@@ -1,4 +1,4 @@
-import { CSSProperties, FormEvent, useEffect, useState } from "react";
+import { CSSProperties, FormEvent, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -1370,15 +1370,53 @@ function ProjectsView({
   onAddProject,
   onOpenProject,
   onRefresh,
+  onRemoveProject,
 }: {
   projects: Project[];
   loading: boolean;
   onAddProject: () => void;
   onOpenProject: (projectId: string) => void;
   onRefresh: () => void;
+  onRemoveProject: (projectId: string) => Promise<void>;
 }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<"all" | "changed" | "clean">("all");
+  const [projectToRemove, setProjectToRemove] = useState<Project | null>(null);
+  const [removing, setRemoving] = useState(false);
+  const [removalError, setRemovalError] = useState("");
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const removeTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const removalStatusRef = useRef<HTMLDivElement>(null);
+  const [removedName, setRemovedName] = useState("");
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!projectToRemove || !dialog) return;
+    if (typeof dialog.showModal === "function") dialog.showModal();
+    else dialog.setAttribute("open", "");
+    return () => { if (dialog.open && typeof dialog.close === "function") dialog.close(); };
+  }, [projectToRemove]);
+
+  function cancelRemoval() {
+    setProjectToRemove(null);
+    setRemovalError("");
+    removeTriggerRef.current?.focus();
+  }
+
+  async function confirmRemoval() {
+    if (!projectToRemove) return;
+    setRemoving(true);
+    setRemovalError("");
+    try {
+      await onRemoveProject(projectToRemove.id);
+      setRemovedName(projectToRemove.name);
+      setProjectToRemove(null);
+      requestAnimationFrame(() => removalStatusRef.current?.focus());
+    } catch (reason) {
+      setRemovalError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setRemoving(false);
+    }
+  }
   const changedCount = projects.filter((project) => project.gitState === "dirty").length;
   const cleanCount = projects.length - changedCount;
   const branchCount = new Set(projects.map((project) => project.branch).filter(Boolean)).size;
@@ -1503,14 +1541,33 @@ function ProjectsView({
                     <code title={project.currentCommit}>{project.currentCommit ? project.currentCommit.slice(0, 7) : "—"}</code>
                   </div>
                 </div>
-                <button className="project-open-button" type="button" onClick={() => onOpenProject(project.id)}>
-                  Open workspace <span aria-hidden="true">→</span>
-                </button>
+                <div className="project-directory-actions">
+                  <button className="project-open-button" type="button" onClick={() => onOpenProject(project.id)}>
+                    Open workspace <span aria-hidden="true">→</span>
+                  </button>
+                  <button className="project-remove-button" type="button" aria-label={`Remove ${project.name} from app`} title="Remove from app" onClick={(event) => { removeTriggerRef.current = event.currentTarget; setProjectToRemove(project); }}>
+                    Remove
+                  </button>
+                </div>
               </article>
             ))}
           </div>
         )}
       </section>
+      <div ref={removalStatusRef} className="project-removal-status" role="status" tabIndex={-1}>{removedName && `${removedName} removed from the app.`}</div>
+      {projectToRemove && (
+        <dialog ref={dialogRef} className="modal project-remove-dialog" aria-labelledby="remove-project-title" aria-describedby="remove-project-copy" onCancel={(event) => { event.preventDefault(); if (!removing) cancelRemoval(); }}>
+          <p className="eyebrow">REMOVE PROJECT</p>
+          <h2 id="remove-project-title">Remove {projectToRemove.name}?</h2>
+          <p className="modal-copy" id="remove-project-copy">This removes the project from the app and turns off its automation. Its files will not be deleted. You can add it again to restore its tasks and session history.</p>
+          <p className="project-remove-path">{projectToRemove.path}</p>
+          {removalError && <p className="project-removal-error" role="alert">{removalError}</p>}
+          <div className="modal-actions">
+            <button type="button" className="secondary-button" onClick={cancelRemoval} disabled={removing} autoFocus>Cancel</button>
+            <button type="button" className="project-confirm-remove" onClick={() => void confirmRemoval()} disabled={removing}>{removing ? "Removing..." : "Remove project"}</button>
+          </div>
+        </dialog>
+      )}
     </div>
   );
 }
@@ -1740,6 +1797,13 @@ function App() {
     } finally {
       setLoadingProjects(false);
     }
+  }
+
+  async function removeProject(projectId: string) {
+    await invoke("remove_project", { projectId });
+    setProjects((current) => current.filter((project) => project.id !== projectId));
+    if (selectedProjectId === projectId) setSelectedProjectId("");
+    void refreshAttentionItems();
   }
 
   async function refreshAttentionItems() {
@@ -2108,7 +2172,7 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView settings={settings} transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openProjectSession} onOpenTask={openProjectTask} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} settings={settings} transcriptFontSize={settings.transcriptFontSize} initialTaskId={taskToOpen?.projectId === selectedProject.id ? taskToOpen.taskId : undefined} initialSessionId={projectSessionToOpen?.projectId === selectedProject.id ? projectSessionToOpen.sessionId : undefined} onProjectUpdated={updateProject} onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} /> : <>
+        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView settings={settings} transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openProjectSession} onOpenTask={openProjectTask} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} settings={settings} transcriptFontSize={settings.transcriptFontSize} initialTaskId={taskToOpen?.projectId === selectedProject.id ? taskToOpen.taskId : undefined} initialSessionId={projectSessionToOpen?.projectId === selectedProject.id ? projectSessionToOpen.sessionId : undefined} onProjectUpdated={updateProject} onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} onRemoveProject={removeProject} /> : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>

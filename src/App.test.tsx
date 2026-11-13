@@ -79,6 +79,53 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("get_current_username");
   });
 
+  it("confirms removing a project from the app without deleting its files", async () => {
+    const project = {
+      id: "/work/website", name: "website", path: "/work/website", branch: "main",
+      currentCommit: "abcdef0", gitState: "clean", looping: false, agentTaskCreation: false,
+    };
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_projects") return [project];
+      if (command === "remove_project") return undefined;
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Projects" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Remove website from app" }));
+    expect(screen.getByText(/files.*will not be deleted/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(invokeMock).not.toHaveBeenCalledWith("remove_project", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "Remove website from app" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove project" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("remove_project", { projectId: project.id }));
+    expect(await screen.findByText("No projects connected yet")).toBeTruthy();
+  });
+
+  it("keeps the project and confirmation visible when removal fails", async () => {
+    const project = {
+      id: "/work/website", name: "website", path: "/work/website", branch: "main",
+      currentCommit: "abcdef0", gitState: "clean", looping: false, agentTaskCreation: false,
+    };
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_projects") return [project];
+      if (command === "remove_project") throw new Error("Stop active sessions first.");
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Projects" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Remove website from app" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove project" }));
+    const dialog = screen.getByRole("dialog", { name: "Remove website?" });
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Stop active sessions first.");
+    expect(screen.getByRole("button", { name: "Remove website from app", hidden: true })).toBeTruthy();
+  });
+
   it("omits the username from the greeting when it is unavailable", async () => {
     const defaultImplementation = invokeMock.getMockImplementation();
     invokeMock.mockImplementation(async (command, args) => {

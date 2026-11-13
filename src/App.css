@@ -311,6 +311,21 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .project-open-button { display: flex; align-items: center; justify-content: space-between; width: 100%; min-height: 40px; margin-top: 13px; padding: 0 10px; border: 1px solid #2b3854; border-radius: 6px; color: #b3a8ff; background: #191d39; text-align: left; font-size: 10px; font-weight: 600; }
 .project-open-button:hover { border-color: #5b4aa9; color: #d1c9ff; background: #242149; }
 .project-open-button:focus-visible { outline: 2px solid #a99bff; outline-offset: 2px; }
+.project-directory-actions { display: flex; align-items: stretch; gap: 8px; margin-top: 13px; }
+.project-directory-actions .project-open-button { flex: 1; width: auto; margin: 0; }
+.project-remove-button { min-height: 40px; padding: 0 12px; border: 1px solid #544151; border-radius: 6px; color: #e7b5be; background: transparent; font-size: 10px; font-weight: 600; }
+.project-remove-button:hover { border-color: #b86c7b; background: #392431; }
+.project-remove-button:focus-visible, .project-confirm-remove:focus-visible { outline: 2px solid #f4a8b5; outline-offset: 2px; }
+.project-remove-dialog { max-width: calc(100vw - 32px); margin: auto; color: #e8ecf8; }
+.project-remove-dialog::backdrop { background: #060a15c9; }
+.project-remove-dialog h2 { overflow-wrap: anywhere; }
+.project-remove-dialog .modal-copy { margin-bottom: 12px; color: #c4cce0; }
+.project-remove-path { overflow-wrap: anywhere; color: #aebbd2; font-family: "JetBrains Mono", monospace; font-size: 11px; }
+.project-removal-error { margin-top: 16px; color: #ffb9c3; font-size: 12px; line-height: 1.5; }
+.project-confirm-remove { min-height: 40px; padding: 0 15px; border: 1px solid #c46c7a; border-radius: 6px; color: #fff; background: #843e4e; font-weight: 600; }
+.project-confirm-remove:hover { background: #a34a5d; }
+.project-confirm-remove:disabled { cursor: wait; opacity: .7; }
+.project-removal-status { margin-top: 12px; color: #a6dfc4; font-size: 11px; }
 .project-workspace-page { max-width: 1440px; }
 .project-workspace-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding-bottom: 22px; }
 .project-workspace-heading { min-width: 0; }
