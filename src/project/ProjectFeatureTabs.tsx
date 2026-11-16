@@ -30,6 +30,8 @@ type ProjectTask = {
   stepBudget: number;
   stepsUsed: number;
   autoApprove: boolean;
+  useWorktree: boolean;
+  workspaceLocked: boolean;
   status: "backlog" | "in_progress" | "done";
   loopEnabled: boolean;
   origin: "user" | "agent";
@@ -573,6 +575,7 @@ type ProjectTaskInput = {
   model: string;
   stepBudget: number;
   autoApprove: boolean;
+  useWorktree: boolean;
 };
 
 function TaskSettingHelp({ label, text }: { label: string; text: string }) {
@@ -720,6 +723,7 @@ function ProjectTaskDialog({
   );
   const [stepBudget, setStepBudget] = useState(initial?.stepBudget ?? 30);
   const [autoApprove, setAutoApprove] = useState(initial?.autoApprove ?? false);
+  const [useWorktree, setUseWorktree] = useState(initial?.useWorktree ?? false);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
@@ -742,7 +746,7 @@ function ProjectTaskDialog({
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (valid) onSave({ title, description, provider, mode, model, stepBudget, autoApprove });
+    if (valid) onSave({ title, description, provider, mode, model, stepBudget, autoApprove, useWorktree });
   }
 
   function chooseProvider(nextProvider: AgentProvider) {
@@ -915,7 +919,7 @@ function ProjectTaskDialog({
               onChange={(event) => setStepBudget(Number(event.target.value))}
             />
           </div>
-          <div className="task-dialog-setting task-dialog-auto-approve">
+          <div className="task-dialog-setting task-dialog-checkbox-setting">
             <label htmlFor="project-task-auto-approve">Auto-approve</label>
             <TaskSettingHelp
               label="Auto-approve"
@@ -926,6 +930,20 @@ function ProjectTaskDialog({
               type="checkbox"
               checked={autoApprove}
               onChange={(event) => setAutoApprove(event.target.checked)}
+            />
+          </div>
+          <div className="task-dialog-setting task-dialog-checkbox-setting">
+            <label htmlFor="project-task-use-worktree">Run in a new Git worktree</label>
+            <TaskSettingHelp
+              label="Git worktree"
+              text="Starts this task on a new branch from the project's current commit. Uncommitted changes are not copied. The choice is fixed after the first session starts."
+            />
+            <input
+              id="project-task-use-worktree"
+              type="checkbox"
+              checked={useWorktree}
+              disabled={initial?.workspaceLocked ?? false}
+              onChange={(event) => setUseWorktree(event.target.checked)}
             />
           </div>
           {error && <p className="project-feature-error" role="alert">{error}</p>}

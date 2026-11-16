@@ -25,9 +25,10 @@ use project_features::{
     create_project_terminal, delete_project_task, finish_project_task_session,
     get_project_dependencies, get_project_diff, get_project_pipelines, get_project_ref_diff,
     increment_project_task_step, link_project_task_session, list_project_git_refs,
-    list_project_skills, list_project_tasks, list_project_terminals, project_task_step_usage,
-    resize_project_terminal, set_project_task_archived, set_project_task_loop_enabled,
-    set_project_task_status, take_next_loop_task, update_project_task, write_project_terminal,
+    list_project_skills, list_project_tasks, list_project_terminals, prepare_task_worktree,
+    project_task_step_usage, resize_project_terminal, set_project_task_archived,
+    set_project_task_loop_enabled, set_project_task_status, take_next_loop_task,
+    update_project_task, write_project_terminal,
 };
 
 #[derive(Clone)]
@@ -2523,31 +2524,59 @@ fn start_copilot_session_blocking(
             return Err("This Copilot session is already connected.".to_owned());
         }
     }
-    let (project_id, project_path, branch, session_id, resume_external_id, allow_agent_tasks) = {
+    let (
+        project_id,
+        mut project_path,
+        mut branch,
+        session_id,
+        resume_external_id,
+        allow_agent_tasks,
+        mut worktree_path,
+    ) = {
         let connection = database
             .0
             .lock()
             .map_err(|_| "Project database is unavailable.".to_owned())?;
         if let Some(session_id) = resume_session_id.as_deref() {
-            let (project_id, external_id, stored_task): (String, String, String) = connection
+            let (project_id, external_id, stored_task, stored_branch, stored_worktree_path): (
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+            ) = connection
                 .query_row(
-                    "SELECT project_id, external_session_id, task
+                    "SELECT project_id, external_session_id, task, branch, worktree_path
                      FROM agent_sessions
                      WHERE id = ?1 AND provider = 'copilot'",
                     [session_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .map_err(|error| format!("Unable to find Copilot session to resume: {error}"))?;
             if task.is_empty() {
                 task = stored_task;
             }
-            let (path, branch) = connection
+            let (project_path, project_branch) = connection
                 .query_row(
                     "SELECT path, branch FROM projects WHERE id = ?1",
                     [&project_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
                 .map_err(|error| format!("Unable to find project for Copilot session: {error}"))?;
+            let path = stored_worktree_path.clone().unwrap_or(project_path);
+            let branch = if stored_branch.is_empty() {
+                project_branch
+            } else {
+                stored_branch
+            };
             (
                 project_id,
                 path,
@@ -2555,6 +2584,7 @@ fn start_copilot_session_blocking(
                 session_id.to_owned(),
                 Some(external_id),
                 false,
+                stored_worktree_path,
             )
         } else {
             let project_id = project_id
@@ -2582,10 +2612,11 @@ fn start_copilot_session_blocking(
                 copilot_session_id(),
                 None,
                 allow_agent_tasks,
+                None,
             )
         }
     };
-    let (permission_mode, model) = {
+    let (permission_mode, model, use_worktree, worktree_task_id) = {
         let connection = database
             .0
             .lock()
@@ -2593,9 +2624,16 @@ fn start_copilot_session_blocking(
         if let Some(task_id) = task_id.as_deref() {
             connection
                 .query_row(
-                    "SELECT mode, model FROM project_tasks WHERE id = ?1 AND project_id = ?2",
+                    "SELECT mode, model, use_worktree FROM project_tasks WHERE id = ?1 AND project_id = ?2",
                     params![task_id, project_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                            Some(task_id.to_owned()),
+                        ))
+                    },
                 )
                 .map_err(|error| format!("Unable to read project task settings: {error}"))?
         } else if let Some(resume_session_id) = resume_session_id.as_deref() {
@@ -2608,9 +2646,10 @@ fn start_copilot_session_blocking(
                     [resume_session_id],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
+                .map(|(mode, model)| (mode, model, false, None))
                 .map_err(|error| format!("Unable to read resumed session settings: {error}"))?
         } else {
-            ("plan".to_owned(), "auto".to_owned())
+            ("plan".to_owned(), "auto".to_owned(), false, None)
         }
     };
 
@@ -2644,6 +2683,17 @@ fn start_copilot_session_blocking(
         });
     }
 
+    if use_worktree {
+        let task_id = worktree_task_id
+            .as_deref()
+            .ok_or_else(|| "Unable to find the task for its Git worktree.".to_owned())?;
+        let (resolved_worktree_path, worktree_branch) =
+            prepare_task_worktree(Path::new(&project_path), task_id)?;
+        project_path = resolved_worktree_path.to_string_lossy().into_owned();
+        branch = worktree_branch;
+        worktree_path = Some(project_path.clone());
+    }
+
     {
         let mut connection = database
             .0
@@ -2655,25 +2705,34 @@ fn start_copilot_session_blocking(
         if resume_external_id.is_some() {
             transaction.execute(
                 "UPDATE agent_sessions
-                     SET project_id = ?2, task = ?3, branch = ?4, status = 'starting',
+                     SET project_id = ?2, task = ?3, branch = ?4,
+                         worktree_path = COALESCE(worktree_path, ?6), status = 'starting',
                          status_reason = '', current_step = 'Starting Copilot session',
                          permission_mode = ?5, origin = 'managed', archived = 0,
                          updated_at = CURRENT_TIMESTAMP
                      WHERE id = ?1",
-                params![session_id, project_id, task, branch, permission_mode],
-            )
-        } else {
-            transaction.execute(
-                "INSERT INTO agent_sessions
-                     (id, project_id, provider, task, branch, status, status_reason,
-                      current_step, permission_mode, origin, loop_owned, last_event)
-                     VALUES (?1, ?2, 'copilot', ?3, ?4, 'starting', '',
-                             'Starting Copilot session', ?5, 'managed', ?6, '')",
                 params![
                     session_id,
                     project_id,
                     task,
                     branch,
+                    permission_mode,
+                    worktree_path
+                ],
+            )
+        } else {
+            transaction.execute(
+                "INSERT INTO agent_sessions
+                     (id, project_id, provider, task, branch, worktree_path, status, status_reason,
+                      current_step, permission_mode, origin, loop_owned, last_event)
+                     VALUES (?1, ?2, 'copilot', ?3, ?4, ?5, 'starting', '',
+                             'Starting Copilot session', ?6, 'managed', ?7, '')",
+                params![
+                    session_id,
+                    project_id,
+                    task,
+                    branch,
+                    worktree_path,
                     permission_mode,
                     loop_owned
                 ],
@@ -2684,6 +2743,7 @@ fn start_copilot_session_blocking(
             let changed = transaction
                 .execute(
                     "UPDATE project_tasks SET status = 'in_progress', session_id = ?1,
+                     workspace_locked = 1,
                      updated_at = CURRENT_TIMESTAMP
                      WHERE id = ?2 AND project_id = ?3 AND
                       ((status = 'backlog' AND ?4 = 0) OR
@@ -3000,7 +3060,7 @@ fn start_claude_code_session_blocking(
     if task.len() > 16_000 {
         return Err("Messages must be 16,000 bytes or fewer.".to_owned());
     }
-    let (project_path, branch, allow_agent_tasks) = {
+    let (mut project_path, mut branch, allow_agent_tasks) = {
         let connection = database
             .0
             .lock()
@@ -3019,26 +3079,34 @@ fn start_claude_code_session_blocking(
             )
             .map_err(|error| format!("Unable to find project for Claude Code session: {error}"))?
     };
-    let (permission_mode, model) = if let Some(task_id) = task_id.as_deref() {
+    let (permission_mode, model, use_worktree) = if let Some(task_id) = task_id.as_deref() {
         let connection = database
             .0
             .lock()
             .map_err(|_| "Project database is unavailable.".to_owned())?;
-        let (provider, mode, model): (String, String, String) = connection
+        let (provider, mode, model, use_worktree): (String, String, String, bool) = connection
             .query_row(
-                "SELECT provider, mode, model FROM project_tasks
+                "SELECT provider, mode, model, use_worktree FROM project_tasks
                  WHERE id = ?1 AND project_id = ?2",
                 params![task_id, project_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)? != 0,
+                    ))
+                },
             )
             .map_err(|error| format!("Unable to read project task settings: {error}"))?;
         if provider != "claudeCode" {
             return Err("The task is assigned to a different agent.".to_owned());
         }
-        (mode, model)
+        (mode, model, use_worktree)
     } else {
-        ("plan".to_owned(), "auto".to_owned())
+        ("plan".to_owned(), "auto".to_owned(), false)
     };
+    let mut worktree_path = None;
     if allow_agent_tasks {
         task.push_str(
             "\n\n# Agent-proposed backlog tasks\nThis project allows you to propose separate follow-up work. When useful, add a fenced `apt-task` JSON block with a short `title`, a `purpose`, and optional `acceptanceCriteria` string array. Example:\n```apt-task\n{\"title\":\"Add example\",\"purpose\":\"Describe the follow-up work\",\"acceptanceCriteria\":[\"A verifiable outcome\"]}\n```\nProposed tasks are added to the backlog and do not interrupt this session. Do not propose work that is part of the task you were asked to complete.",
@@ -3048,6 +3116,17 @@ fn start_claude_code_session_blocking(
         task.push_str(
             "\n\n# Task completion protocol\nEnd your response with one fenced apt-status JSON block. Use state `working` with a brief note when unfinished, `question` when you need a human decision, `blocked` when you cannot proceed, or `complete` when the task is done. A `complete` report must include `gatePassed: true` and a brief `gateSummary` only after all available relevant checks pass. Example: ```apt-status\n{\"state\":\"complete\",\"note\":\"Implemented and verified the task\",\"gatePassed\":true,\"gateSummary\":\"Tests passed\"}\n``` Do not report complete when checks fail or were not run.",
         );
+    }
+
+    if use_worktree {
+        let task_id = task_id
+            .as_deref()
+            .ok_or_else(|| "Unable to find the task for its Git worktree.".to_owned())?;
+        let (resolved_worktree_path, worktree_branch) =
+            prepare_task_worktree(Path::new(&project_path), task_id)?;
+        project_path = resolved_worktree_path.to_string_lossy().into_owned();
+        branch = worktree_branch;
+        worktree_path = Some(project_path.clone());
     }
 
     let session_id = claude_session_id();
@@ -3062,15 +3141,16 @@ fn start_claude_code_session_blocking(
         transaction
             .execute(
                 "INSERT INTO agent_sessions
-                 (id, project_id, provider, task, branch, status, status_reason,
+                 (id, project_id, provider, task, branch, worktree_path, status, status_reason,
                   current_step, permission_mode, origin, loop_owned, last_event)
-                 VALUES (?1, ?2, 'claudeCode', ?3, ?4, 'starting', '',
-                         'Starting Claude Code session', ?5, 'managed', ?6, '')",
+                 VALUES (?1, ?2, 'claudeCode', ?3, ?4, ?5, 'starting', '',
+                     'Starting Claude Code session', ?6, 'managed', ?7, '')",
                 params![
                     session_id,
                     project_id,
                     task,
                     branch,
+                    worktree_path,
                     permission_mode,
                     loop_owned
                 ],
@@ -3080,6 +3160,7 @@ fn start_claude_code_session_blocking(
             let changed = transaction
                 .execute(
                     "UPDATE project_tasks SET status = 'in_progress', session_id = ?1,
+                     workspace_locked = 1,
                      updated_at = CURRENT_TIMESTAMP
                      WHERE id = ?2 AND project_id = ?3 AND provider = 'claudeCode' AND
                       ((status = 'backlog' AND ?4 = 0) OR
@@ -3467,8 +3548,9 @@ fn send_claude_message(
             .map_err(|_| "Agent session database is unavailable.".to_owned())?;
         connection
             .query_row(
-                "SELECT p.path, s.external_session_id, s.permission_mode,
-                        COALESCE((SELECT t.model FROM project_tasks t WHERE t.session_id = s.id), 'auto')
+                "SELECT COALESCE(s.worktree_path, p.path), s.external_session_id,
+                    s.permission_mode,
+                    COALESCE((SELECT t.model FROM project_tasks t WHERE t.session_id = s.id), 'auto')
                  FROM agent_sessions s
                  JOIN projects p ON p.id = s.project_id
                  WHERE s.id = ?1 AND s.provider = 'claudeCode' AND s.origin = 'managed'",
@@ -3605,6 +3687,7 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            external_session_id TEXT,
            task TEXT NOT NULL,
            branch TEXT NOT NULL DEFAULT '',
+           worktree_path TEXT,
            status TEXT NOT NULL,
            status_reason TEXT NOT NULL DEFAULT '',
            current_step TEXT NOT NULL DEFAULT '',
@@ -3725,6 +3808,21 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             if error
                 .to_string()
                 .contains("duplicate column name: loop_owned")
+            {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
+    connection
+        .execute(
+            "ALTER TABLE agent_sessions ADD COLUMN worktree_path TEXT",
+            [],
+        )
+        .or_else(|error| {
+            if error
+                .to_string()
+                .contains("duplicate column name: worktree_path")
             {
                 Ok(0)
             } else {

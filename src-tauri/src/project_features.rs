@@ -43,6 +43,8 @@ pub(crate) struct ProjectTask {
     step_budget: i64,
     steps_used: i64,
     auto_approve: bool,
+    use_worktree: bool,
+    workspace_locked: bool,
     status: String,
     loop_enabled: bool,
     origin: String,
@@ -215,6 +217,8 @@ pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()>
            step_budget INTEGER NOT NULL DEFAULT 30,
            steps_used INTEGER NOT NULL DEFAULT 0,
            auto_approve INTEGER NOT NULL DEFAULT 0,
+           use_worktree INTEGER NOT NULL DEFAULT 0,
+           workspace_locked INTEGER NOT NULL DEFAULT 0,
            status TEXT NOT NULL DEFAULT 'backlog'
              CHECK(status IN ('backlog', 'in_progress', 'done')),
            loop_enabled INTEGER NOT NULL DEFAULT 1,
@@ -370,6 +374,40 @@ pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()>
                     }
                 })
         })
+        .and_then(|_| {
+            connection
+                .execute(
+                    "ALTER TABLE project_tasks ADD COLUMN use_worktree INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .or_else(|error| {
+                    if error
+                        .to_string()
+                        .contains("duplicate column name: use_worktree")
+                    {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                })
+        })
+        .and_then(|_| {
+            connection
+                .execute(
+                    "ALTER TABLE project_tasks ADD COLUMN workspace_locked INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .or_else(|error| {
+                    if error
+                        .to_string()
+                        .contains("duplicate column name: workspace_locked")
+                    {
+                        Ok(0)
+                    } else {
+                        Err(error)
+                    }
+                })
+        })
         .map(|_| ())
 }
 
@@ -433,6 +471,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTask> {
         updated_at: row.get(15)?,
         archived: row.get::<_, i64>(16)? != 0,
         review_pending: row.get::<_, i64>(17)? != 0,
+        use_worktree: row.get::<_, i64>(18)? != 0,
+        workspace_locked: row.get::<_, i64>(19)? != 0,
     })
 }
 
@@ -446,7 +486,8 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
                       SELECT 1 FROM agent_sessions s
                       WHERE s.id = project_tasks.session_id AND s.status = 'completed'
                         AND s.current_step = 'Task ready for review'
-                    ) THEN 1 ELSE 0 END
+                    ) THEN 1 ELSE 0 END,
+                    use_worktree, workspace_locked
              FROM project_tasks
              WHERE project_id = ?1
              ORDER BY CASE status WHEN 'backlog' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
@@ -468,7 +509,8 @@ fn task_by_id(connection: &Connection, task_id: &str) -> rusqlite::Result<Projec
                   SELECT 1 FROM agent_sessions s
                   WHERE s.id = project_tasks.session_id AND s.status = 'completed'
                     AND s.current_step = 'Task ready for review'
-                ) THEN 1 ELSE 0 END
+                ) THEN 1 ELSE 0 END,
+                use_worktree, workspace_locked
          FROM project_tasks WHERE id = ?1",
         [task_id],
         task_from_row,
@@ -530,6 +572,7 @@ pub(crate) fn create_project_task(
     model: String,
     step_budget: i64,
     auto_approve: bool,
+    use_worktree: bool,
     database: State<'_, Database>,
 ) -> Result<ProjectTask, String> {
     let title = title.trim();
@@ -555,9 +598,9 @@ pub(crate) fn create_project_task(
     ensure_project_exists(&connection, &project_id)?;
     connection
         .execute(
-            "INSERT INTO project_tasks (id, project_id, title, description, provider, mode, model, step_budget, auto_approve)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![id, project_id, title, description.trim(), provider, mode, model, step_budget, auto_approve],
+            "INSERT INTO project_tasks (id, project_id, title, description, provider, mode, model, step_budget, auto_approve, use_worktree)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![id, project_id, title, description.trim(), provider, mode, model, step_budget, auto_approve, use_worktree],
         )
         .map_err(|error| format!("Unable to create project task: {error}"))?;
     task_by_id(&connection, &id)
@@ -606,6 +649,7 @@ pub(crate) fn update_project_task(
     model: String,
     step_budget: i64,
     auto_approve: bool,
+    use_worktree: bool,
     database: State<'_, Database>,
 ) -> Result<ProjectTask, String> {
     let title = title.trim();
@@ -632,8 +676,10 @@ pub(crate) fn update_project_task(
         .execute(
             "UPDATE project_tasks
              SET title = ?1, description = ?2, provider = ?3, mode = ?4, model = ?5,
-                 step_budget = ?6, auto_approve = ?7, updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?8 AND project_id = ?9",
+                 step_budget = ?6, auto_approve = ?7,
+                 use_worktree = CASE WHEN workspace_locked = 0 THEN ?8 ELSE use_worktree END,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?9 AND project_id = ?10",
             params![
                 title,
                 description.trim(),
@@ -642,6 +688,7 @@ pub(crate) fn update_project_task(
                 model,
                 step_budget,
                 auto_approve,
+                use_worktree,
                 task_id,
                 project_id
             ],
@@ -993,22 +1040,32 @@ pub(crate) fn link_project_task_session(
         .0
         .lock()
         .map_err(|_| "Project database is unavailable.".to_owned())?;
-    let session_belongs_to_project = connection
+    let session_worktree_path = connection
         .query_row(
-            "SELECT 1 FROM agent_sessions WHERE id = ?1 AND project_id = ?2",
+            "SELECT worktree_path FROM agent_sessions WHERE id = ?1 AND project_id = ?2",
             params![session_id, project_id],
-            |_| Ok(()),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()
         .map_err(|error| format!("Unable to validate the agent session: {error}"))?
-        .is_some();
-    if !session_belongs_to_project {
-        return Err("The agent session must belong to this project.".to_owned());
+        .ok_or_else(|| "The agent session must belong to this project.".to_owned())?;
+    let task_uses_worktree: bool = connection
+        .query_row(
+            "SELECT use_worktree FROM project_tasks WHERE id = ?1 AND project_id = ?2",
+            params![task_id, project_id],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )
+        .optional()
+        .map_err(|error| format!("Unable to validate the project task: {error}"))?
+        .ok_or_else(|| "The task was not found in this project.".to_owned())?;
+    if task_uses_worktree != session_worktree_path.is_some() {
+        return Err("The agent session workspace does not match the task setting.".to_owned());
     }
     let changed = connection
         .execute(
             "UPDATE project_tasks
-             SET session_id = ?1, status = 'in_progress', updated_at = CURRENT_TIMESTAMP
+             SET session_id = ?1, status = 'in_progress', workspace_locked = 1,
+                 updated_at = CURRENT_TIMESTAMP
              WHERE id = ?2 AND project_id = ?3",
             params![session_id, task_id, project_id],
         )
@@ -1074,6 +1131,133 @@ fn git_text(path: &Path, args: &[&str]) -> Result<String, String> {
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn git_common_dir(path: &Path) -> Result<PathBuf, String> {
+    let common_dir = PathBuf::from(git_text(path, &["rev-parse", "--git-common-dir"])?);
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        path.join(common_dir)
+    };
+    common_dir
+        .canonicalize()
+        .map_err(|error| format!("Unable to validate the Git repository: {error}"))
+}
+
+pub(crate) fn prepare_task_worktree(
+    project_path: &Path,
+    task_id: &str,
+) -> Result<(PathBuf, String), String> {
+    let project_path = project_path
+        .canonicalize()
+        .map_err(|error| format!("The project folder is unavailable: {error}"))?;
+    let project_name = project_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| {
+            "Unable to determine the project folder name for its worktree.".to_owned()
+        })?;
+    let task_key: String = task_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if task_key.is_empty() || task_key == "." || task_key == ".." {
+        return Err("The task ID cannot be used to create a Git worktree.".to_owned());
+    }
+
+    let branch = format!("agent/{task_key}");
+    let parent = project_path
+        .parent()
+        .ok_or_else(|| "Unable to determine where to create the task worktree.".to_owned())?
+        .join(format!("{project_name}-worktrees"));
+    fs::create_dir_all(&parent)
+        .map_err(|error| format!("Unable to create the task worktree folder: {error}"))?;
+    let worktree_path = parent.join(&task_key);
+
+    if worktree_path.exists() {
+        let canonical_worktree = worktree_path
+            .canonicalize()
+            .map_err(|error| format!("Unable to read the existing task worktree: {error}"))?;
+        let worktree_root = PathBuf::from(git_text(
+            &canonical_worktree,
+            &["rev-parse", "--show-toplevel"],
+        )?)
+        .canonicalize()
+        .map_err(|error| format!("Unable to validate the existing task worktree: {error}"))?;
+        let existing_branch = git_text(&canonical_worktree, &["branch", "--show-current"])?;
+        if worktree_root != canonical_worktree
+            || existing_branch != branch
+            || git_common_dir(&project_path)? != git_common_dir(&canonical_worktree)?
+        {
+            return Err(
+                "The task worktree folder already exists but belongs to another repository."
+                    .to_owned(),
+            );
+        }
+        return Ok((canonical_worktree, branch));
+    }
+
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_check = git_output(
+        &project_path,
+        &["show-ref", "--verify", "--quiet", &branch_ref],
+    )?;
+    let output = if branch_check.status.success() {
+        git_output(
+            &project_path,
+            &[
+                "worktree",
+                "add",
+                worktree_path
+                    .to_str()
+                    .ok_or_else(|| "The task worktree path is not valid UTF-8.".to_owned())?,
+                &branch,
+            ],
+        )?
+    } else if branch_check.status.code() == Some(1) {
+        git_output(
+            &project_path,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                worktree_path
+                    .to_str()
+                    .ok_or_else(|| "The task worktree path is not valid UTF-8.".to_owned())?,
+                "HEAD",
+            ],
+        )?
+    } else {
+        let detail = String::from_utf8_lossy(&branch_check.stderr)
+            .trim()
+            .to_owned();
+        return Err(if detail.is_empty() {
+            "Unable to check whether the task branch already exists.".to_owned()
+        } else {
+            format!("Unable to check whether the task branch already exists: {detail}")
+        });
+    };
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if detail.is_empty() {
+            "Git could not create the task worktree.".to_owned()
+        } else {
+            format!("Git could not create the task worktree: {detail}")
+        });
+    }
+    let canonical_worktree = worktree_path
+        .canonicalize()
+        .map_err(|error| format!("Unable to read the new task worktree: {error}"))?;
+    Ok((canonical_worktree, branch))
 }
 
 fn append_limited(target: &mut String, addition: &str, truncated: &mut bool) {
@@ -2185,6 +2369,31 @@ pub(crate) fn close_project_terminal(
 mod tests {
     use super::*;
 
+    fn run_git_test_command(path: &Path, args: &[&str]) {
+        let output = git_output(path, args).expect("run Git command");
+        assert!(
+            output.status.success(),
+            "Git command failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialize_test_repository(path: &Path, branch: Option<&str>) {
+        fs::create_dir_all(path).expect("temporary repository folder");
+        run_git_test_command(path, &["init", "--quiet"]);
+        run_git_test_command(path, &["config", "user.name", "Agent Control Plane"]);
+        run_git_test_command(
+            path,
+            &["config", "user.email", "agent-control-plane@example.com"],
+        );
+        fs::write(path.join("README.md"), "worktree test\n").expect("write test file");
+        run_git_test_command(path, &["add", "README.md"]);
+        run_git_test_command(path, &["commit", "--quiet", "-m", "initial commit"]);
+        if let Some(branch) = branch {
+            run_git_test_command(path, &["checkout", "--quiet", "-b", branch]);
+        }
+    }
+
     #[test]
     fn github_remotes_are_restricted_to_github_owner_and_repository() {
         assert_eq!(
@@ -2221,6 +2430,27 @@ mod tests {
         assert!(dependencies.contains_key(&("react".to_owned(), "production".to_owned())));
         assert!(dependencies.contains_key(&("vitest".to_owned(), "development".to_owned())));
         assert!(dependencies.contains_key(&("requests".to_owned(), "python".to_owned())));
+    }
+
+    #[test]
+    fn task_worktree_is_created_and_reused_on_its_task_branch() {
+        let temporary_root = env::temp_dir().join(new_id("worktree-test"));
+        let repository = temporary_root.join("project");
+        initialize_test_repository(&repository, None);
+
+        let (first_path, first_branch) =
+            prepare_task_worktree(&repository, "task-test-1").expect("create task worktree");
+        let (second_path, second_branch) =
+            prepare_task_worktree(&repository, "task-test-1").expect("reuse task worktree");
+
+        assert_eq!(first_path, second_path);
+        assert_eq!(first_branch, "agent/task-test-1");
+        assert_eq!(second_branch, first_branch);
+        assert_eq!(
+            git_text(&first_path, &["branch", "--show-current"]).expect("read worktree branch"),
+            first_branch
+        );
+        fs::remove_dir_all(temporary_root).expect("remove temporary repository");
     }
 
     #[test]
@@ -2395,6 +2625,76 @@ mod tests {
         assert_eq!(tasks[0].provider, "copilot");
         assert!(tasks[0].loop_enabled);
         assert_eq!(tasks[0].origin, "user");
+        assert!(!tasks[0].use_worktree);
+        assert!(!tasks[0].workspace_locked);
+    }
+
+    #[test]
+    fn failed_task_keeps_workspace_choice_and_session_worktree() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        crate::initialize_schema(&connection).expect("application schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, path, branch, current_commit, git_state)
+                 VALUES ('project-1', 'project', '/tmp/project', 'main', 'abc123', 'clean')",
+                [],
+            )
+            .expect("project row");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions
+                 (id, project_id, provider, task, branch, worktree_path, status, origin)
+                 VALUES ('session-1', 'project-1', 'copilot', 'Task', 'agent/task-1',
+                         '/tmp/project-worktrees/task-1', 'failed', 'managed')",
+                [],
+            )
+            .expect("session row");
+        connection
+            .execute(
+                "INSERT INTO project_tasks
+                 (id, project_id, title, status, session_id, use_worktree, workspace_locked)
+                 VALUES ('task-1', 'project-1', 'Task', 'in_progress', 'session-1', 1, 1)",
+                [],
+            )
+            .expect("task row");
+
+        finish_project_task_session(&connection, "session-1", false).expect("reset failed task");
+
+        let task_state: (Option<String>, i64, i64) = connection
+            .query_row(
+                "SELECT session_id, use_worktree, workspace_locked
+                 FROM project_tasks WHERE id = 'task-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read reset task");
+        assert_eq!(task_state, (None, 1, 1));
+        let worktree_path: String = connection
+            .query_row(
+                "SELECT worktree_path FROM agent_sessions WHERE id = 'session-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read session worktree");
+        assert_eq!(worktree_path, "/tmp/project-worktrees/task-1");
+    }
+
+    #[test]
+    fn task_worktree_rejects_an_unrelated_repository_at_its_path() {
+        let temporary_root = env::temp_dir().join(new_id("worktree-collision-test"));
+        let repository = temporary_root.join("project");
+        let unrelated_repository = temporary_root.join("project-worktrees").join("task-test-2");
+        initialize_test_repository(&repository, None);
+        initialize_test_repository(&unrelated_repository, Some("agent/task-test-2"));
+
+        let result = prepare_task_worktree(&repository, "task-test-2");
+
+        assert!(
+            result
+                .unwrap_err()
+                .contains("belongs to another repository")
+        );
+        fs::remove_dir_all(temporary_root).expect("remove temporary repositories");
     }
 
     #[test]
