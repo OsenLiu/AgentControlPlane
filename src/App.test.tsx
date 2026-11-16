@@ -498,6 +498,8 @@ describe("App", () => {
       stepBudget: number;
       stepsUsed: number;
       autoApprove: boolean;
+      useWorktree: boolean;
+      workspaceLocked: boolean;
       status: "backlog" | "in_progress" | "done";
       loopEnabled: boolean;
       origin: "user" | "agent";
@@ -559,6 +561,8 @@ describe("App", () => {
           stepBudget: Number(payload.stepBudget),
           stepsUsed: 0,
           autoApprove: Boolean(payload.autoApprove),
+          useWorktree: Boolean(payload.useWorktree),
+          workspaceLocked: false,
           status: "backlog",
           loopEnabled: true,
           origin: "user",
@@ -581,12 +585,13 @@ describe("App", () => {
             model: payload.model,
             stepBudget: Number(payload.stepBudget),
             autoApprove: Boolean(payload.autoApprove),
+            useWorktree: Boolean(payload.useWorktree),
           };
         }
         return task;
       }
       if (command === "start_agent_session") {
-        if (task) task = { ...task, status: "in_progress", sessionId: "session-1" };
+        if (task) task = { ...task, status: "in_progress", sessionId: "session-1", workspaceLocked: true };
         return undefined;
       }
       throw new Error(`Unexpected command: ${command}`);
@@ -616,6 +621,8 @@ describe("App", () => {
     fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gpt-5.6-sol" } });
     fireEvent.change(screen.getByLabelText("Step budget"), { target: { value: "6" } });
     fireEvent.click(screen.getByRole("checkbox", { name: "Auto-approve" }));
+    expect(screen.getByRole("checkbox", { name: "Run in a new Git worktree" })).toHaveProperty("checked", false);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Run in a new Git worktree" }));
     fireEvent.click(screen.getByRole("button", { name: "Create task" }));
 
     expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
@@ -632,6 +639,7 @@ describe("App", () => {
       model: "gpt-5.6-sol",
       stepBudget: 6,
       autoApprove: true,
+      useWorktree: true,
     });
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     expect(screen.getByRole("combobox", { name: "Model" })).toHaveProperty("value", "gpt-5.6-sol");
@@ -650,6 +658,7 @@ describe("App", () => {
       model: "auto",
       stepBudget: 6,
       autoApprove: true,
+      useWorktree: true,
     }));
     const taskFilter = screen.getByRole("searchbox", { name: "Filter tasks" });
     fireEvent.change(taskFilter, { target: { value: "not in this task" } });
@@ -684,6 +693,9 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start session" }));
     expect(await screen.findByText("Linked session")).toBeTruthy();
     expect(await screen.findByText("session-1")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByRole("checkbox", { name: "Run in a new Git worktree" })).toHaveProperty("disabled", true);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(screen.getByRole("button", { name: "Open linked session session-1" }));
     expect(await screen.findByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Sessions", current: "page" })).toBeTruthy();
