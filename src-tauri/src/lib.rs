@@ -271,29 +271,27 @@ fn copilot_executable_from(
     home: Option<&Path>,
 ) -> Option<PathBuf> {
     if let Some(executable) = override_path {
-        return Some(PathBuf::from(executable));
+        return Some(copilot_override_path(executable));
     }
 
     if let Some(path) = search_path.and_then(|path| {
-        std::env::split_paths(path)
-            .map(|directory| directory.join("copilot"))
-            .find(|candidate| candidate.is_file())
+        std::env::split_paths(path).find_map(|directory| copilot_in_directory(&directory))
     }) {
         return Some(path);
     }
 
     if let Some(home) = home {
         for candidate in [
-            home.join(".local/bin/copilot"),
-            home.join(".npm-global/bin/copilot"),
-            home.join(".volta/bin/copilot"),
-            home.join(".bun/bin/copilot"),
-            home.join(".local/share/pnpm/copilot"),
-            home.join("Library/pnpm/copilot"),
-            home.join(".yarn/bin/copilot"),
-            home.join(".linuxbrew/bin/copilot"),
+            home.join(".local/bin"),
+            home.join(".npm-global/bin"),
+            home.join(".volta/bin"),
+            home.join(".bun/bin"),
+            home.join(".local/share/pnpm"),
+            home.join("Library/pnpm"),
+            home.join(".yarn/bin"),
+            home.join(".linuxbrew/bin"),
         ] {
-            if candidate.is_file() {
+            if let Some(candidate) = copilot_in_directory(&candidate) {
                 return Some(candidate);
             }
         }
@@ -302,8 +300,7 @@ fn copilot_executable_from(
         if let Ok(entries) = fs::read_dir(nvm_nodes) {
             let mut candidates = entries
                 .filter_map(Result::ok)
-                .map(|entry| entry.path().join("bin/copilot"))
-                .filter(|candidate| candidate.is_file())
+                .filter_map(|entry| copilot_in_directory(&entry.path().join("bin")))
                 .collect::<Vec<_>>();
             candidates.sort();
             if let Some(candidate) = candidates.pop() {
@@ -312,11 +309,18 @@ fn copilot_executable_from(
         }
     }
 
+    #[cfg(windows)]
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        if let Some(candidate) = copilot_in_directory(&PathBuf::from(app_data).join("npm")) {
+            return Some(candidate);
+        }
+    }
+
     for candidate in [
-        PathBuf::from("/opt/homebrew/bin/copilot"),
-        PathBuf::from("/usr/local/bin/copilot"),
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
     ] {
-        if candidate.is_file() {
+        if let Some(candidate) = copilot_in_directory(&candidate) {
             return Some(candidate);
         }
     }
@@ -324,10 +328,44 @@ fn copilot_executable_from(
     None
 }
 
+fn copilot_in_directory(directory: &Path) -> Option<PathBuf> {
+    #[cfg(windows)]
+    let candidates = [
+        directory.join("copilot.exe"),
+        directory.join("copilot.cmd"),
+        directory.join("copilot.bat"),
+    ];
+    #[cfg(not(windows))]
+    let candidates = [directory.join("copilot")];
+    candidates.into_iter().find(|candidate| candidate.is_file())
+}
+
+fn copilot_override_path(executable: &OsStr) -> PathBuf {
+    let executable = PathBuf::from(executable);
+    #[cfg(windows)]
+    {
+        let extension = executable
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(str::to_ascii_lowercase);
+        if !matches!(extension.as_deref(), Some("exe" | "cmd" | "bat")) {
+            for extension in ["exe", "cmd", "bat"] {
+                let candidate = executable.with_extension(extension);
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    executable
+}
+
 fn copilot_executable() -> Result<PathBuf, String> {
     let override_path = std::env::var_os("COPILOT_CLI_PATH");
     let search_path = std::env::var_os("PATH");
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
     copilot_executable_from(
         override_path.as_deref(),
         search_path.as_deref(),
@@ -374,11 +412,29 @@ fn with_node_path(command: &mut Command, executable: &std::path::Path) {
     }
 }
 
-fn copilot_command() -> Result<Command, String> {
+fn copilot_command_for(executable: &Path) -> Command {
+    #[cfg(windows)]
+    if matches!(
+        executable
+            .extension()
+            .and_then(OsStr::to_str)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("cmd" | "bat")
+    ) {
+        let mut command = Command::new("cmd.exe");
+        command.arg("/d").arg("/c").arg(executable);
+        return command;
+    }
+
+    Command::new(executable)
+}
+
+fn copilot_command() -> Result<(Command, PathBuf), String> {
     let executable = copilot_executable()?;
-    let mut command = Command::new(&executable);
+    let mut command = copilot_command_for(&executable);
     with_node_path(&mut command, &executable);
-    Ok(command)
+    Ok((command, executable))
 }
 
 fn claude_executable() -> PathBuf {
@@ -2009,7 +2065,8 @@ fn spawn_copilot_acp(
     processes: Arc<Mutex<HashMap<String, SessionControl>>>,
     app: tauri::AppHandle,
 ) -> Result<SessionControl, String> {
-    let mut child = copilot_command()?
+    let (mut command, executable) = copilot_command()?;
+    let mut child = command
         .arg("--acp")
         .arg("--model")
         .arg(model)
@@ -2018,7 +2075,12 @@ fn spawn_copilot_acp(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("Unable to start Copilot ACP: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Unable to start Copilot ACP at '{}': {error}",
+                executable.display()
+            )
+        })?;
     let stdin = child
         .stdin
         .take()
@@ -2563,10 +2625,16 @@ fn start_copilot_session_blocking(
         );
     }
 
-    let version = copilot_command()?
+    let (mut command, executable) = copilot_command()?;
+    let version = command
         .arg("--version")
         .output()
-        .map_err(|error| format!("Unable to start Copilot CLI: {error}"))?;
+        .map_err(|error| {
+            format!(
+                "Unable to start Copilot CLI at '{}': {error}",
+                executable.display()
+            )
+        })?;
     if !version.status.success() {
         let detail = String::from_utf8_lossy(&version.stderr).trim().to_owned();
         return Err(if detail.is_empty() {
@@ -3744,8 +3812,13 @@ mod tests {
                 .expect("clock after epoch")
                 .as_nanos()
         ));
-        let executable = home.join(".local/bin/copilot");
-        let path_shim = home.join("app-path/copilot");
+        let executable_name = if cfg!(windows) {
+            "copilot.cmd"
+        } else {
+            "copilot"
+        };
+        let executable = home.join(".local/bin").join(executable_name);
+        let path_shim = home.join("app-path").join(executable_name);
         fs::create_dir_all(executable.parent().expect("copilot parent"))
             .expect("create user-local bin");
         fs::create_dir_all(path_shim.parent().expect("shim parent")).expect("create app PATH");
@@ -3762,6 +3835,38 @@ mod tests {
         fs::remove_dir_all(&home).expect("remove copilot fixture");
         assert_eq!(result, Some(path_shim));
         assert_eq!(fallback, Some(executable));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copilot_cmd_shim_is_discovered_and_started_with_arguments() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-control-plane copilot-cmd-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create CLI directory");
+        let executable = directory.join("copilot.cmd");
+        let extensionless_shim = directory.join("copilot");
+        fs::write(&extensionless_shim, "not a Windows executable")
+            .expect("create extensionless CLI shim");
+        fs::write(&executable, "@echo off\r\necho %1\r\n").expect("create CLI shim");
+
+        assert_eq!(copilot_in_directory(&directory), Some(executable.clone()));
+        assert_eq!(
+            copilot_executable_from(Some(extensionless_shim.as_os_str()), None, None),
+            Some(executable.clone())
+        );
+        let output = copilot_command_for(&executable)
+            .arg("hello")
+            .output()
+            .expect("start CLI shim");
+
+        fs::remove_dir_all(&directory).expect("remove CLI directory");
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "hello");
     }
 
     #[test]
