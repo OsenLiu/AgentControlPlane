@@ -1133,6 +1133,22 @@ fn git_text(path: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn git_path_argument(path: &Path) -> Result<String, String> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| "The task worktree path is not valid UTF-8.".to_owned())?;
+    #[cfg(windows)]
+    {
+        if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+            return Ok(format!(r"\\{unc_path}"));
+        }
+        if let Some(drive_path) = path.strip_prefix(r"\\?\") {
+            return Ok(drive_path.to_owned());
+        }
+    }
+    Ok(path.to_owned())
+}
+
 fn git_common_dir(path: &Path) -> Result<PathBuf, String> {
     let common_dir = PathBuf::from(git_text(path, &["rev-parse", "--git-common-dir"])?);
     let common_dir = if common_dir.is_absolute() {
@@ -1206,6 +1222,7 @@ pub(crate) fn prepare_task_worktree(
     }
 
     let branch_ref = format!("refs/heads/{branch}");
+    let worktree_path_arg = git_path_argument(&worktree_path)?;
     let branch_check = git_output(
         &project_path,
         &["show-ref", "--verify", "--quiet", &branch_ref],
@@ -1213,28 +1230,12 @@ pub(crate) fn prepare_task_worktree(
     let output = if branch_check.status.success() {
         git_output(
             &project_path,
-            &[
-                "worktree",
-                "add",
-                worktree_path
-                    .to_str()
-                    .ok_or_else(|| "The task worktree path is not valid UTF-8.".to_owned())?,
-                &branch,
-            ],
+            &["worktree", "add", &worktree_path_arg, &branch],
         )?
     } else if branch_check.status.code() == Some(1) {
         git_output(
             &project_path,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch,
-                worktree_path
-                    .to_str()
-                    .ok_or_else(|| "The task worktree path is not valid UTF-8.".to_owned())?,
-                "HEAD",
-            ],
+            &["worktree", "add", "-b", &branch, &worktree_path_arg, "HEAD"],
         )?
     } else {
         let detail = String::from_utf8_lossy(&branch_check.stderr)
