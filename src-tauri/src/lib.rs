@@ -968,6 +968,40 @@ fn copilot_token_count_from_message(
     Ok(Some((used, size)))
 }
 
+fn copilot_usage_update_for_session(
+    database: &Arc<Mutex<Connection>>,
+    message: &Value,
+    session_id: &str,
+) -> Result<Option<(i64, i64)>, String> {
+    if message.get("method").and_then(Value::as_str) != Some("session/update")
+        || message
+            .get("params")
+            .and_then(|params| params.get("update"))
+            .and_then(|update| update.get("sessionUpdate"))
+            .and_then(Value::as_str)
+            != Some("usage_update")
+    {
+        return Ok(None);
+    }
+
+    let external_session_id = database
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?
+        .query_row(
+            "SELECT external_session_id
+             FROM agent_sessions
+             WHERE id = ?1 AND provider = 'copilot'",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Unable to read Copilot protocol session ID: {error}"))?
+        .flatten()
+        .ok_or_else(|| "Copilot protocol session ID is not available yet.".to_owned())?;
+
+    copilot_token_count_from_message(message, &external_session_id)
+}
+
 fn update_session_token_count(
     database: &Arc<Mutex<Connection>>,
     session_id: &str,
@@ -2458,7 +2492,7 @@ fn spawn_copilot_acp(
                 continue;
             };
 
-            match copilot_token_count_from_message(&message, &reader_session_id) {
+            match copilot_usage_update_for_session(&database, &message, &reader_session_id) {
                 Ok(Some((token_count, context_window_size))) => {
                     match update_session_token_count(
                         &database,
@@ -4992,6 +5026,61 @@ mod tests {
             copilot_token_count_from_message(&message, "copilot-session"),
             Ok(Some((12800, 128000)))
         );
+    }
+
+    #[test]
+    fn copilot_usage_updates_validate_the_provider_session_id() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, path, branch, current_commit, git_state)
+                 VALUES ('project-1', 'Control Plane', '/tmp/control-plane', 'main', 'abc', 'clean')",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions
+                 (id, project_id, provider, external_session_id, task, status)
+                 VALUES ('local-session-id', 'project-1', 'copilot', 'acp-session-id', 'Test usage', 'running')",
+                [],
+            )
+            .expect("session");
+        let database = Arc::new(Mutex::new(connection));
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "acp-session-id",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 12800,
+                    "size": 128000
+                }
+            }
+        });
+
+        let (token_count, context_window_size) =
+            copilot_usage_update_for_session(&database, &message, "local-session-id")
+                .expect("usage update")
+                .expect("recognized usage update");
+        update_session_token_count(
+            &database,
+            "local-session-id",
+            token_count,
+            Some(context_window_size),
+        )
+        .expect("persist usage");
+        let connection = database.lock().expect("database lock");
+        let session = list_agent_sessions_from_connection(&connection, None, None, None)
+            .expect("read session")
+            .into_iter()
+            .next()
+            .expect("session");
+        assert_eq!(session.tokens, "12.8k");
+        assert_eq!(session.context_tokens, Some(12800));
+        assert_eq!(session.context_window_size, Some(128000));
     }
 
     #[test]

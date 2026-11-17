@@ -6,6 +6,27 @@ Source revision: `21ac11bf8918c5cc8ffb4950e32ec4732a0154c6`
 
 Scope: investigation and solution design only; no application source changes.
 
+## Follow-up: valid updates rejected by session-ID mismatch
+
+On 2026-11-17, a regression test with distinct app-local and ACP session IDs
+reproduced another cause of "Not reported." The ACP reader passed the app-local
+`agent_sessions.id` to a parser that validates the notification's
+`params.sessionId`. ACP sends the provider's external session ID there, which
+the app stores separately as `external_session_id`; every otherwise-valid
+usage update was therefore rejected as belonging to a different session.
+
+The reader now resolves `external_session_id` for its app-local session before
+validating the update. A regression test runs the update through parsing,
+persistence, and the session read model, and verifies that `12800` is reported
+as `12.8k`. The pre-fix test failed with
+`ACP session update belongs to a different session.` All 41 Rust library tests
+pass after the fix.
+
+This fixes the app-side ID mismatch, but does not prove that a given Copilot CLI
+version emits `usage_update`. No live prompt or private session database was
+used; sessions with no stored snapshot remain unavailable until a valid update
+arrives, and historical values are not backfilled.
+
 ## Conclusion
 
 **The Copilot ACP adapter reads the wrong shape for `usage_update.used`.**
