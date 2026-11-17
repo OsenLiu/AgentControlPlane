@@ -100,6 +100,8 @@ type AgentSession = {
   step: string;
   elapsed: string;
   tokens: string;
+  contextTokens?: number | null;
+  contextWindowSize?: number | null;
   permissionMode: "Plan" | "Accept edits" | "Auto";
   managed: boolean;
   lastEvent: string;
@@ -247,6 +249,20 @@ function formatLocalTimestamp(value: string) {
     dateStyle: "medium",
     timeStyle: "short",
   }).format(date);
+}
+
+function formatTokenCount(value: number) {
+  return value < 1000 ? String(value) : `${(value / 1000).toFixed(1)}k`;
+}
+
+function formatContextWindow(session: AgentSession) {
+  if (session.contextTokens == null || session.contextWindowSize == null) {
+    return "Not reported";
+  }
+  const utilization = session.contextWindowSize === 0
+    ? 0
+    : Math.round((session.contextTokens / session.contextWindowSize) * 100);
+  return `${formatTokenCount(session.contextTokens)} / ${formatTokenCount(session.contextWindowSize)} (${utilization}%)`;
 }
 
 const emptyToolSettings = (): ToolSettings => ({
@@ -805,7 +821,7 @@ function AgentSessionsView({
         <article className="session-summary-card"><span className="summary-icon running-icon">◉</span><div><strong>{sessions.filter((session) => session.status === "running").length}</strong><span>Running now</span></div><small>Live output streaming</small></article>
         <article className="session-summary-card"><span className="summary-icon waiting-icon">?</span><div><strong>{sessions.filter((session) => session.status === "waiting").length}</strong><span>Needs your input</span></div><small>Reply to keep it moving</small></article>
         <article className="session-summary-card"><span className="summary-icon paused-icon">Ⅱ</span><div><strong>{sessions.filter((session) => session.status === "paused").length}</strong><span>Paused</span></div><small>Supervisor controlled</small></article>
-        <article className="session-summary-card"><span className="summary-icon token-icon">⌁</span><div><strong>{sessions.reduce((total, session) => total + Number.parseFloat(session.tokens), 0).toFixed(1)}k</strong><span>Tokens this hour</span></div><small>Across {sessions.length} sessions</small></article>
+        <article className="session-summary-card"><span className="summary-icon token-icon">⌁</span><div><strong>{sessions.some((session) => session.contextTokens != null) ? formatTokenCount(sessions.reduce((total, session) => total + (session.contextTokens ?? 0), 0)) : "Not reported"}</strong><span>Context tokens</span></div><small>Latest reported context across {sessions.length} sessions</small></article>
       </section>
 
       <div className="session-toolbar">
@@ -855,7 +871,7 @@ function AgentSessionsView({
             <button className="secondary-button" type="button" onClick={() => setRenamingSession(false)} disabled={savingSessionName}>Cancel</button>
             <button className="primary-button" type="submit" disabled={savingSessionName || !sessionNameDraft.trim()}>{savingSessionName ? "Saving…" : "Save name"}</button>
           </form>}
-          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Token usage</span><strong>{selectedSession.tokens}</strong></div><div><span>Session</span><strong className="mono" title={selectedSession.externalSessionId ?? selectedSession.id}>{selectedSession.externalSessionId || selectedSession.id}</strong></div></div>
+          <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Context tokens</span><strong>{selectedSession.tokens}</strong></div><div><span>Context window</span><strong>{formatContextWindow(selectedSession)}</strong></div><div><span>Session</span><strong className="mono" title={selectedSession.externalSessionId ?? selectedSession.id}>{selectedSession.externalSessionId || selectedSession.id}</strong></div></div>
 
           <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
           <div className="transcript" style={{ "--transcript-font-size": `${transcriptFontSize}px` } as CSSProperties}>

@@ -96,6 +96,8 @@ struct AgentSession {
     step: String,
     elapsed: String,
     tokens: String,
+    context_tokens: Option<i64>,
+    context_window_size: Option<i64>,
     permission_mode: String,
     managed: bool,
     last_event: String,
@@ -239,10 +241,12 @@ fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
 
 fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
     let token_count: i64 = row.get(8)?;
+    let token_usage_available: bool = row.get::<_, i64>(9)? != 0 || token_count != 0;
+    let context_window_size: Option<i64> = row.get(10)?;
     Ok(AgentSession {
         id: row.get(0)?,
-        project_id: row.get(18)?,
-        task_id: row.get(19)?,
+        project_id: row.get(20)?,
+        task_id: row.get(21)?,
         project: row.get(1)?,
         task: row.get(2)?,
         branch: row.get(3)?,
@@ -250,17 +254,31 @@ fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSess
         status: row.get(5)?,
         step: row.get(6)?,
         elapsed: row.get(7)?,
-        tokens: format!("{:.1}k", token_count as f64 / 1000.0),
-        permission_mode: row.get(9)?,
-        managed: row.get::<_, String>(10)? == "managed",
-        last_event: row.get(11)?,
-        archived: row.get::<_, i64>(12)? != 0,
-        status_reason: row.get(13)?,
-        updated_at: row.get(14)?,
-        external_session_id: row.get(15)?,
-        task_done: row.get::<_, i64>(16)? != 0,
-        task_archived: row.get::<_, i64>(17)? != 0,
+        tokens: if token_usage_available {
+            format_token_count(token_count)
+        } else {
+            "Not reported".to_owned()
+        },
+        context_tokens: token_usage_available.then_some(token_count),
+        context_window_size,
+        permission_mode: row.get(11)?,
+        managed: row.get::<_, String>(12)? == "managed",
+        last_event: row.get(13)?,
+        archived: row.get::<_, i64>(14)? != 0,
+        status_reason: row.get(15)?,
+        updated_at: row.get(16)?,
+        external_session_id: row.get(17)?,
+        task_done: row.get::<_, i64>(18)? != 0,
+        task_archived: row.get::<_, i64>(19)? != 0,
     })
+}
+
+fn format_token_count(token_count: i64) -> String {
+    if token_count < 1000 {
+        token_count.to_string()
+    } else {
+        format!("{:.1}k", token_count as f64 / 1000.0)
+    }
 }
 
 fn validate_session_status(status: &str) -> Result<(), String> {
@@ -861,30 +879,52 @@ fn append_assistant_chunk(
     Ok(())
 }
 
-fn copilot_token_count_from_message(message: &Value) -> Option<i64> {
-    let update = &message["params"]["update"];
-    if update["sessionUpdate"].as_str() != Some("usage_update") {
-        return None;
+fn copilot_token_count_from_message(
+    message: &Value,
+    expected_session_id: &str,
+) -> Result<Option<(i64, i64)>, String> {
+    if message.get("method").and_then(Value::as_str) != Some("session/update") {
+        return Ok(None);
     }
-
-    let used = &update["used"];
-    let fields = [
-        "inputTokens",
-        "outputTokens",
-        "cacheReadInputTokens",
-        "cacheCreationInputTokens",
-    ];
-    let total = fields
-        .iter()
-        .filter_map(|field| used[*field].as_u64())
-        .fold(0_u64, u64::saturating_add);
-    i64::try_from(total).ok()
+    let params = message
+        .get("params")
+        .ok_or_else(|| "ACP session update is missing params.".to_owned())?;
+    let update = params
+        .get("update")
+        .ok_or_else(|| "ACP session update is missing update.".to_owned())?;
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("usage_update") {
+        return Ok(None);
+    }
+    let session_id = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "ACP session update is missing sessionId.".to_owned())?;
+    if session_id != expected_session_id {
+        return Err("ACP session update belongs to a different session.".to_owned());
+    }
+    let used = update
+        .get("used")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "ACP usage_update.used must be a nonnegative integer.".to_owned())?;
+    let size = update
+        .get("size")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "ACP usage_update.size must be a nonnegative integer.".to_owned())?;
+    let used = i64::try_from(used)
+        .map_err(|_| "ACP usage_update.used exceeds the supported range.".to_owned())?;
+    let size = i64::try_from(size)
+        .map_err(|_| "ACP usage_update.size exceeds the supported range.".to_owned())?;
+    if used > size {
+        return Err("ACP usage_update.used cannot exceed size.".to_owned());
+    }
+    Ok(Some((used, size)))
 }
 
 fn update_session_token_count(
     database: &Arc<Mutex<Connection>>,
     session_id: &str,
     token_count: i64,
+    context_window_size: Option<i64>,
 ) -> Result<(), String> {
     let connection = database
         .lock()
@@ -892,10 +932,11 @@ fn update_session_token_count(
     connection
         .execute(
             "UPDATE agent_sessions
-             SET token_count = ?2, last_seen_at = CURRENT_TIMESTAMP,
+             SET token_count = ?2, token_usage_available = 1, context_window_size = ?3,
+                 last_seen_at = CURRENT_TIMESTAMP,
                  updated_at = CURRENT_TIMESTAMP
              WHERE id = ?1",
-            params![session_id, token_count],
+            params![session_id, token_count, context_window_size],
         )
         .map_err(|error| format!("Unable to update agent session token usage: {error}"))?;
     Ok(())
@@ -1758,8 +1799,8 @@ fn list_agent_sessions_from_connection(
     let mut statement = connection
         .prepare(
             "SELECT s.id, p.name, s.task, s.branch, s.provider, s.status,
-                    s.current_step, s.started_at, s.token_count,
-                   s.permission_mode, s.origin, s.last_event, s.archived,
+                    s.current_step, s.started_at, s.token_count, s.token_usage_available,
+                   s.context_window_size, s.permission_mode, s.origin, s.last_event, s.archived,
                    s.status_reason, s.updated_at, s.external_session_id,
                    EXISTS(
                      SELECT 1 FROM project_tasks t
@@ -2214,9 +2255,28 @@ fn spawn_copilot_acp(
                 continue;
             };
 
-            if let Some(token_count) = copilot_token_count_from_message(&message) {
-                let _ = update_session_token_count(&database, &reader_session_id, token_count);
-                let _ = app.emit("agent-session-updated", &reader_session_id);
+            match copilot_token_count_from_message(&message, &reader_session_id) {
+                Ok(Some((token_count, context_window_size))) => {
+                    match update_session_token_count(
+                        &database,
+                        &reader_session_id,
+                        token_count,
+                        Some(context_window_size),
+                    ) {
+                        Ok(()) => {
+                            let _ = app.emit("agent-session-updated", &reader_session_id);
+                        }
+                        Err(error) => {
+                            eprintln!("{error}");
+                            let _ = app.emit("agent-session-usage-error", error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    let _ = app.emit("agent-session-usage-error", error);
+                }
+                Ok(None) => {}
             }
 
             if message.get("method").and_then(Value::as_str) == Some("session/request_permission") {
@@ -3477,6 +3537,7 @@ fn start_claude_turn(
                         &reader_database,
                         &reader_session_id,
                         token_count,
+                        None,
                     );
                 }
             }
@@ -3755,6 +3816,8 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
            status_reason TEXT NOT NULL DEFAULT '',
            current_step TEXT NOT NULL DEFAULT '',
            token_count INTEGER NOT NULL DEFAULT 0,
+           token_usage_available INTEGER NOT NULL DEFAULT 0,
+           context_window_size INTEGER,
            permission_mode TEXT NOT NULL DEFAULT 'plan',
            origin TEXT NOT NULL DEFAULT 'observed',
            loop_owned INTEGER NOT NULL DEFAULT 0,
@@ -3886,6 +3949,36 @@ fn initialize_schema(connection: &Connection) -> rusqlite::Result<()> {
             if error
                 .to_string()
                 .contains("duplicate column name: worktree_path")
+            {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
+    connection
+        .execute(
+            "ALTER TABLE agent_sessions ADD COLUMN token_usage_available INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .or_else(|error| {
+            if error
+                .to_string()
+                .contains("duplicate column name: token_usage_available")
+            {
+                Ok(0)
+            } else {
+                Err(error)
+            }
+        })?;
+    connection
+        .execute(
+            "ALTER TABLE agent_sessions ADD COLUMN context_window_size INTEGER",
+            [],
+        )
+        .or_else(|error| {
+            if error
+                .to_string()
+                .contains("duplicate column name: context_window_size")
             {
                 Ok(0)
             } else {
@@ -4609,5 +4702,58 @@ mod tests {
         assert!(failure.completed);
         assert!(failure.failed);
         assert_eq!(failure.result.as_deref(), Some("Tool failed"));
+    }
+
+    #[test]
+    fn copilot_usage_updates_parse_context_snapshots() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "copilot-session",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 12800,
+                    "size": 128000
+                }
+            }
+        });
+
+        assert_eq!(
+            copilot_token_count_from_message(&message, "copilot-session"),
+            Ok(Some((12800, 128000)))
+        );
+    }
+
+    #[test]
+    fn copilot_usage_rejects_malformed_updates() {
+        let missing_used = serde_json::json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "copilot-session",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "size": 128000
+                }
+            }
+        });
+        let fractional_used = serde_json::json!({
+            "method": "session/update",
+            "params": {
+                "sessionId": "copilot-session",
+                "update": {
+                    "sessionUpdate": "usage_update",
+                    "used": 12.5,
+                    "size": 128000
+                }
+            }
+        });
+
+        assert!(copilot_token_count_from_message(&missing_used, "copilot-session").is_err());
+        assert!(copilot_token_count_from_message(&fractional_used, "copilot-session").is_err());
+        assert_eq!(
+            copilot_token_count_from_message(&missing_used, "other-session"),
+            Err("ACP session update belongs to a different session.".to_owned())
+        );
     }
 }
