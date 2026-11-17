@@ -1402,11 +1402,12 @@ fn send_system_notification(
     }
     drop(connection);
 
-    let mut notification = app
-        .notification()
-        .builder()
-        .title(title)
-        .body(body)
+    let mut notification = app.notification().builder().title(title).body(body);
+    #[cfg(target_os = "linux")]
+    {
+        notification = notification.sound("bell");
+    }
+    notification = notification
         .extra("category", &category)
         .extra("sessionId", &session_id);
     if let Some(request_id) = request_id {
