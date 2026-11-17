@@ -426,6 +426,52 @@ fn hide_console_window(command: &mut Command) {
     }
 }
 
+fn configure_agent_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
+fn terminate_agent_process(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as libc::pid_t);
+        let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
+        if result == 0 {
+            return Ok(());
+        }
+
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error);
+        }
+        return match child.try_wait()? {
+            Some(_) => Ok(()),
+            None => child.kill(),
+        };
+    }
+
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("taskkill");
+        hide_console_window(&mut command);
+        let process_id = child.id().to_string();
+        let status = command
+            .args(["/PID", process_id.as_str(), "/T", "/F"])
+            .status()?;
+        if status.success() {
+            return Ok(());
+        }
+
+        return match child.try_wait()? {
+            Some(_) => Ok(()),
+            None => child.kill(),
+        };
+    }
+}
+
 fn copilot_command_for(executable: &Path) -> Command {
     #[cfg(windows)]
     if matches!(
@@ -1932,7 +1978,6 @@ fn stop_agent_session(
     session_id: String,
     database: State<'_, Database>,
     processes: State<'_, SessionProcesses>,
-    app: tauri::AppHandle,
 ) -> Result<(), String> {
     let connection = database
         .0
@@ -1957,21 +2002,18 @@ fn stop_agent_session(
         .cloned()
         .ok_or_else(|| "This session is not running in Agent Control Plane.".to_owned())?;
     control.stop_requested.store(true, Ordering::Relaxed);
-    control
+    if let Err(error) = control
         .child
         .lock()
-        .map_err(|_| "Agent process state is unavailable.".to_owned())?
-        .kill()
-        .map_err(|error| format!("Unable to stop agent session: {error}"))?;
-    update_session_status(
-        &database.0,
-        &session_id,
-        "completed",
-        "Stopped by user.",
-        "Stopped by user.",
-    )?;
-    app.emit("agent-session-updated", &session_id)
-        .map_err(|error| format!("Unable to publish agent session update: {error}"))?;
+        .map_err(|_| "Agent process state is unavailable.".to_owned())
+        .and_then(|mut child| {
+            terminate_agent_process(&mut child)
+                .map_err(|error| format!("Unable to stop agent session: {error}"))
+        })
+    {
+        control.stop_requested.store(false, Ordering::Relaxed);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -2086,6 +2128,7 @@ fn spawn_copilot_acp(
     app: tauri::AppHandle,
 ) -> Result<SessionControl, String> {
     let (mut command, executable) = copilot_command()?;
+    configure_agent_process(&mut command);
     let mut child = command
         .arg("--acp")
         .arg("--model")
@@ -3295,6 +3338,7 @@ fn start_claude_turn(
     };
 
     let mut command = claude_command();
+    configure_agent_process(&mut command);
     command
         .arg("--print")
         .arg("--output-format")
@@ -3952,6 +3996,39 @@ mod tests {
         fs::remove_dir_all(&home).expect("remove copilot fixture");
         assert_eq!(result, Some(path_shim));
         assert_eq!(fallback, Some(executable));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stopping_agent_process_terminates_its_process_group() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & echo $!; wait"]);
+        command.stdout(Stdio::piped()).stderr(Stdio::null());
+        configure_agent_process(&mut command);
+        let mut child = command.spawn().expect("start agent process group");
+        let mut descendant_pid = String::new();
+        BufReader::new(child.stdout.take().expect("agent stdout"))
+            .read_line(&mut descendant_pid)
+            .expect("read descendant PID");
+        let descendant_pid: u32 = descendant_pid.trim().parse().expect("parse descendant PID");
+
+        terminate_agent_process(&mut child).expect("terminate agent process group");
+        child.wait().expect("wait for agent process");
+
+        for _ in 0..50 {
+            let running = fs::read_to_string(format!("/proc/{descendant_pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(')')
+                        .map(|(_, fields)| !fields.trim_start().starts_with('Z'))
+                })
+                .unwrap_or(false);
+            if !running {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("agent process group left its descendant running");
     }
 
     #[cfg(windows)]
