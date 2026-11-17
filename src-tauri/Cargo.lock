@@ -13,6 +13,7 @@ name = "agent-control-plane"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "libc",
  "portable-pty",
  "reqwest 0.12.28",
  "rusqlite",
