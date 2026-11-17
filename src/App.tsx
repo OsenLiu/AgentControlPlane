@@ -1,7 +1,9 @@
 import { CSSProperties, FormEvent, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
+import { isPermissionGranted, onAction, requestPermission } from "@tauri-apps/plugin-notification";
 import appMetadata from "../package.json";
 import {
   ProjectDependenciesTab,
@@ -79,6 +81,9 @@ type Settings = {
   githubTokenConfigured: boolean;
   defaultProvider: "copilot" | "gemini" | "claudeCode";
   transcriptFontSize: number;
+  notificationsEnabled: boolean;
+  attentionNotificationsEnabled: boolean;
+  taskCompletionNotificationsEnabled: boolean;
 };
 
 type AgentProvider = "copilot" | "claudeCode";
@@ -86,6 +91,15 @@ type AgentProvider = "copilot" | "claudeCode";
 type SettingsForm = Settings & { githubToken: string };
 
 type SessionStatus = "starting" | "running" | "waiting" | "idle" | "paused" | "completed" | "failed" | "orphaned" | "unknown";
+type NotificationStatus = "unknown" | "available" | "blocked";
+type NotificationEvent = {
+  category: "attention" | "taskResult";
+  sessionId: string;
+  requestId?: string;
+  projectId?: string;
+  taskId?: string;
+  success?: boolean;
+};
 
 const taskReadyForReviewStep = "Task ready for review";
 
@@ -278,6 +292,9 @@ const emptySettings = (): Settings => ({
   githubTokenConfigured: false,
   defaultProvider: "claudeCode",
   transcriptFontSize: 16,
+  notificationsEnabled: true,
+  attentionNotificationsEnabled: true,
+  taskCompletionNotificationsEnabled: true,
 });
 
 const navItems = [
@@ -351,11 +368,17 @@ function SettingsView({
   setSettings,
   onSave,
   saving,
+  notificationStatus,
+  notificationError,
+  onCheckNotificationPermission,
 }: {
   settings: SettingsForm;
   setSettings: (settings: SettingsForm) => void;
   onSave: (event: FormEvent<HTMLFormElement>) => void;
   saving: boolean;
+  notificationStatus: NotificationStatus;
+  notificationError: string;
+  onCheckNotificationPermission: () => void;
 }) {
   const updateTool = (key: "copilot" | "claudeCode", field: keyof ToolSettings, value: boolean) => {
     setSettings({ ...settings, [key]: { ...settings[key], [field]: value } });
@@ -406,6 +429,31 @@ function SettingsView({
               {[12, 14, 16, 18, 20, 22, 24].map((size) => <option value={size} key={size}>{size}px</option>)}
             </select>
           </label>
+        </div>
+      </section>
+      <section className="settings-section">
+        <div className="section-header"><div><h2>Notifications</h2><span className="section-caption">System notifications for agent attention and task results.</span></div></div>
+        <div className="notifications-card">
+          <label className="notification-preference">
+            <span><strong>Enable notifications</strong><small>Master switch for system notifications.</small></span>
+            <span className="toggle"><input aria-label="Enable notifications" type="checkbox" checked={settings.notificationsEnabled} onChange={(event) => setSettings({ ...settings, notificationsEnabled: event.currentTarget.checked })} /><span /></span>
+          </label>
+          <label className="notification-preference">
+            <span><strong>Attention</strong><small>Notify when an agent needs you to respond or act.</small></span>
+            <span className="toggle"><input aria-label="Attention notifications" type="checkbox" checked={settings.attentionNotificationsEnabled} onChange={(event) => setSettings({ ...settings, attentionNotificationsEnabled: event.currentTarget.checked })} /><span /></span>
+          </label>
+          <label className="notification-preference">
+            <span><strong>Task completion</strong><small>Notify when an assigned task succeeds or fails.</small></span>
+            <span className="toggle"><input aria-label="Task completion notifications" type="checkbox" checked={settings.taskCompletionNotificationsEnabled} onChange={(event) => setSettings({ ...settings, taskCompletionNotificationsEnabled: event.currentTarget.checked })} /><span /></span>
+          </label>
+          <div className={`notification-os-status ${notificationStatus}`}>
+            <strong>{notificationStatus === "blocked" ? "Notifications blocked" : notificationStatus === "available" ? "Notification API ready" : "Notification permission not checked"}</strong>
+            <p>{notificationStatus === "blocked"
+              ? "The permission check or notification request was blocked. Enable notifications for Agent Control Plane in Windows Settings > System > Notifications, macOS System Settings > Notifications, or your Linux desktop's notification settings."
+              : "Delivery is controlled by the operating system and desktop environment; this app cannot confirm that a notification was displayed. If no notification appears, check your OS notification settings."}</p>
+            {notificationError && <p role="alert">{notificationError}</p>}
+            {notificationStatus === "blocked" && <button className="text-button" type="button" onClick={onCheckNotificationPermission}>Check permission again</button>}
+          </div>
         </div>
       </section>
       <section className="settings-section">
@@ -936,12 +984,16 @@ function AttentionInboxView({
   error,
   onRefresh,
   onOpenSession,
+  initialSessionId,
+  initialRequestId,
 }: {
   items: AttentionItem[];
   loading: boolean;
   error: string;
   onRefresh: () => Promise<void>;
   onOpenSession: (sessionId: string) => void;
+  initialSessionId?: string;
+  initialRequestId?: string;
 }) {
   const [filter, setFilter] = useState<AttentionKind | "all">("all");
   const [query, setQuery] = useState("");
@@ -953,7 +1005,10 @@ function AttentionInboxView({
     const searchable = `${item.title} ${item.project} ${item.branch} ${item.agent} ${item.summary}`.toLowerCase();
     return matchesFilter && searchable.includes(query.toLowerCase());
   });
-  const selectedItem = visibleItems.find((item) => item.id === selectedId) ?? visibleItems[0];
+  const selectedItem = visibleItems.find((item) => item.id === selectedId)
+    ?? visibleItems.find((item) => item.id === `${initialSessionId}:permission:${initialRequestId}`)
+    ?? visibleItems.find((item) => item.sessionId === initialSessionId)
+    ?? visibleItems[0];
   const priorityCount = items.filter((item) => item.priority === "High").length;
   const decisionCount = items.filter((item) => item.kind === "permission").length;
   const projectCount = new Set(items.map((item) => item.project)).size;
@@ -1193,6 +1248,7 @@ function TaskOutcomesView({
   onRefresh,
   onOpenSession,
   onOpenTask,
+  initialSessionId,
 }: {
   sessions: AgentSession[];
   loading: boolean;
@@ -1200,6 +1256,7 @@ function TaskOutcomesView({
   onRefresh: () => Promise<void>;
   onOpenSession: (session: AgentSession) => void;
   onOpenTask: (session: AgentSession) => void;
+  initialSessionId?: string;
 }) {
   const [filter, setFilter] = useState<"all" | "review" | "completed" | "failed">("all");
   const [query, setQuery] = useState("");
@@ -1213,7 +1270,9 @@ function TaskOutcomesView({
     const searchable = `${stripTaskCompletionProtocol(session.task)} ${session.project} ${session.branch} ${session.provider} ${session.statusReason} ${session.lastEvent}`.toLowerCase();
     return matchesFilter && searchable.includes(normalizedQuery);
   });
-  const selectedSession = visibleSessions.find((session) => session.id === selectedId) ?? visibleSessions[0];
+  const selectedSession = visibleSessions.find((session) => session.id === selectedId)
+    ?? visibleSessions.find((session) => session.id === initialSessionId)
+    ?? visibleSessions[0];
   const reviewCount = sessions.filter(isReadyForReview).length;
   const completedCount = sessions.filter((session) => session.status === "completed" && !isReadyForReview(session)).length;
   const failedCount = sessions.filter((session) => session.status === "failed").length;
@@ -1773,6 +1832,8 @@ function App() {
   const [userName, setUserName] = useState("");
   const [greeting, setGreeting] = useState(() => getGreetingForLocalTime(new Date()));
   const [sessionToOpen, setSessionToOpen] = useState("");
+  const [attentionSessionToOpen, setAttentionSessionToOpen] = useState<{ sessionId: string; requestId?: string } | null>(null);
+  const [taskOutcomeSessionToOpen, setTaskOutcomeSessionToOpen] = useState("");
   const [taskToOpen, setTaskToOpen] = useState<{ projectId: string; taskId: string } | null>(null);
   const [projectSessionToOpen, setProjectSessionToOpen] = useState<{ projectId: string; sessionId: string } | null>(null);
   const [showAddProject, setShowAddProject] = useState(false);
@@ -1785,6 +1846,9 @@ function App() {
   const [error, setError] = useState("");
   const [settings, setSettings] = useState<SettingsForm>({ ...emptySettings(), githubToken: "" });
   const [savingSettings, setSavingSettings] = useState(false);
+  const [notificationPromptOpen, setNotificationPromptOpen] = useState(false);
+  const [notificationStatus, setNotificationStatus] = useState<NotificationStatus>("unknown");
+  const [notificationError, setNotificationError] = useState("");
   const [attentionItems, setAttentionItems] = useState<AttentionItem[]>([]);
   const [attentionLoading, setAttentionLoading] = useState(true);
   const [attentionError, setAttentionError] = useState("");
@@ -1804,6 +1868,151 @@ function App() {
   const [readyBacklogLoading, setReadyBacklogLoading] = useState(true);
   const [readyBacklogError, setReadyBacklogError] = useState("");
   const [readyBacklogRefreshKey, setReadyBacklogRefreshKey] = useState(0);
+  const savedNotificationPreferencesRef = useRef({
+    enabled: true,
+    attention: true,
+    taskCompletion: true,
+  });
+  const notificationSettingsLoadedRef = useRef(false);
+  const notificationStatusRef = useRef<NotificationStatus>("unknown");
+  const notificationQueueRef = useRef<NotificationEvent[]>([]);
+  const notificationPromptOpenRef = useRef(false);
+  const notificationProcessingRef = useRef(false);
+  const taskResultSessionIdsRef = useRef(new Set<string>());
+  const sessionStatusesRef = useRef(new Map<string, SessionStatus>());
+  const hasSessionSnapshotRef = useRef(false);
+
+  function notificationEnabled(event: NotificationEvent) {
+    const preferences = savedNotificationPreferencesRef.current;
+    return preferences.enabled &&
+      (event.category === "attention" ? preferences.attention : preferences.taskCompletion);
+  }
+
+  function setNotificationPermissionStatus(status: NotificationStatus) {
+    notificationStatusRef.current = status;
+    setNotificationStatus(status);
+  }
+
+  async function processNotificationQueue() {
+    if (notificationProcessingRef.current || notificationPromptOpenRef.current) return;
+    notificationProcessingRef.current = true;
+    try {
+      while (notificationQueueRef.current.length > 0) {
+        const event = notificationQueueRef.current.shift();
+        if (!event || !notificationEnabled(event)) continue;
+        if (notificationStatusRef.current === "blocked") {
+          notificationQueueRef.current = [];
+          return;
+        }
+
+        let permissionGranted: boolean;
+        try {
+          permissionGranted = await isPermissionGranted();
+        } catch (reason) {
+          notificationQueueRef.current = [];
+          setNotificationPermissionStatus("blocked");
+          setNotificationError(reason instanceof Error ? reason.message : String(reason));
+          return;
+        }
+        if (!permissionGranted) {
+          notificationQueueRef.current.unshift(event);
+          notificationPromptOpenRef.current = true;
+          setNotificationPromptOpen(true);
+          return;
+        }
+
+        setNotificationPermissionStatus("available");
+        setNotificationError("");
+        try {
+          await invoke("send_system_notification", {
+            category: event.category,
+            sessionId: event.sessionId,
+            requestId: event.requestId ?? null,
+            projectId: event.projectId ?? null,
+            taskId: event.taskId ?? null,
+            success: event.success ?? null,
+          });
+        } catch (reason) {
+          notificationQueueRef.current = [];
+          setNotificationPermissionStatus("blocked");
+          setNotificationError(reason instanceof Error ? reason.message : String(reason));
+          return;
+        }
+      }
+    } finally {
+      notificationProcessingRef.current = false;
+    }
+  }
+
+  function queueNotification(event: NotificationEvent) {
+    if (event.category === "taskResult") {
+      if (taskResultSessionIdsRef.current.has(event.sessionId)) return;
+      taskResultSessionIdsRef.current.add(event.sessionId);
+    }
+    if (!notificationSettingsLoadedRef.current || !notificationEnabled(event) ||
+      notificationStatusRef.current === "blocked") {
+      return;
+    }
+    notificationQueueRef.current.push(event);
+    void processNotificationQueue();
+  }
+
+  async function allowNotificationPrompt() {
+    try {
+      let permissionGranted = await isPermissionGranted();
+      if (!permissionGranted) {
+        permissionGranted = await requestPermission() === "granted";
+      }
+      notificationPromptOpenRef.current = false;
+      setNotificationPromptOpen(false);
+      if (!permissionGranted) {
+        notificationQueueRef.current = [];
+        setNotificationPermissionStatus("blocked");
+        setNotificationError("The operating system did not grant notification permission.");
+        return;
+      }
+      setNotificationPermissionStatus("available");
+      setNotificationError("");
+      void processNotificationQueue();
+    } catch (reason) {
+      notificationPromptOpenRef.current = false;
+      setNotificationPromptOpen(false);
+      notificationQueueRef.current = [];
+      setNotificationPermissionStatus("blocked");
+      setNotificationError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
+
+  function dismissNotificationPrompt() {
+    notificationPromptOpenRef.current = false;
+    notificationQueueRef.current = [];
+    setNotificationPromptOpen(false);
+  }
+
+  function applySavedNotificationPreferences(value: Settings) {
+    savedNotificationPreferencesRef.current = {
+      enabled: value.notificationsEnabled,
+      attention: value.attentionNotificationsEnabled,
+      taskCompletion: value.taskCompletionNotificationsEnabled,
+    };
+    notificationSettingsLoadedRef.current = true;
+    notificationQueueRef.current = notificationQueueRef.current.filter(notificationEnabled);
+    if (notificationQueueRef.current.length === 0 && notificationPromptOpenRef.current) {
+      notificationPromptOpenRef.current = false;
+      setNotificationPromptOpen(false);
+    }
+  }
+
+  async function checkNotificationPermission() {
+    try {
+      const granted = await isPermissionGranted();
+      setNotificationPermissionStatus(granted ? "available" : "blocked");
+      setNotificationError(granted ? "" : "The operating system has not granted notification permission.");
+    } catch (reason) {
+      setNotificationPermissionStatus("blocked");
+      setNotificationError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }
 
   async function loadProjects() {
     setLoadingProjects(true);
@@ -1841,11 +2050,37 @@ function App() {
           !session.taskArchived,
         )
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+      let snapshotAttentionItems: AttentionItem[] | null = null;
       try {
-        setAttentionItems(await loadAttentionItemsFromBackend(sessions));
+        snapshotAttentionItems = await loadAttentionItemsFromBackend(sessions);
+        setAttentionItems(snapshotAttentionItems);
       } catch (reason) {
         setAttentionError(reason instanceof Error ? reason.message : String(reason));
       }
+      if (hasSessionSnapshotRef.current && notificationSettingsLoadedRef.current) {
+        const permissionSessionIds = new Set(
+          snapshotAttentionItems?.filter((item) => item.kind === "permission").map((item) => item.sessionId) ?? [],
+        );
+        for (const session of sessions) {
+          const previousStatus = sessionStatusesRef.current.get(session.id);
+          if (previousStatus === session.status) continue;
+          if (session.status !== "completed" && session.status !== "failed") {
+            taskResultSessionIdsRef.current.delete(session.id);
+          }
+          if (session.status === "waiting" && snapshotAttentionItems &&
+            !permissionSessionIds.has(session.id)) {
+            queueNotification({ category: "attention", sessionId: session.id });
+          } else if (session.status === "completed" || session.status === "failed") {
+            queueNotification({
+              category: "taskResult",
+              sessionId: session.id,
+              success: session.status === "completed",
+            });
+          }
+        }
+      }
+      sessionStatusesRef.current = new Map(sessions.map((session) => [session.id, session.status]));
+      hasSessionSnapshotRef.current = true;
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
       setAttentionError(message);
@@ -1978,14 +2213,14 @@ function App() {
   useEffect(() => {
     void refreshAttentionItems();
     let disposed = false;
-    let unsubscribe: (() => void) | undefined;
+    const unsubscribers: (() => void)[] = [];
     void listen<string>("agent-session-updated", () => {
       void refreshAttentionItems();
     }).then((unlisten) => {
       if (disposed) {
         unlisten();
       } else {
-        unsubscribe = unlisten;
+        unsubscribers.push(unlisten);
       }
     }).catch((reason) => {
       const message = reason instanceof Error ? reason.message : String(reason);
@@ -1993,9 +2228,79 @@ function App() {
       setActivityError(message);
       setTaskOutcomesError(message);
     });
+    void listen<{ sessionId: string; permission: PermissionRequest }>("agent-session-permission-requested", (event) => {
+      queueNotification({
+        category: "attention",
+        sessionId: event.payload.sessionId,
+        requestId: event.payload.permission.requestId,
+      });
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubscribers.push(unlisten);
+    }).catch((reason) => {
+      setNotificationError(reason instanceof Error ? reason.message : String(reason));
+    });
+    void listen<{
+      sessionId: string;
+      projectId: string;
+      taskId: string;
+      success: boolean;
+    }>("agent-task-result", (event) => {
+      queueNotification({ category: "taskResult", ...event.payload });
+    }).then((unlisten) => {
+      if (disposed) unlisten();
+      else unsubscribers.push(unlisten);
+    }).catch((reason) => {
+      setNotificationError(reason instanceof Error ? reason.message : String(reason));
+    });
     return () => {
       disposed = true;
-      unsubscribe?.();
+      unsubscribers.forEach((unlisten) => unlisten());
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unregister: (() => void) | undefined;
+    void onAction((event) => {
+      if (event.actionId !== "tap") return;
+      const extra = event.notification?.extra;
+      if (!extra) return;
+      const sessionId = extra?.sessionId;
+      if (typeof sessionId !== "string") return;
+      const requestId = extra.requestId;
+      const category = extra.category;
+      if (category !== "attention" && category !== "taskResult") return;
+
+      if (category === "attention") {
+        setAttentionSessionToOpen({
+          sessionId,
+          ...(typeof requestId === "string" ? { requestId } : {}),
+        });
+        setActiveNav("Attention inbox");
+        void refreshAttentionItems();
+      } else {
+        setTaskOutcomeSessionToOpen(sessionId);
+        setActiveNav("Task outcomes");
+        void refreshAttentionItems();
+      }
+      void getCurrentWindow().show()
+        .then(() => getCurrentWindow().setFocus())
+        .catch((reason) => {
+          setNotificationError(reason instanceof Error ? reason.message : String(reason));
+        });
+    }).then((listener) => {
+      if (disposed) {
+        void listener.unregister();
+      } else {
+        unregister = () => { void listener.unregister(); };
+      }
+    }).catch((reason) => {
+      setNotificationError(reason instanceof Error ? reason.message : String(reason));
+    });
+    return () => {
+      disposed = true;
+      unregister?.();
     };
   }, []);
 
@@ -2019,7 +2324,9 @@ function App() {
   async function loadSettings() {
     try {
       const loaded = await invoke<Settings>("load_settings");
-      setSettings({ ...emptySettings(), ...loaded, transcriptFontSize: loaded.transcriptFontSize ?? 16, githubToken: "" });
+      const normalized = { ...emptySettings(), ...loaded, transcriptFontSize: loaded.transcriptFontSize ?? 16, githubToken: "" };
+      setSettings(normalized);
+      applySavedNotificationPreferences(normalized);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -2034,7 +2341,9 @@ function App() {
       const saved = await invoke<Settings>("save_settings", {
         input: { ...input, githubToken: input.githubAuthMethod === "token" ? githubToken : "" },
       });
-      setSettings({ ...emptySettings(), ...saved, transcriptFontSize: saved.transcriptFontSize ?? 16, githubToken: "" });
+      const normalized = { ...emptySettings(), ...saved, transcriptFontSize: saved.transcriptFontSize ?? 16, githubToken: "" };
+      setSettings(normalized);
+      applySavedNotificationPreferences(normalized);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -2116,6 +2425,12 @@ function App() {
   }
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
+  const taskOutcomeSession = activitySessions.find((session) => session.id === taskOutcomeSessionToOpen);
+  const taskOutcomeSessions = taskOutcomeSession &&
+    (taskOutcomeSession.status === "completed" || taskOutcomeSession.status === "failed") &&
+    !taskOutcomes.some((session) => session.id === taskOutcomeSession.id)
+    ? [taskOutcomeSession, ...taskOutcomes]
+    : taskOutcomes;
   const urgentAttentionCount = attentionItems.filter((item) => item.priority === "High").length;
   const completedPipelineRuns = dashboardPipelineRuns
     .filter((run) => run.status === "completed" && ["success", "failure", "timed_out", "startup_failure"].includes(run.conclusion ?? ""))
@@ -2196,7 +2511,52 @@ function App() {
       </aside>
 
       <main className="main-content">
-        {activeNav === "Settings" ? <SettingsView settings={settings} setSettings={setSettings} onSave={saveSettings} saving={savingSettings} /> : activeNav === "Agent sessions" ? <AgentSessionsView settings={settings} transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} /> : activeNav === "Attention inbox" ? <AttentionInboxView items={attentionItems} loading={attentionLoading} error={attentionError} onRefresh={refreshAttentionItems} onOpenSession={openAttentionSession} /> : activeNav === "Task outcomes" ? <TaskOutcomesView sessions={taskOutcomes} loading={taskOutcomesLoading} error={taskOutcomesError} onRefresh={refreshAttentionItems} onOpenSession={openProjectSession} onOpenTask={openProjectTask} /> : activeNav === "Project workspace" && selectedProject ? <ProjectWorkspaceView key={selectedProject.id} project={selectedProject} settings={settings} transcriptFontSize={settings.transcriptFontSize} initialTaskId={taskToOpen?.projectId === selectedProject.id ? taskToOpen.taskId : undefined} initialSessionId={projectSessionToOpen?.projectId === selectedProject.id ? projectSessionToOpen.sessionId : undefined} onProjectUpdated={updateProject} onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }} /> : activeNav === "Projects" || activeNav === "Project workspace" ? <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} onRemoveProject={removeProject} /> : <>
+        {activeNav === "Settings" ? (
+          <SettingsView
+            settings={settings}
+            setSettings={setSettings}
+            onSave={saveSettings}
+            saving={savingSettings}
+            notificationStatus={notificationStatus}
+            notificationError={notificationError}
+            onCheckNotificationPermission={() => void checkNotificationPermission()}
+          />
+        ) : activeNav === "Agent sessions" ? (
+          <AgentSessionsView settings={settings} transcriptFontSize={settings.transcriptFontSize} initialSessionId={sessionToOpen} />
+        ) : activeNav === "Attention inbox" ? (
+          <AttentionInboxView
+            items={attentionItems}
+            loading={attentionLoading}
+            error={attentionError}
+            onRefresh={refreshAttentionItems}
+            onOpenSession={openAttentionSession}
+            initialSessionId={attentionSessionToOpen?.sessionId}
+            initialRequestId={attentionSessionToOpen?.requestId}
+          />
+        ) : activeNav === "Task outcomes" ? (
+          <TaskOutcomesView
+            sessions={taskOutcomeSessions}
+            loading={taskOutcomesLoading}
+            error={taskOutcomesError}
+            onRefresh={refreshAttentionItems}
+            onOpenSession={openProjectSession}
+            onOpenTask={openProjectTask}
+            initialSessionId={taskOutcomeSessionToOpen}
+          />
+        ) : activeNav === "Project workspace" && selectedProject ? (
+          <ProjectWorkspaceView
+            key={selectedProject.id}
+            project={selectedProject}
+            settings={settings}
+            transcriptFontSize={settings.transcriptFontSize}
+            initialTaskId={taskToOpen?.projectId === selectedProject.id ? taskToOpen.taskId : undefined}
+            initialSessionId={projectSessionToOpen?.projectId === selectedProject.id ? projectSessionToOpen.sessionId : undefined}
+            onProjectUpdated={updateProject}
+            onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }}
+          />
+        ) : activeNav === "Projects" || activeNav === "Project workspace" ? (
+          <ProjectsView projects={projects} loading={loadingProjects} onAddProject={() => setShowAddProject(true)} onOpenProject={openProjectWorkspace} onRefresh={() => void loadProjects()} onRemoveProject={removeProject} />
+        ) : <>
         <header className="topbar">
           <div>
             <p className="eyebrow">Thursday, November 6, 2026</p>
@@ -2361,6 +2721,18 @@ function App() {
         </>}
       </main>
 
+      {notificationPromptOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="modal notification-permission-modal" role="dialog" aria-modal="true" aria-labelledby="notification-permission-title">
+            <div className="modal-title"><div><p className="eyebrow">SYSTEM NOTIFICATIONS</p><h2 id="notification-permission-title">Stay informed about agent activity</h2></div></div>
+            <p className="modal-copy">Allow Agent Control Plane to notify you when an agent needs your input or a task finishes. Your operating system may ask you to allow notifications.</p>
+            <div className="modal-actions">
+              <button type="button" className="secondary-button" onClick={dismissNotificationPrompt}>Not now</button>
+              <button type="button" className="primary-button" onClick={() => void allowNotificationPrompt()}>Enable notifications</button>
+            </div>
+          </section>
+        </div>
+      )}
       {showAddProject && (
         <div className="modal-backdrop" role="presentation" onClick={() => setShowAddProject(false)}>
           <form className="modal" role="dialog" aria-modal="true" aria-labelledby="add-project-title" onSubmit={addProject} onClick={(event) => event.stopPropagation()}>

@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -17,6 +17,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_notification::NotificationExt;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -151,6 +152,9 @@ struct SettingsInput {
     github_token: String,
     default_provider: String,
     transcript_font_size: u8,
+    notifications_enabled: bool,
+    attention_notifications_enabled: bool,
+    task_completion_notifications_enabled: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -170,6 +174,50 @@ struct Settings {
     github_token_configured: bool,
     default_provider: String,
     transcript_font_size: u8,
+    notifications_enabled: bool,
+    attention_notifications_enabled: bool,
+    task_completion_notifications_enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TaskResultNotificationEvent {
+    session_id: String,
+    project_id: String,
+    task_id: String,
+    success: bool,
+}
+
+fn task_result_notification_event(
+    connection: &Connection,
+    session_id: &str,
+    success: bool,
+) -> Result<Option<TaskResultNotificationEvent>, String> {
+    connection
+        .query_row(
+            "SELECT p.id, t.id FROM project_tasks t
+             JOIN projects p ON p.id = t.project_id
+             WHERE t.session_id = ?1 AND t.status = 'in_progress'",
+            [session_id],
+            |row| {
+                Ok(TaskResultNotificationEvent {
+                    session_id: session_id.to_owned(),
+                    project_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    success,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("Unable to read task notification details: {error}"))
+}
+
+fn emit_task_result_notification(
+    app: &tauri::AppHandle,
+    event: TaskResultNotificationEvent,
+) -> Result<(), String> {
+    app.emit("agent-task-result", event)
+        .map_err(|error| format!("Unable to publish task result notification: {error}"))
 }
 
 #[derive(Debug)]
@@ -1096,6 +1144,22 @@ fn default_tool_settings() -> ToolSettings {
     ToolSettings { enabled: false }
 }
 
+fn read_notification_setting(connection: &Connection, key: &str) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = ?1",
+            [key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("Unable to read notification setting {key}: {error}"))
+        .map(|value| {
+            value
+                .and_then(|value| value.parse::<bool>().ok())
+                .unwrap_or(true)
+        })
+}
+
 fn read_tool_settings(connection: &Connection, provider: &str) -> Result<ToolSettings, String> {
     connection
         .query_row(
@@ -1165,7 +1229,6 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
         .and_then(|value| value.parse::<u8>().ok())
         .filter(|size| (12..=24).contains(size))
         .unwrap_or(16);
-
     Ok(Settings {
         copilot: read("copilot"),
         gemini: read("gemini"),
@@ -1175,6 +1238,15 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
         github_token_configured: github_token_configured(),
         default_provider,
         transcript_font_size,
+        notifications_enabled: read_notification_setting(&connection, "notifications_enabled")?,
+        attention_notifications_enabled: read_notification_setting(
+            &connection,
+            "attention_notifications_enabled",
+        )?,
+        task_completion_notifications_enabled: read_notification_setting(
+            &connection,
+            "task_completion_notifications_enabled",
+        )?,
     })
 }
 
@@ -1254,12 +1326,104 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
             [input.transcript_font_size.to_string()],
         )
         .map_err(|error| format!("Unable to save transcript text size: {error}"))?;
+    for (key, enabled) in [
+        ("notifications_enabled", input.notifications_enabled),
+        (
+            "attention_notifications_enabled",
+            input.attention_notifications_enabled,
+        ),
+        (
+            "task_completion_notifications_enabled",
+            input.task_completion_notifications_enabled,
+        ),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, enabled.to_string()],
+            )
+            .map_err(|error| format!("Unable to save {key}: {error}"))?;
+    }
     transaction
         .commit()
         .map_err(|error| format!("Unable to commit settings: {error}"))?;
 
     drop(connection);
     load_settings(database)
+}
+
+#[tauri::command]
+fn send_system_notification(
+    category: String,
+    session_id: String,
+    request_id: Option<String>,
+    project_id: Option<String>,
+    task_id: Option<String>,
+    success: Option<bool>,
+    database: State<'_, Database>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let (title, body) = match category.as_str() {
+        "attention" => (
+            "Agent needs your attention",
+            "Open Agent Control Plane to review a pending request.",
+        ),
+        "taskResult" => match success {
+            Some(true) => (
+                "Task completed",
+                "Open Agent Control Plane to view the outcome.",
+            ),
+            Some(false) => (
+                "Task failed",
+                "Open Agent Control Plane to view the outcome.",
+            ),
+            None => return Err("A task result notification needs an outcome.".to_owned()),
+        },
+        _ => return Err("Choose a supported notification category.".to_owned()),
+    };
+    if session_id.is_empty() {
+        return Err("A session is required for a notification.".to_owned());
+    }
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Notification settings database is unavailable.".to_owned())?;
+    let master_enabled = read_notification_setting(&connection, "notifications_enabled")?;
+    let category_enabled = match category.as_str() {
+        "attention" => read_notification_setting(&connection, "attention_notifications_enabled")?,
+        "taskResult" => {
+            read_notification_setting(&connection, "task_completion_notifications_enabled")?
+        }
+        _ => false,
+    };
+    if !master_enabled || !category_enabled {
+        return Ok(());
+    }
+    drop(connection);
+
+    let mut notification = app
+        .notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .extra("category", &category)
+        .extra("sessionId", &session_id);
+    if let Some(request_id) = request_id {
+        notification = notification.extra("requestId", request_id);
+    }
+    if let Some(project_id) = project_id {
+        notification = notification.extra("projectId", project_id);
+    }
+    if let Some(task_id) = task_id {
+        notification = notification.extra("taskId", task_id);
+    }
+    if let Some(success) = success {
+        notification = notification.extra("success", success);
+    }
+    notification
+        .show()
+        .map_err(|error| format!("Unable to show system notification: {error}"))
 }
 
 #[tauri::command]
@@ -1614,8 +1778,14 @@ fn handle_project_task_turn(
     processes: &SessionProcesses,
     app: &tauri::AppHandle,
 ) {
-    let result =
-        (|| -> Result<(Option<(String, bool)>, Option<(String, String, String)>), String> {
+    let result = (|| -> Result<
+        (
+            Option<(String, bool)>,
+            Option<(String, String, String)>,
+            Option<TaskResultNotificationEvent>,
+        ),
+        String,
+    > {
             let connection = database
                 .lock()
                 .map_err(|_| "Project database is unavailable.".to_owned())?;
@@ -1665,6 +1835,17 @@ fn handle_project_task_turn(
                 task.is_some_and(|(task_loop_enabled, _, _, auto_approve)| {
                     !auto_approve && !(looping && task_loop_enabled)
                 });
+            let task_result_event = match report.as_ref() {
+                Some(report) if report.state == "blocked" => {
+                    task_result_notification_event(&connection, session_id, false)?
+                }
+                Some(report)
+                    if report.state == "complete" && report.gate_passed == Some(true) =>
+                {
+                    task_result_notification_event(&connection, session_id, true)?
+                }
+                _ => None,
+            };
             if let (Some((task_loop_enabled, _, _, _)), Some(report)) = (task, report.as_ref()) {
                 match report.state.as_str() {
                     "complete" if report.gate_passed == Some(true) => {
@@ -1747,17 +1928,26 @@ fn handle_project_task_turn(
             Ok((
                 schedule_loop.then_some((project_id, looping)),
                 status_update,
+                task_result_event,
             ))
         })();
 
     match result {
-        Ok((schedule, status_update)) => {
+        Ok((schedule, status_update, task_result_event)) => {
+            let mut status_updated = true;
             if let Some((status, reason, detail)) = status_update {
                 if let Err(error) =
                     update_session_status(database, session_id, &status, &reason, &detail)
                 {
+                    status_updated = false;
                     let _ = app.emit("project-loop-error", error);
                 }
+            }
+            if status_updated
+                && let Some(event) = task_result_event
+                && let Err(error) = emit_task_result_notification(app, event)
+            {
+                let _ = app.emit("project-loop-error", error);
             }
             if let Some((project_id, true)) = schedule {
                 if let Err(error) = maybe_start_next_loop_task(
@@ -1777,12 +1967,24 @@ fn handle_project_task_turn(
 }
 
 fn fail_project_task(database: &Arc<Mutex<Connection>>, session_id: &str, app: &tauri::AppHandle) {
-    let result = database
-        .lock()
-        .map_err(|_| "Project database is unavailable.".to_owned())
-        .and_then(|connection| finish_project_task_session(&connection, session_id, false));
-    if let Err(error) = result {
-        let _ = app.emit("project-loop-error", error);
+    let result = (|| -> Result<Option<TaskResultNotificationEvent>, String> {
+        let connection = database
+            .lock()
+            .map_err(|_| "Project database is unavailable.".to_owned())?;
+        let event = task_result_notification_event(&connection, session_id, false)?;
+        finish_project_task_session(&connection, session_id, false)?;
+        Ok(event)
+    })();
+    match result {
+        Ok(Some(event)) => {
+            if let Err(error) = emit_task_result_notification(app, event) {
+                let _ = app.emit("project-loop-error", error);
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = app.emit("project-loop-error", error);
+        }
     }
 }
 
@@ -4003,6 +4205,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             app.manage(open_database(app.handle())?);
             app.manage(SessionProcesses(Arc::new(Mutex::new(HashMap::new()))));
@@ -4047,7 +4250,8 @@ pub fn run() {
             resize_project_terminal,
             close_project_terminal,
             load_settings,
-            save_settings
+            save_settings,
+            send_system_notification
         ])
         .run(tauri::generate_context!())
         .expect("error while running Agent Control Plane");
@@ -4175,6 +4379,70 @@ mod tests {
             .expect("session query");
 
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn notification_preferences_default_to_enabled_and_persist_independently() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+
+        assert!(read_notification_setting(&connection, "notifications_enabled").expect("master"));
+        assert!(
+            read_notification_setting(&connection, "attention_notifications_enabled")
+                .expect("attention")
+        );
+        assert!(
+            read_notification_setting(&connection, "task_completion_notifications_enabled")
+                .expect("task completion")
+        );
+
+        connection
+            .execute_batch(
+                "INSERT INTO app_settings (key, value) VALUES
+                   ('notifications_enabled', 'false'),
+                   ('attention_notifications_enabled', 'true'),
+                   ('task_completion_notifications_enabled', 'false')",
+            )
+            .expect("notification preferences");
+
+        assert!(!read_notification_setting(&connection, "notifications_enabled").expect("master"));
+        assert!(
+            read_notification_setting(&connection, "attention_notifications_enabled")
+                .expect("attention")
+        );
+        assert!(
+            !read_notification_setting(&connection, "task_completion_notifications_enabled")
+                .expect("task completion")
+        );
+    }
+
+    #[test]
+    fn task_result_notification_resolves_only_active_task_links() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        connection
+            .execute_batch(
+                "INSERT INTO projects (id, name, path, branch, current_commit, git_state)
+                 VALUES ('project-1', 'Project', '/tmp/project', 'main', 'abc', 'clean');
+                 INSERT INTO project_tasks (id, project_id, title, status, session_id)
+                 VALUES ('task-1', 'project-1', 'Sensitive task title', 'in_progress', 'session-1');",
+            )
+            .expect("project task link");
+
+        let event = task_result_notification_event(&connection, "session-1", false)
+            .expect("task notification query")
+            .expect("active task result");
+        assert_eq!(event.session_id, "session-1");
+        assert_eq!(event.project_id, "project-1");
+        assert_eq!(event.task_id, "task-1");
+        assert!(!event.success);
+
+        finish_project_task_session(&connection, "session-1", false).expect("finish failed task");
+        assert!(
+            task_result_notification_event(&connection, "session-1", false)
+                .expect("task notification query")
+                .is_none()
+        );
     }
 
     #[test]

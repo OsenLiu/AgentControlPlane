@@ -17,6 +17,8 @@ in.
   state, and resume conversations.
 - **Human-in-the-loop controls** — review permission requests and failed
   sessions in the attention inbox, then choose how to proceed.
+- **Native system notifications** — get alerted when an agent needs attention
+  or an assigned task completes, with separate controls in Settings.
 - **Outcome review** — see completed, failed, and review-ready work and inspect
   results before marking tasks done.
 - **Project tools in context** — browse diffs, terminals, pipelines,

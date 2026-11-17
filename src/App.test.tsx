@@ -1,15 +1,26 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import App, { getGreetingForLocalTime } from "./App";
 import { ProjectDiffsTab, ProjectTasksTab } from "./project/ProjectFeatureTabs";
+
+const testNotificationEvents = vi.hoisted(() => ({
+  handlers: new Map<string, (event: { payload: unknown }) => void>(),
+  actionHandlers: [] as Array<(event: {
+    actionId: string;
+    notification: { extra: Record<string, unknown> } | null;
+  }) => void>,
+}));
 
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => vi.fn()),
+  listen: vi.fn(async (name: string, handler: (event: { payload: unknown }) => void) => {
+    testNotificationEvents.handlers.set(name, handler);
+    return () => testNotificationEvents.handlers.delete(name);
+  }),
 }));
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -18,6 +29,22 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({ show: vi.fn(async () => undefined), setFocus: vi.fn(async () => undefined) }),
+}));
+
+vi.mock("@tauri-apps/plugin-notification", () => ({
+  isPermissionGranted: vi.fn(async () => true),
+  requestPermission: vi.fn(async () => "granted"),
+  onAction: vi.fn(async (handler: (event: {
+    actionId: string;
+    notification: { extra: Record<string, unknown> } | null;
+  }) => void) => {
+    testNotificationEvents.actionHandlers.push(handler);
+    return { unregister: vi.fn() };
+  }),
 }));
 
 const invokeMock = vi.mocked(invoke);
@@ -30,15 +57,22 @@ const settings = {
   githubAuthMethod: "token" as const,
   githubTokenConfigured: false,
   defaultProvider: "claudeCode" as const,
+  transcriptFontSize: 16,
+  notificationsEnabled: true,
+  attentionNotificationsEnabled: true,
+  taskCompletionNotificationsEnabled: true,
 };
 
 beforeEach(() => {
+  testNotificationEvents.handlers.clear();
+  testNotificationEvents.actionHandlers.length = 0;
   invokeMock.mockImplementation(async (command) => {
     if (command === "get_current_username") return "Test User";
     if (command === "list_projects") return [];
     if (command === "list_agent_sessions") return [];
     if (command === "get_pending_session_permission") return null;
     if (command === "load_settings") return settings;
+    if (command === "send_system_notification") return undefined;
     if (command === "list_project_tasks") return [];
     if (command === "get_project_diff") return { branch: "main", changedFiles: [], diff: "", truncated: false };
     if (command === "list_project_terminals") return [];
@@ -338,6 +372,203 @@ describe("App", () => {
     expect(screen.queryByText("Gemini CLI")).toBeNull();
     expect(screen.getByRole("radio", { name: /GitHub Copilot CLI/ })).toBeTruthy();
     expect(screen.getByRole("radio", { name: /Claude Code CLI/ })).toBeTruthy();
+  });
+
+  it("persists independent notification preferences without changing category selections", async () => {
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "save_settings") return settings;
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    const masterSwitch = screen.getByRole("checkbox", { name: "Enable notifications" });
+    const attentionSwitch = screen.getByRole("checkbox", { name: "Attention notifications" });
+    const completionSwitch = screen.getByRole("checkbox", { name: "Task completion notifications" });
+    expect((masterSwitch as HTMLInputElement).checked).toBe(true);
+    expect((attentionSwitch as HTMLInputElement).checked).toBe(true);
+    expect((completionSwitch as HTMLInputElement).checked).toBe(true);
+
+    fireEvent.click(masterSwitch);
+    expect((attentionSwitch as HTMLInputElement).checked).toBe(true);
+    expect((completionSwitch as HTMLInputElement).checked).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
+      "save_settings",
+      { input: expect.objectContaining({
+        notificationsEnabled: false,
+        attentionNotificationsEnabled: true,
+        taskCompletionNotificationsEnabled: true,
+      }) },
+    ));
+  });
+
+  it("notifies for a new actionable waiting state but not routine session updates", async () => {
+    let session = {
+      id: "session-attention",
+      projectId: "project-1",
+      taskId: null,
+      project: "Example project",
+      task: "Build a dashboard",
+      branch: "main",
+      provider: "claudeCode",
+      status: "running",
+      step: "Working",
+      elapsed: "1m",
+      tokens: "0",
+      permissionMode: "Plan",
+      managed: true,
+      lastEvent: "",
+      archived: false,
+      statusReason: "",
+      updatedAt: "2026-07-01T00:00:00Z",
+      taskDone: false,
+      taskArchived: false,
+    };
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_agent_sessions") return [session];
+      if (command === "get_pending_session_permission") return null;
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    await screen.findByText("Build a dashboard");
+    await waitFor(() => expect(testNotificationEvents.handlers.has("agent-session-updated")).toBe(true));
+    const updateListener = testNotificationEvents.handlers.get("agent-session-updated");
+    if (!updateListener) throw new Error("Missing session update listener");
+
+    session = { ...session, status: "idle", step: "Ready for your message" };
+    await act(async () => updateListener({ payload: session.id }));
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "list_agent_sessions").length).toBeGreaterThan(1));
+    expect(invokeMock).not.toHaveBeenCalledWith("send_system_notification", expect.anything());
+
+    session = { ...session, status: "waiting", step: "Agent needs your direction" };
+    await act(async () => updateListener({ payload: session.id }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("send_system_notification", expect.objectContaining({
+      category: "attention",
+      sessionId: session.id,
+    })));
+  });
+
+  it("notifies when a session reaches a successful or failed task outcome", async () => {
+    let session = {
+      id: "session-terminal-result",
+      projectId: "project-1",
+      taskId: null,
+      project: "Example project",
+      task: "Build a dashboard",
+      branch: "main",
+      provider: "claudeCode",
+      status: "running",
+      step: "Working",
+      elapsed: "1m",
+      tokens: "0",
+      permissionMode: "Plan",
+      managed: true,
+      lastEvent: "",
+      archived: false,
+      statusReason: "",
+      updatedAt: "2026-07-01T00:00:00Z",
+      taskDone: false,
+      taskArchived: false,
+    };
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_agent_sessions") return [session];
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    await screen.findByText("Build a dashboard");
+    await waitFor(() => expect(testNotificationEvents.handlers.has("agent-session-updated")).toBe(true));
+    const updateListener = testNotificationEvents.handlers.get("agent-session-updated");
+    if (!updateListener) throw new Error("Missing session update listener");
+
+    session = { ...session, status: "completed" };
+    await act(async () => updateListener({ payload: session.id }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("send_system_notification", expect.objectContaining({
+      category: "taskResult",
+      sessionId: session.id,
+      success: true,
+    })));
+
+    session = { ...session, status: "running" };
+    await act(async () => updateListener({ payload: session.id }));
+    await waitFor(() => expect(invokeMock.mock.calls.filter(([command]) => command === "list_agent_sessions").length).toBeGreaterThan(2));
+
+    session = { ...session, status: "failed" };
+    await act(async () => updateListener({ payload: session.id }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("send_system_notification", expect.objectContaining({
+      category: "taskResult",
+      sessionId: session.id,
+      success: false,
+    })));
+  });
+
+  it("sends a generic task-result notification and opens its outcome on notification click", async () => {
+    const session = {
+      id: "session-task-result",
+      projectId: "project-1",
+      taskId: "task-1",
+      project: "Example project",
+      task: "Build a dashboard",
+      branch: "main",
+      provider: "claudeCode",
+      status: "completed",
+      step: "Task complete",
+      elapsed: "1m",
+      tokens: "0",
+      permissionMode: "Plan",
+      managed: true,
+      lastEvent: "",
+      archived: false,
+      statusReason: "",
+      updatedAt: "2026-07-01T00:00:00Z",
+      taskDone: true,
+      taskArchived: false,
+    };
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_agent_sessions") return [session];
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    await waitFor(() => expect(testNotificationEvents.handlers.has("agent-task-result")).toBe(true));
+    await act(async () => {
+      testNotificationEvents.handlers.get("agent-task-result")?.({
+        payload: {
+          sessionId: session.id,
+          projectId: session.projectId,
+          taskId: session.taskId,
+          success: true,
+        },
+      });
+    });
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("send_system_notification", expect.objectContaining({
+      category: "taskResult",
+      sessionId: session.id,
+      projectId: session.projectId,
+      taskId: session.taskId,
+      success: true,
+    })));
+    await act(async () => {
+      testNotificationEvents.actionHandlers[0]({
+        actionId: "tap",
+        notification: { extra: { category: "taskResult", sessionId: session.id } },
+      });
+    });
+
+    expect(await screen.findByRole("heading", { name: "Task outcomes" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Build a dashboard" })).toBeTruthy();
   });
 
   it("renders a navigable diff and compares selected Git references", async () => {
