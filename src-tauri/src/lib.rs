@@ -18,6 +18,9 @@ use std::{
 };
 use tauri::{Emitter, Manager, State};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 mod project_features;
 
 use project_features::{
@@ -176,7 +179,9 @@ struct GitSnapshot {
 }
 
 fn git_command(path: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
+    let mut cmd = Command::new("git");
+    hide_console_window(&mut cmd);
+    let output = cmd
         .arg("-C")
         .arg(path)
         .args(args)
@@ -413,6 +418,14 @@ fn with_node_path(command: &mut Command, executable: &std::path::Path) {
     }
 }
 
+fn hide_console_window(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 fn copilot_command_for(executable: &Path) -> Command {
     #[cfg(windows)]
     if matches!(
@@ -424,11 +437,14 @@ fn copilot_command_for(executable: &Path) -> Command {
         Some("cmd" | "bat")
     ) {
         let mut command = Command::new("cmd.exe");
+        hide_console_window(&mut command);
         command.arg("/d").arg("/c").arg(executable);
         return command;
     }
 
-    Command::new(executable)
+    let mut command = Command::new(executable);
+    hide_console_window(&mut command);
+    command
 }
 
 fn copilot_command() -> Result<(Command, PathBuf), String> {
@@ -483,6 +499,7 @@ fn claude_executable() -> PathBuf {
 fn claude_command() -> Command {
     let executable = claude_executable();
     let mut command = Command::new(&executable);
+    hide_console_window(&mut command);
     with_node_path(&mut command, &executable);
     command
 }
@@ -1331,7 +1348,9 @@ fn open_project_in_vscode(project_id: String, database: State<'_, Database>) -> 
     }
     let mut last_error = None;
     for executable in executables {
-        match Command::new(executable)
+        let mut cmd = Command::new(executable);
+        hide_console_window(&mut cmd);
+        match cmd
             .arg("--new-window")
             .arg(&project_path)
             .stdin(Stdio::null())

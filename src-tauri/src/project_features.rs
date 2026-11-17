@@ -19,6 +19,9 @@ use std::{
 };
 use tauri::{AppHandle, Emitter, State};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 const MAX_TASK_TITLE: usize = 200;
 const MAX_TASK_DESCRIPTION: usize = 20_000;
 const MAX_TERMINALS_PER_PROJECT: usize = 8;
@@ -29,6 +32,14 @@ const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
 const MAX_SKILL_BYTES: u64 = 512 * 1024;
 const MAX_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn hide_console_window(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1112,7 +1123,9 @@ fn new_id(prefix: &str) -> String {
 }
 
 fn git_output(path: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    Command::new("git")
+    let mut cmd = Command::new("git");
+    hide_console_window(&mut cmd);
+    cmd
         .arg("-C")
         .arg(path)
         .args(args)
@@ -1928,7 +1941,9 @@ fn github_repository(remote: &str) -> Option<String> {
 }
 
 fn github_cli_token() -> Result<String, String> {
-    let output = Command::new("gh")
+    let mut cmd = Command::new("gh");
+    hide_console_window(&mut cmd);
+    let output = cmd
         .args(["auth", "token"])
         .output()
         .map_err(|error| {
