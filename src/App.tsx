@@ -1772,6 +1772,9 @@ function App() {
   const [attentionItems, setAttentionItems] = useState<AttentionItem[]>([]);
   const [attentionLoading, setAttentionLoading] = useState(true);
   const [attentionError, setAttentionError] = useState("");
+  const [activitySessions, setActivitySessions] = useState<AgentSession[]>([]);
+  const [activityLoading, setActivityLoading] = useState(true);
+  const [activityError, setActivityError] = useState("");
   const [taskOutcomes, setTaskOutcomes] = useState<AgentSession[]>([]);
   const [taskOutcomesLoading, setTaskOutcomesLoading] = useState(true);
   const [taskOutcomesError, setTaskOutcomesError] = useState("");
@@ -1808,10 +1811,13 @@ function App() {
   async function refreshAttentionItems() {
     setAttentionLoading(true);
     setAttentionError("");
+    setActivityLoading(true);
+    setActivityError("");
     setTaskOutcomesLoading(true);
     setTaskOutcomesError("");
     try {
       const sessions = await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
+      setActivitySessions(sessions);
       setTaskOutcomes(sessions
         .filter((session) =>
           (session.status === "completed" || session.status === "failed") &&
@@ -1827,9 +1833,11 @@ function App() {
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
       setAttentionError(message);
+      setActivityError(message);
       setTaskOutcomesError(message);
     } finally {
       setAttentionLoading(false);
+      setActivityLoading(false);
       setTaskOutcomesLoading(false);
     }
   }
@@ -1966,6 +1974,7 @@ function App() {
     }).catch((reason) => {
       const message = reason instanceof Error ? reason.message : String(reason);
       setAttentionError(message);
+      setActivityError(message);
       setTaskOutcomesError(message);
     });
     return () => {
@@ -2313,9 +2322,23 @@ function App() {
             </div>
           </section>
           <section className="section-block activity-section">
-            <div className="section-header"><div><h2>Live activity</h2><span className="section-caption live-caption"><span /> Streaming now</span></div><button className="text-button" type="button" onClick={() => { setSessionToOpen(""); setActiveNav("Agent sessions"); }}>View transcript <span>→</span></button></div>
+            <div className="section-header"><div><h2>Live activity</h2><span className="section-caption live-caption"><span /> {activitySessions.some((session) => ["starting", "running", "waiting"].includes(session.status)) ? "Streaming now" : "Recent activity"}</span></div><button className="text-button" type="button" onClick={() => { setSessionToOpen(""); setActiveNav("Agent sessions"); }}>View transcript <span>→</span></button></div>
             <div className="activity-card">
-              <div className="empty-card">Live activity will appear when an agent session is connected.</div>
+              {activityLoading && activitySessions.length === 0 && <div className="empty-card">Loading recent activity…</div>}
+              {!activityLoading && activitySessions.length === 0 && !activityError && <div className="empty-card">Session activity will appear here when an agent session starts.</div>}
+              {!activityLoading && activitySessions.length === 0 && activityError && <div className="empty-card" role="status">{activityError}</div>}
+              {activitySessions.slice(0, 5).map((session) => (
+                <button className="activity-item" key={session.id} type="button" onClick={() => openAttentionSession(session.id)}>
+                  <span className={`activity-line ${session.status === "completed" ? "green-line" : session.status === "failed" ? "red-line" : session.status === "running" || session.status === "starting" ? "blue-line" : "purple-line"}`} aria-hidden="true" />
+                  <div>
+                    <strong>{stripTaskCompletionProtocol(session.task) || providerLabel(session.provider)}</strong>
+                    <span>{session.project} · {session.step || session.lastEvent || session.status}</span>
+                    {session.lastEvent && session.lastEvent !== session.step && <span>{session.lastEvent}</span>}
+                  </div>
+                  <time>{session.status} · {formatLocalTimestamp(session.updatedAt)}</time>
+                </button>
+              ))}
+              {activityError && activitySessions.length > 0 && <div className="empty-card" role="status">Live activity may be stale: {activityError}</div>}
             </div>
           </section>
         </div>

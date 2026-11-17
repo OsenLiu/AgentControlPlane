@@ -278,6 +278,59 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("get_session_transcript", { sessionId: "latest-session" });
   });
 
+  it("shows running and completed sessions in dashboard live activity", async () => {
+    const sessions = [
+      {
+        id: "running-session",
+        project: "website",
+        task: "Implement live updates",
+        branch: "feature/activity",
+        provider: "copilot",
+        status: "running",
+        step: "Writing regression test",
+        elapsed: "2026-11-12 10:00:00",
+        tokens: "100",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Updating App.test.tsx",
+        archived: false,
+        statusReason: "",
+        updatedAt: "2026-11-12 10:02:00",
+      },
+      {
+        id: "completed-session",
+        project: "website",
+        task: "Finish cleanup",
+        branch: "main",
+        provider: "claudeCode",
+        status: "completed",
+        step: "Finished",
+        elapsed: "2026-11-12 09:00:00",
+        tokens: "100",
+        permissionMode: "Plan",
+        managed: true,
+        lastEvent: "Task complete",
+        archived: false,
+        statusReason: "",
+        updatedAt: "2026-11-12 09:30:00",
+      },
+    ];
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_agent_sessions") return sessions;
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+
+    const activityCard = await screen.findByText("Implement live updates");
+    expect(activityCard).toBeTruthy();
+    expect(screen.getByText(/Writing regression test/)).toBeTruthy();
+    expect(screen.getByText("Finish cleanup")).toBeTruthy();
+    expect(screen.getByText("Task complete")).toBeTruthy();
+  });
+
   it("hides Gemini CLI from the agent provider settings", async () => {
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Settings" }));

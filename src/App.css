@@ -813,3 +813,10 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 @media (prefers-reduced-motion: reduce) {
   .task-outcome-item, .task-outcomes-filter { transition: none; }
 }
+.activity-item { width: 100%; color: inherit; background: transparent; border: 0; text-align: left; font: inherit; cursor: pointer; }
+.activity-item:hover { background: #17213a; }
+.activity-item:focus-visible { outline: 2px solid #a99bff; outline-offset: -2px; }
+.activity-item div { min-width: 0; flex: 1; }
+.activity-item strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.activity-item time { white-space: nowrap; }
+.red-line { background: #ee727f; }

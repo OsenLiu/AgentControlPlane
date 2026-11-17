@@ -48,8 +48,9 @@ The selected dashboard direction is **Command Center** (`dashboard-concept-a-com
    - Use severity indicators and relative timestamps.
    - **Open inbox** navigates to the cross-project queue; each row opens an in-place response/review action.
 4. **Live activity stream**
-   - Stream structured events such as implementation steps, test progress, waiting questions, retries, and accepted runs.
-   - Include project, task/session name, current step, and elapsed time.
+   - Show the five most recently updated non-archived sessions, including project, task/session name, current step, latest event, status, and update time.
+   - Refresh the list on session updates; selecting an item opens that session.
+   - A future event-by-event stream can include implementation steps, test progress, waiting questions, retries, and accepted runs.
    - Pause/resume live updates while the user is inspecting older activity.
    - Provide a link to the transcript, diff, or pipeline log associated with each event.
 5. **Pipeline trend card**
