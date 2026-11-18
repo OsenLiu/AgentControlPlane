@@ -1260,7 +1260,7 @@ function TaskOutcomesView({
   onOpenTask: (session: AgentSession) => void;
   initialSessionId?: string;
 }) {
-  const [filter, setFilter] = useState<"all" | "review" | "completed" | "failed">("all");
+  const [filter, setFilter] = useState<"all" | "review" | "completed">("all");
   const [query, setQuery] = useState("");
   const [selectedId, setSelectedId] = useState("");
   const normalizedQuery = query.trim().toLowerCase();
@@ -1277,7 +1277,6 @@ function TaskOutcomesView({
     ?? visibleSessions[0];
   const reviewCount = sessions.filter(isReadyForReview).length;
   const completedCount = sessions.filter((session) => session.status === "completed" && !isReadyForReview(session)).length;
-  const failedCount = sessions.filter((session) => session.status === "failed").length;
 
   return (
     <div className="task-outcomes-page">
@@ -1285,7 +1284,7 @@ function TaskOutcomesView({
         <div>
           <p className="eyebrow">WORKSPACE / SESSION HISTORY</p>
           <h1>Task outcomes</h1>
-          <p className="subtitle">See what finished, what failed, and what is ready for your review.</p>
+          <p className="subtitle">See what finished and what is ready for your review.</p>
         </div>
         <button className="secondary-button task-outcomes-refresh" type="button" onClick={() => void onRefresh()} disabled={loading}>
           <span className="refresh-glyph" aria-hidden="true">↻</span> {loading ? "Refreshing…" : "Refresh"}
@@ -1302,11 +1301,6 @@ function TaskOutcomesView({
           <span className="summary-icon outcome-completed-icon" aria-hidden="true">✓</span>
           <div><strong>{completedCount}</strong><span>Completed</span></div>
           <small>Finished successfully</small>
-        </article>
-        <article className="session-summary-card">
-          <span className="summary-icon outcome-failed-icon" aria-hidden="true">!</span>
-          <div><strong>{failedCount}</strong><span>Failed</span></div>
-          <small>Review the session details</small>
         </article>
       </section>
 
@@ -1335,7 +1329,6 @@ function TaskOutcomesView({
             ["all", "All outcomes", sessions.length],
             ["review", "Ready for review", reviewCount],
             ["completed", "Completed", completedCount],
-            ["failed", "Failed", failedCount],
           ] as const).map(([value, label, count]) => (
             <button
               className={`task-outcomes-filter ${filter === value ? "active" : ""}`}
@@ -1350,7 +1343,7 @@ function TaskOutcomesView({
         </div>
 
         <div className="task-outcomes-workspace">
-          <div className="task-outcomes-list" role="region" aria-label="Completed and failed sessions">
+          <div className="task-outcomes-list" role="region" aria-label="Completed sessions">
             {visibleSessions.map((session) => (
               <button
                 className={`task-outcome-item ${selectedSession?.id === session.id ? "selected" : ""}`}
@@ -1359,9 +1352,7 @@ function TaskOutcomesView({
                 aria-pressed={selectedSession?.id === session.id}
                 onClick={() => setSelectedId(session.id)}
               >
-                <span className={`task-outcome-icon ${session.status === "completed" ? "completed" : "failed"}`} aria-hidden="true">
-                  {session.status === "completed" ? "✓" : "!"}
-                </span>
+                <span className="task-outcome-icon completed" aria-hidden="true">✓</span>
                 <span className="task-outcome-copy">
                   <strong>{stripTaskCompletionProtocol(session.task)}</strong>
                   <span>{session.project} <i>·</i> {providerLabel(session.provider)}</span>
@@ -1382,7 +1373,7 @@ function TaskOutcomesView({
               <div className="task-outcomes-empty">
                 <span aria-hidden="true">{sessions.length === 0 && !query && filter === "all" ? "✓" : "⌕"}</span>
                 <strong>{sessions.length === 0 && !query && filter === "all" ? "No finished sessions yet" : "No matching outcomes"}</strong>
-                <p>{sessions.length === 0 && !query && filter === "all" ? "Completed and failed sessions will appear here. Nothing needs your attention until you choose to review it." : "Try another filter or search term."}</p>
+                <p>{sessions.length === 0 && !query && filter === "all" ? "Completed sessions for tasks that are not done or archived will appear here." : "Try another filter or search term."}</p>
                 {(query || filter !== "all") && <button type="button" onClick={() => { setFilter("all"); setQuery(""); }}>Clear filters</button>}
               </div>
             )}
@@ -1391,16 +1382,14 @@ function TaskOutcomesView({
           {selectedSession ? (
             <article className="task-outcome-detail">
               <div className="task-outcome-detail-status">
-                <span className={`task-outcome-icon ${selectedSession.status === "completed" ? "completed" : "failed"}`} aria-hidden="true">
-                  {selectedSession.status === "completed" ? "✓" : "!"}
-                </span>
+                <span className="task-outcome-icon completed" aria-hidden="true">✓</span>
                 {isReadyForReview(selectedSession)
                   ? <span className="task-outcome-review-badge">Ready for review</span>
                   : <SessionStatusBadge status={selectedSession.status} />}
               </div>
               <h3>{stripTaskCompletionProtocol(selectedSession.task)}</h3>
               <p className="task-outcome-detail-summary">
-                {selectedSession.statusReason || selectedSession.lastEvent || selectedSession.step || (selectedSession.status === "completed" ? "The session finished successfully." : "The session stopped before completing the task.")}
+                {selectedSession.statusReason || selectedSession.lastEvent || selectedSession.step || "The session finished successfully."}
               </p>
               <dl className="attention-metadata task-outcome-metadata">
                 <div><dt>PROJECT</dt><dd>{selectedSession.project}</dd></div>
@@ -2048,23 +2037,9 @@ function App() {
     try {
       const sessions = await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
       setActivitySessions(sessions);
-      try {
-        const archivedSessions = await invoke<AgentSession[]>("list_agent_sessions", {
-          archived: true,
-          status: "completed",
-        });
-        setTaskOutcomes([
-          ...sessions,
-          ...archivedSessions.filter((session) => session.archived && session.taskDone),
-        ]
-          .filter((session) =>
-            (session.status === "completed" || session.status === "failed") &&
-            (session.taskDone || !session.taskArchived),
-          )
-          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
-      } catch (reason) {
-        setTaskOutcomesError(reason instanceof Error ? reason.message : String(reason));
-      }
+      setTaskOutcomes(sessions
+        .filter((session) => session.status === "completed" && !session.taskDone && !session.taskArchived)
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
       let snapshotAttentionItems: AttentionItem[] | null = null;
       try {
         snapshotAttentionItems = await loadAttentionItemsFromBackend(sessions);
@@ -2440,12 +2415,6 @@ function App() {
   }
 
   const selectedProject = projects.find((project) => project.id === selectedProjectId);
-  const taskOutcomeSession = activitySessions.find((session) => session.id === taskOutcomeSessionToOpen);
-  const taskOutcomeSessions = taskOutcomeSession &&
-    (taskOutcomeSession.status === "completed" || taskOutcomeSession.status === "failed") &&
-    !taskOutcomes.some((session) => session.id === taskOutcomeSession.id)
-    ? [taskOutcomeSession, ...taskOutcomes]
-    : taskOutcomes;
   const urgentAttentionCount = attentionItems.filter((item) => item.priority === "High").length;
   const completedPipelineRuns = dashboardPipelineRuns
     .filter((run) => run.status === "completed" && ["success", "failure", "timed_out", "startup_failure"].includes(run.conclusion ?? ""))
@@ -2550,7 +2519,7 @@ function App() {
           />
         ) : activeNav === "Task outcomes" ? (
           <TaskOutcomesView
-            sessions={taskOutcomeSessions}
+            sessions={taskOutcomes}
             loading={taskOutcomesLoading}
             error={taskOutcomesError}
             onRefresh={refreshAttentionItems}

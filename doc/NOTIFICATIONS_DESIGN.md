@@ -12,9 +12,9 @@ Alert users through native operating-system notifications when an agent needs
 their attention or a task reaches a terminal result. Notifications supplement
 the app's existing attention and outcome views; they do not replace them.
 Task outcomes are loaded from persisted session and task state, not notification
-events. Completed tasks marked done remain in Task outcomes after a notification
-is dismissed or their session or task is archived. Accepted tasks count as
-Completed, not Ready for review.
+events. Task outcomes show completed sessions until their task is marked done
+or archived. Archiving a session also removes it from Task outcomes. Failed
+sessions are not shown there.
 
 The design targets Windows, macOS, and Linux. Platform-specific authorization
 and delivery requirements must be respected, and the UI must not imply that a
@@ -107,8 +107,9 @@ environment blocks it.
 - Notifications use the specified generic copy, contain no task or agent
   content, and use the operating system's default sound and dismissal
   behavior.
-- Notification clicks open the related attention item or task outcome without
-  taking an action on the user's behalf.
+- Notification clicks open the related attention item or Task outcomes without
+  taking an action on the user's behalf. An outcome is shown only while it
+  remains eligible for that view.
 - The master and category switches behave independently as described and
   persist across app restarts.
 - Disabled categories do not produce notifications or replay missed events.
