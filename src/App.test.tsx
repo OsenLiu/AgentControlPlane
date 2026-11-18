@@ -58,6 +58,7 @@ const settings = {
   githubTokenConfigured: false,
   defaultProvider: "claudeCode" as const,
   transcriptFontSize: 16,
+  uiFontScale: 100,
   notificationsEnabled: true,
   attentionNotificationsEnabled: true,
   taskCompletionNotificationsEnabled: true,
@@ -372,6 +373,28 @@ describe("App", () => {
     expect(screen.queryByText("Gemini CLI")).toBeNull();
     expect(screen.getByRole("radio", { name: /GitHub Copilot CLI/ })).toBeTruthy();
     expect(screen.getByRole("radio", { name: /Claude Code CLI/ })).toBeTruthy();
+  });
+
+  it("applies and persists the application text size", async () => {
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "save_settings") return { ...settings, uiFontScale: 120 };
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+
+    const sizeSelect = screen.getByRole("combobox", { name: /Application text size/i });
+    fireEvent.change(sizeSelect, { target: { value: "120" } });
+    expect(document.querySelector(".app-shell")?.getAttribute("style")).toContain("zoom: 1.2");
+
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
+      "save_settings",
+      { input: expect.objectContaining({ uiFontScale: 120 }) },
+    ));
   });
 
   it("persists independent notification preferences without changing category selections", async () => {

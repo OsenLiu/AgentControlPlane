@@ -81,6 +81,7 @@ type Settings = {
   githubTokenConfigured: boolean;
   defaultProvider: "copilot" | "gemini" | "claudeCode";
   transcriptFontSize: number;
+  uiFontScale: number;
   notificationsEnabled: boolean;
   attentionNotificationsEnabled: boolean;
   taskCompletionNotificationsEnabled: boolean;
@@ -292,6 +293,7 @@ const emptySettings = (): Settings => ({
   githubTokenConfigured: false,
   defaultProvider: "claudeCode",
   transcriptFontSize: 16,
+  uiFontScale: 100,
   notificationsEnabled: true,
   attentionNotificationsEnabled: true,
   taskCompletionNotificationsEnabled: true,
@@ -427,6 +429,22 @@ function SettingsView({
               onChange={(event) => setSettings({ ...settings, transcriptFontSize: Number(event.currentTarget.value) })}
             >
               {[12, 14, 16, 18, 20, 22, 24].map((size) => <option value={size} key={size}>{size}px</option>)}
+            </select>
+          </label>
+        </div>
+      </section>
+      <section className="settings-section">
+        <div className="section-header"><div><h2>Application text size</h2><span className="section-caption">Adjust the size of text and controls throughout the app.</span></div></div>
+        <div className="transcript-settings-card">
+          <label className="transcript-size-control" htmlFor="ui-font-scale">
+            <span><strong>Application text size</strong><small>Applies across all pages.</small></span>
+            <select
+              id="ui-font-scale"
+              className="settings-input transcript-size-select"
+              value={settings.uiFontScale}
+              onChange={(event) => setSettings({ ...settings, uiFontScale: Number(event.currentTarget.value) })}
+            >
+              {[100, 110, 120, 130].map((scale) => <option value={scale} key={scale}>{scale}%</option>)}
             </select>
           </label>
         </div>
@@ -2324,7 +2342,7 @@ function App() {
   async function loadSettings() {
     try {
       const loaded = await invoke<Settings>("load_settings");
-      const normalized = { ...emptySettings(), ...loaded, transcriptFontSize: loaded.transcriptFontSize ?? 16, githubToken: "" };
+      const normalized = { ...emptySettings(), ...loaded, transcriptFontSize: loaded.transcriptFontSize ?? 16, uiFontScale: loaded.uiFontScale ?? 100, githubToken: "" };
       setSettings(normalized);
       applySavedNotificationPreferences(normalized);
     } catch (reason) {
@@ -2341,7 +2359,7 @@ function App() {
       const saved = await invoke<Settings>("save_settings", {
         input: { ...input, githubToken: input.githubAuthMethod === "token" ? githubToken : "" },
       });
-      const normalized = { ...emptySettings(), ...saved, transcriptFontSize: saved.transcriptFontSize ?? 16, githubToken: "" };
+      const normalized = { ...emptySettings(), ...saved, transcriptFontSize: saved.transcriptFontSize ?? 16, uiFontScale: saved.uiFontScale ?? 100, githubToken: "" };
       setSettings(normalized);
       applySavedNotificationPreferences(normalized);
     } catch (reason) {
@@ -2442,7 +2460,7 @@ function App() {
   const pipelineSuccessCount = completedPipelineRuns.filter((run) => run.conclusion === "success").length;
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" style={{ zoom: settings.uiFontScale / 100 }}>
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark">A</div>
