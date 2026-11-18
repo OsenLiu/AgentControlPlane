@@ -152,6 +152,7 @@ struct SettingsInput {
     github_token: String,
     default_provider: String,
     transcript_font_size: u8,
+    ui_font_scale: u8,
     notifications_enabled: bool,
     attention_notifications_enabled: bool,
     task_completion_notifications_enabled: bool,
@@ -174,6 +175,7 @@ struct Settings {
     github_token_configured: bool,
     default_provider: String,
     transcript_font_size: u8,
+    ui_font_scale: u8,
     notifications_enabled: bool,
     attention_notifications_enabled: bool,
     task_completion_notifications_enabled: bool,
@@ -1263,6 +1265,16 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
         .and_then(|value| value.parse::<u8>().ok())
         .filter(|size| (12..=24).contains(size))
         .unwrap_or(16);
+    let ui_font_scale = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'ui_font_scale'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|scale| [100, 110, 120, 130].contains(scale))
+        .unwrap_or(100);
     Ok(Settings {
         copilot: read("copilot"),
         gemini: read("gemini"),
@@ -1272,6 +1284,7 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
         github_token_configured: github_token_configured(),
         default_provider,
         transcript_font_size,
+        ui_font_scale,
         notifications_enabled: read_notification_setting(&connection, "notifications_enabled")?,
         attention_notifications_enabled: read_notification_setting(
             &connection,
@@ -1297,6 +1310,9 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
     }
     if !(12..=24).contains(&input.transcript_font_size) {
         return Err("Transcript text size must be between 12px and 24px.".to_owned());
+    }
+    if ![100, 110, 120, 130].contains(&input.ui_font_scale) {
+        return Err("Application text size must be 100%, 110%, 120%, or 130%.".to_owned());
     }
 
     let github_token = input.github_token.trim().to_owned();
@@ -1360,6 +1376,13 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
             [input.transcript_font_size.to_string()],
         )
         .map_err(|error| format!("Unable to save transcript text size: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO app_settings (key, value) VALUES ('ui_font_scale', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [input.ui_font_scale.to_string()],
+        )
+        .map_err(|error| format!("Unable to save application text size: {error}"))?;
     for (key, enabled) in [
         ("notifications_enabled", input.notifications_enabled),
         (
