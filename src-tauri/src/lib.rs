@@ -276,6 +276,57 @@ fn inspect_repository(path: &Path) -> Result<GitSnapshot, String> {
     })
 }
 
+fn project_for_directory(path: &Path) -> Result<Project, String> {
+    if path.as_os_str().is_empty() {
+        return Err("Choose a local folder.".to_owned());
+    }
+
+    let canonical_path = fs::canonicalize(path)
+        .map_err(|error| format!("The project path is not accessible: {error}"))?;
+    if !canonical_path.is_dir() {
+        return Err("The selected path is not a folder.".to_owned());
+    }
+
+    let has_git_metadata = canonical_path
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").exists());
+    let (project_path, branch, current_commit, git_state) = if has_git_metadata {
+        let snapshot = inspect_repository(&canonical_path)?;
+        (
+            snapshot.root,
+            snapshot.branch,
+            snapshot.current_commit,
+            snapshot.git_state,
+        )
+    } else {
+        (
+            canonical_path,
+            String::new(),
+            String::new(),
+            "not-git".to_owned(),
+        )
+    };
+    let path = project_path
+        .to_str()
+        .ok_or_else(|| "The project path is not valid UTF-8.".to_owned())?
+        .to_owned();
+
+    Ok(Project {
+        id: path.clone(),
+        name: project_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Unnamed project")
+            .to_owned(),
+        path,
+        branch,
+        current_commit,
+        git_state,
+        looping: false,
+        agent_task_creation: false,
+    })
+}
+
 fn project_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
@@ -3974,34 +4025,7 @@ fn send_claude_message(
 
 #[tauri::command]
 fn register_project(path: String, database: State<'_, Database>) -> Result<Project, String> {
-    let requested_path = PathBuf::from(path.trim());
-    if requested_path.as_os_str().is_empty() {
-        return Err("Choose a local repository path.".to_owned());
-    }
-
-    let canonical_path = fs::canonicalize(&requested_path)
-        .map_err(|error| format!("The project path is not accessible: {error}"))?;
-    let snapshot = inspect_repository(&canonical_path)?;
-    let project_path = snapshot
-        .root
-        .to_str()
-        .ok_or_else(|| "The repository path is not valid UTF-8.".to_owned())?
-        .to_owned();
-    let project = Project {
-        id: project_path.clone(),
-        name: snapshot
-            .root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Unnamed project")
-            .to_owned(),
-        path: project_path.clone(),
-        branch: snapshot.branch,
-        current_commit: snapshot.current_commit,
-        git_state: snapshot.git_state,
-        looping: false,
-        agent_task_creation: false,
-    };
+    let project = project_for_directory(Path::new(path.trim()))?;
 
     let connection = database
         .0
@@ -4351,6 +4375,34 @@ mod tests {
         fs::remove_dir_all(&home).expect("remove copilot fixture");
         assert_eq!(result, Some(path_shim));
         assert_eq!(fallback, Some(executable));
+    }
+
+    #[test]
+    fn non_git_directories_can_be_registered_as_projects() {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-control-plane-folder-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).expect("create project folder");
+
+        let project = project_for_directory(&directory).expect("inspect non-Git folder");
+        let canonical_directory = fs::canonicalize(&directory).expect("canonical project folder");
+
+        assert_eq!(
+            project.path,
+            canonical_directory.to_string_lossy().to_string()
+        );
+        assert_eq!(
+            project.name,
+            directory.file_name().unwrap().to_string_lossy().to_string()
+        );
+        assert_eq!(project.git_state, "not-git");
+        assert!(project.branch.is_empty());
+        assert!(project.current_commit.is_empty());
+        fs::remove_dir_all(&directory).expect("remove project folder");
     }
 
     #[cfg(target_os = "linux")]

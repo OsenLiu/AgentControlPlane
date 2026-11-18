@@ -30,7 +30,7 @@ type Project = {
   path: string;
   branch: string;
   currentCommit: string;
-  gitState: "clean" | "dirty";
+  gitState: "clean" | "dirty" | "not-git";
   looping: boolean;
   agentTaskCreation: boolean;
 };
@@ -1501,8 +1501,8 @@ function ProjectsView({
     }
   }
   const changedCount = projects.filter((project) => project.gitState === "dirty").length;
-  const cleanCount = projects.length - changedCount;
-  const branchCount = new Set(projects.map((project) => project.branch).filter(Boolean)).size;
+  const cleanCount = projects.filter((project) => project.gitState === "clean").length;
+  const branchCount = new Set(projects.filter((project) => project.gitState !== "not-git").map((project) => project.branch).filter(Boolean)).size;
   const normalizedQuery = query.trim().toLowerCase();
   const visibleProjects = projects.filter((project) => {
     const matchesFilter = filter === "all" || project.gitState === (filter === "changed" ? "dirty" : "clean");
@@ -1514,9 +1514,9 @@ function ProjectsView({
     <div className="projects-page">
       <header className="projects-page-header">
         <div>
-          <p className="eyebrow">WORKSPACE / REPOSITORIES</p>
+          <p className="eyebrow">WORKSPACE / PROJECTS</p>
           <h1>Your projects</h1>
-          <p className="subtitle">Local Git checkouts connected to Agent Control Plane.</p>
+          <p className="subtitle">Local folders connected to Agent Control Plane.</p>
         </div>
         <div className="projects-header-actions">
           <span className="projects-local-badge"><span aria-hidden="true" /> Stored on this device</span>
@@ -1529,10 +1529,10 @@ function ProjectsView({
         </div>
       </header>
 
-      <section className="projects-overview" aria-label="Project repository summary">
+      <section className="projects-overview" aria-label="Project summary">
         <article className="projects-overview-card">
           <span className="projects-overview-icon overview-total" aria-hidden="true">⌘</span>
-          <div><strong>{projects.length}</strong><span>Connected repositories</span></div>
+          <div><strong>{projects.length}</strong><span>Connected projects</span></div>
         </article>
         <article className="projects-overview-card">
           <span className="projects-overview-icon overview-clean" aria-hidden="true">✓</span>
@@ -1552,7 +1552,7 @@ function ProjectsView({
         <div className="projects-directory-heading">
           <div>
             <p className="eyebrow">LOCAL REGISTRY</p>
-            <h2 id="projects-directory-title">Repositories <span>{projects.length}</span></h2>
+            <h2 id="projects-directory-title">Projects <span>{projects.length}</span></h2>
           </div>
           <label className="projects-search">
             <span aria-hidden="true">⌕</span>
@@ -1592,7 +1592,7 @@ function ProjectsView({
           <div className="projects-empty-state projects-empty-onboarding">
             <span className="projects-empty-icon" aria-hidden="true">⌘</span>
             <h3>No projects connected yet</h3>
-            <p>Add a local Git checkout to keep its branch and working-tree status in one place.</p>
+            <p>Add a local folder to open it in your workspace. Git branch and working-tree status are available for repositories.</p>
             <button className="primary-button" type="button" onClick={onAddProject}><span aria-hidden="true">+</span> Add your first project</button>
           </div>
         ) : visibleProjects.length === 0 ? (
@@ -1609,7 +1609,7 @@ function ProjectsView({
                   <span className="project-directory-avatar" aria-hidden="true">{project.name.charAt(0).toUpperCase()}</span>
                   <span className={`project-state-badge ${project.gitState}`}>
                     <span aria-hidden="true" />
-                    {project.gitState === "clean" ? "Working tree clean" : "Uncommitted changes"}
+                    {project.gitState === "clean" ? "Working tree clean" : project.gitState === "dirty" ? "Uncommitted changes" : "Not a Git repository"}
                   </span>
                 </div>
                 <h3 title={project.name}>{project.name}</h3>
@@ -1617,7 +1617,7 @@ function ProjectsView({
                 <div className="project-directory-meta">
                   <div>
                     <span>BRANCH</span>
-                    <code title={project.branch}>{project.branch || "No branch"}</code>
+                    <code title={project.branch}>{project.branch || (project.gitState === "not-git" ? "Not a Git repository" : "No branch")}</code>
                   </div>
                   <div>
                     <span>LAST COMMIT</span>
@@ -1732,9 +1732,9 @@ function ProjectWorkspaceView({
         <div className="project-workspace-repo-meta">
           <span className={`project-state-badge ${project.gitState}`}>
             <span aria-hidden="true" />
-            {project.gitState === "clean" ? "Working tree clean" : "Uncommitted changes"}
+            {project.gitState === "clean" ? "Working tree clean" : project.gitState === "dirty" ? "Uncommitted changes" : "Not a Git repository"}
           </span>
-          <span className="project-workspace-branch"><span aria-hidden="true">⑂</span><code>{project.branch || "No branch"}</code></span>
+          {project.gitState !== "not-git" && <span className="project-workspace-branch"><span aria-hidden="true">⑂</span><code>{project.branch || "No branch"}</code></span>}
         </div>
         <div className="project-workspace-actions">
           <div className="project-automation-control">
@@ -2575,7 +2575,7 @@ function App() {
           <article className="summary-card">
             <div className="card-heading"><span>ACTIVE AGENTS</span><span className="card-icon purple">◉</span></div>
             <strong className="metric">{projects.length} <small>projects</small></strong>
-            <div className="metric-meta">Connected local repositories</div>
+            <div className="metric-meta">Connected local projects</div>
             <div className="mini-bars"><i /><i /><i className="muted" /><i className="muted" /><i className="muted" /></div>
           </article>
           <article className="summary-card">
@@ -2670,14 +2670,14 @@ function App() {
           <div className="table-card">
             <div className="table-row table-head"><span>PROJECT</span><span>ACTIVE AGENTS</span><span>PROGRESS</span><span>PIPELINE</span><span>GIT STATE</span><span /></div>
             {loadingProjects && <div className="empty-row">Loading local projects…</div>}
-            {!loadingProjects && projects.length === 0 && <div className="empty-row">No projects connected yet. Add a local Git repository to get started.</div>}
+            {!loadingProjects && projects.length === 0 && <div className="empty-row">No projects connected yet. Add a local folder to get started.</div>}
             {!loadingProjects && projects.map((project) => (
               <div className="table-row" key={project.name}>
-                <div className="project-name"><span className="project-avatar">{project.name.charAt(0)}</span><div><strong>{project.name}</strong><span><code>{project.branch}</code> · {project.path}</span></div></div>
+                <div className="project-name"><span className="project-avatar">{project.name.charAt(0)}</span><div><strong>{project.name}</strong><span>{project.gitState === "not-git" ? "Folder" : <code>{project.branch}</code>} · {project.path}</span></div></div>
                 <span className="agent-count"><span className="idle-dot" /> No agents</span>
                 <div className="progress-cell"><div className="progress-track"><span style={{ width: "0%" }} /></div><small>—</small></div>
                 <StatusBadge {...(projectPipelineStatuses[project.id] ?? { status: "unknown", label: pipelineHealthLoading ? "Loading" : "No data" })} />
-                <span className={`git-state ${project.gitState}`}><span /> {project.gitState === "clean" ? "Clean" : "Changes"}</span>
+                <span className={`git-state ${project.gitState}`}><span /> {project.gitState === "clean" ? "Clean" : project.gitState === "dirty" ? "Changes" : "Not a Git repo"}</span>
                 <button className="row-action" aria-label={`Open ${project.name}`} onClick={() => openProjectWorkspace(project.id)}>→</button>
               </div>
             ))}
@@ -2740,10 +2740,10 @@ function App() {
         <div className="modal-backdrop" role="presentation" onClick={() => setShowAddProject(false)}>
           <form className="modal" role="dialog" aria-modal="true" aria-labelledby="add-project-title" onSubmit={addProject} onClick={(event) => event.stopPropagation()}>
             <div className="modal-title"><div><p className="eyebrow">PROJECT SETUP</p><h2 id="add-project-title">Add a local project</h2></div><button type="button" className="close-button" onClick={() => setShowAddProject(false)} aria-label="Close">×</button></div>
-            <p className="modal-copy">Connect an existing local Git checkout. Remote cloning is not available in the first release.</p>
-            <label className="field-label" htmlFor="project-path">Repository path</label>
-            <div className="path-picker-row"><input id="project-path" className="path-input" value={projectPath} onChange={(event) => setProjectPath(event.currentTarget.value)} placeholder="/Users/you/Projects/my-repository" autoFocus /><button type="button" className="secondary-button browse-button" onClick={() => void chooseProjectFolder()} disabled={pickingProjectFolder}>{pickingProjectFolder ? "Opening…" : "Open folder"}</button></div>
-            <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowAddProject(false)}>Cancel</button><button type="submit" className="primary-button" disabled={savingProject || !projectPath.trim()}>{savingProject ? "Validating…" : "Validate repository"}</button></div>
+            <p className="modal-copy">Add any existing local folder. Git branch and working-tree details are shown automatically when it is a repository.</p>
+            <label className="field-label" htmlFor="project-path">Folder path</label>
+            <div className="path-picker-row"><input id="project-path" className="path-input" value={projectPath} onChange={(event) => setProjectPath(event.currentTarget.value)} placeholder="/Users/you/Projects/my-folder" autoFocus /><button type="button" className="secondary-button browse-button" onClick={() => void chooseProjectFolder()} disabled={pickingProjectFolder}>{pickingProjectFolder ? "Opening…" : "Open folder"}</button></div>
+            <div className="modal-actions"><button type="button" className="secondary-button" onClick={() => setShowAddProject(false)}>Cancel</button><button type="submit" className="primary-button" disabled={savingProject || !projectPath.trim()}>{savingProject ? "Adding…" : "Add folder"}</button></div>
           </form>
         </div>
       )}
