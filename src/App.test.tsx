@@ -106,7 +106,7 @@ describe("App", () => {
   it("loads the empty dashboard state", async () => {
     render(<App />);
 
-    expect(await screen.findByText("No projects connected yet. Add a local Git repository to get started.")).toBeTruthy();
+    expect(await screen.findByText("No projects connected yet. Add a local folder to get started.")).toBeTruthy();
     expect(await screen.findByRole("heading", { name: /Good (morning|afternoon|evening), Test User/ })).toBeTruthy();
     expect(screen.getByText(/^v\d+\.\d+\.\d+$/)).toBeTruthy();
     expect(invokeMock).toHaveBeenCalledWith("list_projects");
@@ -683,7 +683,7 @@ describe("App", () => {
     ));
   });
 
-  it("opens the project directory and filters repositories by search and Git state", async () => {
+  it("opens the project directory and filters projects by search and Git state", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_projects") return [
         {
@@ -730,7 +730,7 @@ describe("App", () => {
     fireEvent.click(await screen.findByRole("button", { name: /View all projects/ }));
 
     expect(await screen.findByRole("heading", { name: "Your projects" })).toBeTruthy();
-    expect(screen.getByRole("heading", { name: /Repositories 2/ })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: /Projects 2/ })).toBeTruthy();
     expect(screen.getByText("/work/agent-control-plane")).toBeTruthy();
     expect(screen.getByText("a1b2c3d")).toBeTruthy();
     expect(screen.getByText("Uncommitted changes")).toBeTruthy();
@@ -1492,14 +1492,14 @@ describe("App", () => {
     expect(await screen.findAllByText("Build the app")).toHaveLength(2);
   });
 
-  it("registers a local project from the add-project dialog", async () => {
+  it("registers a local folder from the add-project dialog", async () => {
     const project = {
       id: "/tmp/demo",
       name: "demo",
       path: "/tmp/demo",
-      branch: "main",
-      currentCommit: "abc123",
-      gitState: "clean" as const,
+      branch: "",
+      currentCommit: "",
+      gitState: "not-git" as const,
     };
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_projects") return [];
@@ -1510,10 +1510,11 @@ describe("App", () => {
 
     render(<App />);
     fireEvent.click(within(screen.getByRole("main")).getByRole("button", { name: /add project/i }));
-    fireEvent.change(screen.getByLabelText("Repository path"), {
+    expect(screen.getByText(/Add any existing local folder/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Folder path"), {
       target: { value: "/tmp/demo" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Validate repository" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
 
     await waitFor(() => {
       expect(invokeMock).toHaveBeenCalledWith("register_project", { path: "/tmp/demo" });

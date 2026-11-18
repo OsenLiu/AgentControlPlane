@@ -260,6 +260,7 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .project-state-badge > span { width: 6px; height: 6px; flex: 0 0 6px; border-radius: 50%; }
 .project-state-badge.clean { color: #7edbb0; background: #183a32; }.project-state-badge.clean > span { background: #56d49e; }
 .project-state-badge.dirty { color: #f0bf7a; background: #453322; }.project-state-badge.dirty > span { background: #efb266; }
+.project-state-badge.not-git { color: #a7b2c8; background: #28334a; }.project-state-badge.not-git > span { background: #8997b2; }
 .project-directory-card h3 { overflow: hidden; margin: 15px 0 0; color: #e6ebf7; font-size: 14px; font-weight: 650; letter-spacing: -.2px; text-overflow: ellipsis; white-space: nowrap; }
 .project-directory-path { overflow: hidden; margin-top: 6px; color: #8390aa; font-family: "JetBrains Mono", monospace; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
 .project-directory-meta { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .7fr); gap: 12px; margin-top: 18px; padding-top: 14px; border-top: 1px solid #202b48; }
