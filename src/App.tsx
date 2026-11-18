@@ -2691,7 +2691,7 @@ function App() {
               {attentionItems.slice(0, 4).map((item) => (
                 <button className="inbox-item" key={item.id} onClick={() => setActiveNav("Attention inbox")}>
                   <span className={`inbox-icon ${item.kind === "failure" ? "failure" : "high"}`}>{item.kind === "permission" ? "⌘" : "!"}</span>
-                  <div><strong>{item.title}</strong><span>{item.project} · {providerLabel(item.agent)}</span></div>
+                  <div><strong title={item.title}>{item.title}</strong><span>{item.project} · {providerLabel(item.agent)}</span></div>
                   <time>{formatLocalTimestamp(item.updatedAt)}</time>
                 </button>
               ))}
@@ -2707,7 +2707,7 @@ function App() {
                 <button className="activity-item" key={session.id} type="button" onClick={() => openAttentionSession(session.id)}>
                   <span className={`activity-line ${session.status === "completed" ? "green-line" : session.status === "failed" ? "red-line" : session.status === "running" || session.status === "starting" ? "blue-line" : "purple-line"}`} aria-hidden="true" />
                   <div>
-                    <strong>{stripTaskCompletionProtocol(session.task) || providerLabel(session.provider)}</strong>
+                    <strong title={stripTaskCompletionProtocol(session.task) || providerLabel(session.provider)}>{stripTaskCompletionProtocol(session.task) || providerLabel(session.provider)}</strong>
                     <span>{session.project} · {session.step || session.lastEvent || session.status}</span>
                     {session.lastEvent && session.lastEvent !== session.step && <span>{session.lastEvent}</span>}
                   </div>
