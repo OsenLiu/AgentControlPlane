@@ -11,6 +11,10 @@ desktop-app context.
 Alert users through native operating-system notifications when an agent needs
 their attention or a task reaches a terminal result. Notifications supplement
 the app's existing attention and outcome views; they do not replace them.
+Task outcomes are loaded from persisted session and task state, not notification
+events. Completed tasks marked done remain in Task outcomes after a notification
+is dismissed or their session or task is archived. Accepted tasks count as
+Completed, not Ready for review.
 
 The design targets Windows, macOS, and Linux. Platform-specific authorization
 and delivery requirements must be respected, and the UI must not imply that a

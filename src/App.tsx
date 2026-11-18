@@ -526,11 +526,13 @@ function AgentSessionsView({
   settings,
   transcriptFontSize,
   initialSessionId,
+  initialArchived = false,
   projectId,
 }: {
   settings: Settings;
   transcriptFontSize: number;
   initialSessionId?: string;
+  initialArchived?: boolean;
   projectId?: string;
 }) {
   const [sessions, setSessions] = useState<AgentSession[]>([]);
@@ -552,7 +554,7 @@ function AgentSessionsView({
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
   const [messageDraft, setMessageDraft] = useState("");
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
-  const [archivedView, setArchivedView] = useState(false);
+  const [archivedView, setArchivedView] = useState(initialArchived);
   const [renamingSession, setRenamingSession] = useState(false);
   const [sessionNameDraft, setSessionNameDraft] = useState("");
   const [savingSessionName, setSavingSessionName] = useState(false);
@@ -1263,7 +1265,7 @@ function TaskOutcomesView({
   const [selectedId, setSelectedId] = useState("");
   const normalizedQuery = query.trim().toLowerCase();
   const isReadyForReview = (session: AgentSession) =>
-    session.status === "completed" && session.step === taskReadyForReviewStep;
+    session.status === "completed" && !session.taskDone && session.step === taskReadyForReviewStep;
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all"
       || (filter === "review" ? isReadyForReview(session) : session.status === filter && !isReadyForReview(session));
@@ -1652,6 +1654,7 @@ function ProjectWorkspaceView({
   transcriptFontSize,
   initialTaskId,
   initialSessionId,
+  initialSessionArchived,
   onProjectUpdated,
   onTaskOutcomesRefresh,
 }: {
@@ -1660,6 +1663,7 @@ function ProjectWorkspaceView({
   transcriptFontSize: number;
   initialTaskId?: string;
   initialSessionId?: string;
+  initialSessionArchived?: boolean;
   onProjectUpdated: (project: Project) => void;
   onTaskOutcomesRefresh: () => void;
 }) {
@@ -1800,6 +1804,7 @@ function ProjectWorkspaceView({
             transcriptFontSize={transcriptFontSize}
             projectId={project.id}
             initialSessionId={sessionToOpen}
+            initialArchived={sessionToOpen === initialSessionId && initialSessionArchived}
           />
         </div>
       ) : (
@@ -1835,7 +1840,7 @@ function App() {
   const [attentionSessionToOpen, setAttentionSessionToOpen] = useState<{ sessionId: string; requestId?: string } | null>(null);
   const [taskOutcomeSessionToOpen, setTaskOutcomeSessionToOpen] = useState("");
   const [taskToOpen, setTaskToOpen] = useState<{ projectId: string; taskId: string } | null>(null);
-  const [projectSessionToOpen, setProjectSessionToOpen] = useState<{ projectId: string; sessionId: string } | null>(null);
+  const [projectSessionToOpen, setProjectSessionToOpen] = useState<{ projectId: string; sessionId: string; archived: boolean } | null>(null);
   const [showAddProject, setShowAddProject] = useState(false);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState("");
@@ -2043,13 +2048,23 @@ function App() {
     try {
       const sessions = await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
       setActivitySessions(sessions);
-      setTaskOutcomes(sessions
-        .filter((session) =>
-          (session.status === "completed" || session.status === "failed") &&
-          !session.taskDone &&
-          !session.taskArchived,
-        )
-        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+      try {
+        const archivedSessions = await invoke<AgentSession[]>("list_agent_sessions", {
+          archived: true,
+          status: "completed",
+        });
+        setTaskOutcomes([
+          ...sessions,
+          ...archivedSessions.filter((session) => session.archived && session.taskDone),
+        ]
+          .filter((session) =>
+            (session.status === "completed" || session.status === "failed") &&
+            (session.taskDone || !session.taskArchived),
+          )
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
+      } catch (reason) {
+        setTaskOutcomesError(reason instanceof Error ? reason.message : String(reason));
+      }
       let snapshotAttentionItems: AttentionItem[] | null = null;
       try {
         snapshotAttentionItems = await loadAttentionItemsFromBackend(sessions);
@@ -2407,7 +2422,7 @@ function App() {
   function openProjectSession(session: AgentSession) {
     if (!session.projectId) return;
     setTaskToOpen(null);
-    setProjectSessionToOpen({ projectId: session.projectId, sessionId: session.id });
+    setProjectSessionToOpen({ projectId: session.projectId, sessionId: session.id, archived: session.archived });
     setSelectedProjectId(session.projectId);
     setActiveNav("Project workspace");
   }
@@ -2551,6 +2566,7 @@ function App() {
             transcriptFontSize={settings.transcriptFontSize}
             initialTaskId={taskToOpen?.projectId === selectedProject.id ? taskToOpen.taskId : undefined}
             initialSessionId={projectSessionToOpen?.projectId === selectedProject.id ? projectSessionToOpen.sessionId : undefined}
+            initialSessionArchived={projectSessionToOpen?.projectId === selectedProject.id ? projectSessionToOpen.archived : undefined}
             onProjectUpdated={updateProject}
             onTaskOutcomesRefresh={() => { void refreshAttentionItems(); }}
           />
