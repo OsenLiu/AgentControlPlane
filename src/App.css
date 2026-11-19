@@ -715,6 +715,7 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .project-task-setting-value { min-width: 0; color: #e4e9f7; font-size: 12px; font-weight: 600; line-height: 1.4; overflow-wrap: anywhere; }
 .project-task-setting-topline .project-task-setting-value { flex: 0 0 auto; font-family: "JetBrains Mono", monospace; font-size: 10px; }
 .project-task-setting-detail { color: #8f9db6; font-size: 9px; line-height: 1.45; }
+.project-task-worktree-path { display: block; overflow-wrap: anywhere; color: #aab8cf; font: inherit; }
 .project-task-step-progress { height: 5px; margin: 2px 0 1px; overflow: hidden; border-radius: 999px; background: #283650; }
 .project-task-step-progress > span { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #8065ee, #5590ee); transition: width .2s ease; }
 .project-task-actions-panel { display: grid; gap: 14px; margin-top: auto; padding: 14px; border: 1px solid #3a3b56; border-radius: 7px; background: #151a2a; }

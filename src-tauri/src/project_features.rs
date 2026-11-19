@@ -60,6 +60,7 @@ pub(crate) struct ProjectTask {
     loop_enabled: bool,
     origin: String,
     session_id: Option<String>,
+    worktree_path: Option<String>,
     created_at: String,
     updated_at: String,
     archived: bool,
@@ -478,12 +479,13 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTask> {
         loop_enabled: row.get::<_, i64>(11)? != 0,
         origin: row.get(12)?,
         session_id: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
-        archived: row.get::<_, i64>(16)? != 0,
-        review_pending: row.get::<_, i64>(17)? != 0,
-        use_worktree: row.get::<_, i64>(18)? != 0,
-        workspace_locked: row.get::<_, i64>(19)? != 0,
+        worktree_path: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
+        archived: row.get::<_, i64>(17)? != 0,
+        review_pending: row.get::<_, i64>(18)? != 0,
+        use_worktree: row.get::<_, i64>(19)? != 0,
+        workspace_locked: row.get::<_, i64>(20)? != 0,
     })
 }
 
@@ -492,7 +494,9 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
     let mut statement = connection
         .prepare(
             "SELECT id, project_id, title, description, provider, mode, model, step_budget, steps_used, auto_approve,
-                    status, loop_enabled, origin, session_id, created_at, updated_at, archived,
+                    status, loop_enabled, origin, session_id,
+                    (SELECT worktree_path FROM agent_sessions s WHERE s.id = project_tasks.session_id),
+                    created_at, updated_at, archived,
                     CASE WHEN project_tasks.status = 'in_progress' AND EXISTS (
                       SELECT 1 FROM agent_sessions s
                       WHERE s.id = project_tasks.session_id AND s.status = 'completed'
@@ -515,7 +519,9 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
 fn task_by_id(connection: &Connection, task_id: &str) -> rusqlite::Result<ProjectTask> {
     connection.query_row(
         "SELECT id, project_id, title, description, provider, mode, model, step_budget, steps_used, auto_approve,
-                status, loop_enabled, origin, session_id, created_at, updated_at, archived,
+                status, loop_enabled, origin, session_id,
+                (SELECT worktree_path FROM agent_sessions s WHERE s.id = project_tasks.session_id),
+                created_at, updated_at, archived,
                 CASE WHEN project_tasks.status = 'in_progress' AND EXISTS (
                   SELECT 1 FROM agent_sessions s
                   WHERE s.id = project_tasks.session_id AND s.status = 'completed'
@@ -2486,7 +2492,8 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
                  CREATE TABLE agent_sessions (
-                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT,
+                   worktree_path TEXT
                  );",
             )
             .expect("core schema");
@@ -2516,7 +2523,8 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
                  CREATE TABLE agent_sessions (
-                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT,
+                   worktree_path TEXT
                  );",
             )
             .expect("core schema");
@@ -2536,7 +2544,8 @@ mod tests {
             .expect("task row");
         connection
             .execute(
-                "INSERT INTO agent_sessions (id, project_id) VALUES ('session-1', 'project-1')",
+                "INSERT INTO agent_sessions (id, project_id, worktree_path)
+                 VALUES ('session-1', 'project-1', '/tmp/project-worktrees/task-1')",
                 [],
             )
             .expect("session row");
@@ -2553,6 +2562,10 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "in_progress");
         assert_eq!(tasks[0].session_id.as_deref(), Some("session-1"));
+        assert_eq!(
+            tasks[0].worktree_path.as_deref(),
+            Some("/tmp/project-worktrees/task-1")
+        );
         assert!(tasks[0].loop_enabled);
         assert_eq!(tasks[0].origin, "user");
         assert!(!tasks[0].review_pending);
@@ -2575,7 +2588,8 @@ mod tests {
             .execute_batch(
                 "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
                  CREATE TABLE agent_sessions (
-                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT,
+                   worktree_path TEXT
                  );
                  INSERT INTO projects (id, path) VALUES ('project-1', '/tmp/project-1');
                  INSERT INTO agent_sessions (id, project_id) VALUES ('session-1', 'project-1');",
@@ -2627,7 +2641,7 @@ mod tests {
                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                  );
                  CREATE TABLE agent_sessions (
-                   id TEXT PRIMARY KEY, status TEXT, current_step TEXT
+                   id TEXT PRIMARY KEY, status TEXT, current_step TEXT, worktree_path TEXT
                  );
                  INSERT INTO projects (id, path) VALUES ('project-1', '/tmp/project-1');
                  INSERT INTO project_tasks (id, project_id, title)
@@ -2886,7 +2900,8 @@ mod tests {
                    agent_task_creation INTEGER NOT NULL DEFAULT 0
                  );
                  CREATE TABLE agent_sessions (
-                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT
+                   id TEXT PRIMARY KEY, project_id TEXT NOT NULL, status TEXT, current_step TEXT,
+                   worktree_path TEXT
                  );
                  CREATE TABLE session_messages (
                    id TEXT PRIMARY KEY, session_id TEXT NOT NULL, sequence INTEGER NOT NULL,

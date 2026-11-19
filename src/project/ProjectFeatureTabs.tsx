@@ -37,6 +37,7 @@ type ProjectTask = {
   loopEnabled: boolean;
   origin: "user" | "agent";
   sessionId: string | null;
+  worktreePath: string | null;
   createdAt: string;
   updatedAt: string;
   archived: boolean;
@@ -1164,6 +1165,19 @@ function ProjectTaskDetail({
             <span className="project-task-setting-label">Auto-approve</span>
             <strong className="project-task-setting-value">{task.autoApprove ? "Enabled" : "Disabled"}</strong>
             <span className="project-task-setting-detail">Task approval setting</span>
+          </div>
+          <div className="project-task-setting">
+            <span className="project-task-setting-label">Workspace</span>
+            <strong className="project-task-setting-value">
+              {task.useWorktree ? "Git worktree" : "Project folder"}
+            </strong>
+            <span className="project-task-setting-detail">
+              {task.worktreePath
+                ? <code className="project-task-worktree-path">{task.worktreePath}</code>
+                : task.useWorktree
+                  ? task.status === "backlog" ? "Created when the task starts." : "Worktree path unavailable."
+                  : "Runs in the project folder."}
+            </span>
           </div>
         </div>
       </section>

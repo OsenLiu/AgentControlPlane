@@ -844,6 +844,7 @@ describe("App", () => {
       loopEnabled: boolean;
       origin: "user" | "agent";
       sessionId: string | null;
+      worktreePath: string | null;
       createdAt: string;
       updatedAt: string;
       archived: boolean;
@@ -907,6 +908,7 @@ describe("App", () => {
           loopEnabled: true,
           origin: "user",
           sessionId: null,
+          worktreePath: null,
           createdAt: "2026-01-01",
           updatedAt: "2026-01-01",
           archived: false,
@@ -931,7 +933,13 @@ describe("App", () => {
         return task;
       }
       if (command === "start_agent_session") {
-        if (task) task = { ...task, status: "in_progress", sessionId: "session-1", workspaceLocked: true };
+        if (task) task = {
+          ...task,
+          status: "in_progress",
+          sessionId: "session-1",
+          worktreePath: "/work/website-worktrees/task-1",
+          workspaceLocked: true,
+        };
         return undefined;
       }
       throw new Error(`Unexpected command: ${command}`);
@@ -969,6 +977,7 @@ describe("App", () => {
     expect(screen.getByRole("region", { name: "Task settings" })).toBeTruthy();
     expect(screen.getByText("Permission mode")).toBeTruthy();
     expect(screen.getByText("Auto", { selector: ".project-task-setting-value" })).toBeTruthy();
+    expect(screen.getByText("Created when the task starts.")).toBeTruthy();
     expect(screen.getByRole("progressbar", { name: "Steps used" })).toHaveAttribute("aria-valuenow", "0");
     expect(invokeMock).toHaveBeenCalledWith("create_project_task", {
       projectId: "/work/website",
@@ -1033,6 +1042,7 @@ describe("App", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start session" }));
     expect(await screen.findByText("Linked session")).toBeTruthy();
     expect(await screen.findByText("session-1")).toBeTruthy();
+    expect(await screen.findByText("/work/website-worktrees/task-1")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     expect(screen.getByRole("checkbox", { name: "Run in a new Git worktree" })).toHaveProperty("disabled", true);
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
