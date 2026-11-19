@@ -22,6 +22,7 @@ use tauri_plugin_notification::NotificationExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+mod jira;
 mod project_features;
 
 use project_features::{
@@ -150,6 +151,8 @@ struct SettingsInput {
     github_username: String,
     github_auth_method: String,
     github_token: String,
+    jira_email: String,
+    jira_token: String,
     default_provider: String,
     transcript_font_size: u8,
     ui_font_scale: u8,
@@ -173,6 +176,8 @@ struct Settings {
     github_username: String,
     github_auth_method: String,
     github_token_configured: bool,
+    jira_email: String,
+    jira_token_configured: bool,
     default_provider: String,
     transcript_font_size: u8,
     ui_font_scale: u8,
@@ -612,7 +617,7 @@ fn copilot_command_for(executable: &Path) -> Command {
     command
 }
 
-fn copilot_command() -> Result<(Command, PathBuf), String> {
+pub(crate) fn copilot_command() -> Result<(Command, PathBuf), String> {
     let executable = copilot_executable()?;
     let mut command = copilot_command_for(&executable);
     with_node_path(&mut command, &executable);
@@ -661,7 +666,7 @@ fn claude_executable() -> PathBuf {
     PathBuf::from("claude")
 }
 
-fn claude_command() -> Command {
+pub(crate) fn claude_command() -> Command {
     let executable = claude_executable();
     let mut command = Command::new(&executable);
     hide_console_window(&mut command);
@@ -1266,6 +1271,12 @@ fn github_token_configured() -> bool {
         .is_ok()
 }
 
+fn jira_token_configured() -> bool {
+    keyring::Entry::new(jira::JIRA_CREDENTIAL_SERVICE, jira::JIRA_CREDENTIAL_USER)
+        .and_then(|entry| entry.get_password())
+        .is_ok()
+}
+
 #[tauri::command]
 fn get_current_username() -> Option<String> {
     ["USER", "USERNAME"].iter().find_map(|key| {
@@ -1299,6 +1310,13 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
             |row| row.get::<_, String>(0),
         )
         .unwrap_or_else(|_| "token".to_owned());
+    let jira_email = connection
+        .query_row(
+            "SELECT value FROM app_settings WHERE key = 'jira_email'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_default();
     let default_provider = connection
         .query_row(
             "SELECT value FROM app_settings WHERE key = 'default_provider'",
@@ -1333,6 +1351,8 @@ fn load_settings(database: State<'_, Database>) -> Result<Settings, String> {
         github_username,
         github_auth_method,
         github_token_configured: github_token_configured(),
+        jira_email,
+        jira_token_configured: jira_token_configured(),
         default_provider,
         transcript_font_size,
         ui_font_scale,
@@ -1375,6 +1395,15 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
                 format!("Unable to save the GitHub token in the OS credential vault: {error}")
             })?;
     }
+    let jira_token = input.jira_token.trim().to_owned();
+    if !jira_token.is_empty() {
+        keyring::Entry::new(jira::JIRA_CREDENTIAL_SERVICE, jira::JIRA_CREDENTIAL_USER)
+            .map_err(|error| format!("Unable to access the OS credential vault: {error}"))?
+            .set_password(&jira_token)
+            .map_err(|error| {
+                format!("Unable to save the Jira API token in the OS credential vault: {error}")
+            })?;
+    }
 
     let connection = database
         .0
@@ -1413,6 +1442,13 @@ fn save_settings(input: SettingsInput, database: State<'_, Database>) -> Result<
             [&input.github_auth_method],
         )
         .map_err(|error| format!("Unable to save GitHub settings: {error}"))?;
+    transaction
+        .execute(
+            "INSERT INTO app_settings (key, value) VALUES ('jira_email', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [&input.jira_email.trim()],
+        )
+        .map_err(|error| format!("Unable to save Jira settings: {error}"))?;
     transaction
         .execute(
             "INSERT INTO app_settings (key, value) VALUES ('default_provider', ?1)
@@ -4296,6 +4332,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_current_username,
+            jira::import_jira_ticket,
             list_projects,
             remove_project,
             set_project_automation,

@@ -466,6 +466,9 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .task-dialog-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
 .task-dialog-header h2 { color: #e2e9f6; font-size: 16px; }
 .task-dialog > form { display: grid; gap: 15px; }
+.task-jira-import { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: 8px; padding: 12px; border: 1px solid #34415d; border-radius: 7px; background: #0c1423; }
+.task-jira-import > .task-agent-help, .task-jira-import > .project-feature-error { grid-column: 1 / -1; margin: 0; }
+.task-jira-import > button { min-height: 40px; }
 .task-agent-picker { min-width: 0; margin: 0; padding: 0; border: 0; }
 .task-agent-picker legend { margin-bottom: 8px; color: #aab6cd; font-size: 11px; font-weight: 600; }
 .task-agent-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
