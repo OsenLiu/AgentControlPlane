@@ -89,6 +89,7 @@ struct AgentSession {
     id: String,
     project_id: String,
     task_id: Option<String>,
+    worktree_path: Option<String>,
     external_session_id: Option<String>,
     project: String,
     task: String,
@@ -353,6 +354,7 @@ fn agent_session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSess
         id: row.get(0)?,
         project_id: row.get(20)?,
         task_id: row.get(21)?,
+        worktree_path: row.get(22)?,
         project: row.get(1)?,
         task: row.get(2)?,
         branch: row.get(3)?,
@@ -596,7 +598,7 @@ fn terminate_agent_process(child: &mut Child) -> std::io::Result<()> {
     }
 }
 
-fn copilot_command_for(executable: &Path) -> Command {
+fn command_for_executable(executable: &Path) -> Command {
     #[cfg(windows)]
     if matches!(
         executable
@@ -619,7 +621,7 @@ fn copilot_command_for(executable: &Path) -> Command {
 
 pub(crate) fn copilot_command() -> Result<(Command, PathBuf), String> {
     let executable = copilot_executable()?;
-    let mut command = copilot_command_for(&executable);
+    let mut command = command_for_executable(&executable);
     with_node_path(&mut command, &executable);
     Ok((command, executable))
 }
@@ -1697,26 +1699,24 @@ async fn continue_project_loop(
     .await
 }
 
-#[tauri::command]
-fn open_project_in_vscode(project_id: String, database: State<'_, Database>) -> Result<(), String> {
-    let path = {
-        let connection = database
-            .0
-            .lock()
-            .map_err(|_| "Project database is unavailable.".to_owned())?;
-        connection
-            .query_row(
-                "SELECT path FROM projects WHERE id = ?1",
-                [&project_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("Unable to find project folder: {error}"))?
-    };
-    let project_path = Path::new(&path)
-        .canonicalize()
-        .map_err(|error| format!("The project folder is unavailable: {error}"))?;
+fn vscode_executables() -> Vec<PathBuf> {
+    #[cfg(not(windows))]
     #[allow(unused_mut)]
     let mut executables = vec![PathBuf::from("code"), PathBuf::from("code-insiders")];
+    #[cfg(windows)]
+    let mut executables = {
+        let mut candidates = Vec::new();
+        if let Some(path) = std::env::var_os("PATH") {
+            for directory in std::env::split_paths(&path) {
+                let candidate = directory.join("code.cmd");
+                if candidate.is_file() {
+                    candidates.push(candidate);
+                }
+            }
+        }
+        candidates.push(PathBuf::from("code.exe"));
+        candidates
+    };
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = std::env::var_os("HOME") {
@@ -1732,43 +1732,127 @@ fn open_project_in_vscode(project_id: String, database: State<'_, Database>) -> 
     #[cfg(target_os = "windows")]
     {
         if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            executables
-                .push(PathBuf::from(local_app_data).join("Programs/Microsoft VS Code/Code.exe"));
+            executables.push(
+                PathBuf::from(local_app_data).join("Programs/Microsoft VS Code/bin/code.cmd"),
+            );
         }
         if let Some(program_files) = std::env::var_os("ProgramFiles") {
-            executables.push(PathBuf::from(program_files).join("Microsoft VS Code/Code.exe"));
+            executables.push(PathBuf::from(program_files).join("Microsoft VS Code/bin/code.cmd"));
         }
         if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
-            executables.push(PathBuf::from(program_files_x86).join("Microsoft VS Code/Code.exe"));
+            executables
+                .push(PathBuf::from(program_files_x86).join("Microsoft VS Code/bin/code.cmd"));
         }
     }
-    let mut last_error = None;
+    executables
+}
+
+fn launch_vscode(workspace: &Path, executables: Vec<PathBuf>) -> Result<(), String> {
+    let workspace = workspace
+        .canonicalize()
+        .map_err(|error| format!("The workspace folder is unavailable: {error}"))?;
+    if !workspace.is_dir() {
+        return Err("The workspace path is not a directory.".to_owned());
+    }
     for executable in executables {
-        let mut cmd = Command::new(executable);
-        hide_console_window(&mut cmd);
+        // cmd.exe itself can start even when the requested VS Code script is missing.
+        #[cfg(windows)]
+        if executable
+            .extension()
+            .is_some_and(|extension| extension == "cmd")
+            && !executable.is_file()
+        {
+            continue;
+        }
+        let mut cmd = command_for_executable(&executable);
         match cmd
             .arg("--new-window")
-            .arg(&project_path)
+            .arg(&workspace)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .output()
         {
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                last_error = Some(error);
+            Ok(output) if output.status.success() => return Ok(()),
+            Ok(output) => {
+                let detail = String::from_utf8_lossy(&output.stderr);
+                return Err(format!(
+                    "VS Code failed to launch ({}). {}",
+                    output.status,
+                    detail.trim()
+                ));
             }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(format!("Unable to open the project in VS Code: {error}"));
+                return Err(format!("VS Code failed to launch: {error}"));
             }
         }
     }
-    Err(format!(
-        "VS Code was not found on PATH. Install its `code` command and try again.{}",
-        last_error
-            .map(|error| format!(" ({error})"))
-            .unwrap_or_default()
-    ))
+    Err(
+        "VS Code executable was not found. Install its `code` command on PATH and try again."
+            .to_owned(),
+    )
+}
+
+#[tauri::command]
+async fn open_project_in_vscode(
+    project_id: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    let database = Database(database.0.clone());
+    run_agent_operation(move || {
+        let path = {
+            let connection = database
+                .0
+                .lock()
+                .map_err(|_| "Project database is unavailable.".to_owned())?;
+            connection
+                .query_row(
+                    "SELECT path FROM projects WHERE id = ?1",
+                    [&project_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| format!("Unable to find project folder: {error}"))?
+        };
+        launch_vscode(Path::new(&path), vscode_executables())
+    })
+    .await
+}
+
+fn task_worktree_path(
+    connection: &Connection,
+    project_id: &str,
+    task_id: &str,
+) -> Result<String, String> {
+    let path: Option<String> = connection
+        .query_row(
+            "SELECT s.worktree_path FROM project_tasks t
+             LEFT JOIN agent_sessions s ON s.id = t.session_id AND s.project_id = t.project_id
+             WHERE t.id = ?1 AND t.project_id = ?2",
+            params![task_id, project_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to find the task worktree: {error}"))?;
+    path.filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| "This task does not have a prepared worktree.".to_owned())
+}
+
+#[tauri::command]
+async fn open_task_in_vscode(
+    project_id: String,
+    task_id: String,
+    database: State<'_, Database>,
+) -> Result<(), String> {
+    let database = Database(database.0.clone());
+    run_agent_operation(move || {
+        let path = {
+            let connection = database
+                .0
+                .lock()
+                .map_err(|_| "Project database is unavailable.".to_owned())?;
+            task_worktree_path(&connection, &project_id, &task_id)?
+        };
+        launch_vscode(Path::new(&path), vscode_executables())
+    })
+    .await
 }
 
 fn project_session_auto_approve_permissions(
@@ -2161,7 +2245,8 @@ fn list_agent_sessions_from_connection(
                    (SELECT t.id FROM project_tasks t
                     WHERE t.session_id = s.id
                     ORDER BY t.updated_at DESC, t.id
-                    LIMIT 1)
+                    LIMIT 1),
+                   s.worktree_path
              FROM agent_sessions s
              JOIN projects p ON p.id = s.project_id
              WHERE p.connected = 1 AND (?1 IS NULL OR s.project_id = ?1)
@@ -4338,6 +4423,7 @@ pub fn run() {
             set_project_automation,
             continue_project_loop,
             open_project_in_vscode,
+            open_task_in_vscode,
             list_agent_sessions,
             send_session_message,
             get_pending_session_permission,
@@ -4379,6 +4465,59 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vscode_launch_reports_missing_executable_and_unavailable_workspace() {
+        let workspace = std::env::temp_dir();
+        let missing = workspace.join(copilot_session_id()).join("missing-code");
+        let error = launch_vscode(&workspace, vec![missing.clone()]).unwrap_err();
+        assert!(error.contains("executable was not found"), "{error}");
+        let error = launch_vscode(&missing, vec![]).unwrap_err();
+        assert!(error.contains("workspace folder is unavailable"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vscode_launch_passes_workspace_as_one_argument_and_checks_exit_status() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("vscode-{}", copilot_session_id()));
+        let workspace = root.join("worktree with spaces");
+        fs::create_dir_all(&workspace).expect("workspace");
+        let executable = root.join("code");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$(dirname \"$0\")/args\"\n",
+        )
+        .expect("fake VS Code CLI");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).expect("executable");
+        launch_vscode(&workspace, vec![executable.clone()]).expect("successful launch");
+        assert_eq!(
+            fs::read_to_string(root.join("args")).expect("arguments"),
+            format!(
+                "--new-window\n{}\n",
+                workspace.canonicalize().unwrap().display()
+            )
+        );
+
+        fs::write(
+            &executable,
+            "#!/bin/sh\necho 'test launch failure' >&2\nexit 7\n",
+        )
+        .expect("failing VS Code CLI");
+        let error = launch_vscode(&workspace, vec![executable.clone()]).unwrap_err();
+        assert!(error.contains("VS Code failed to launch"), "{error}");
+        assert!(error.contains("test launch failure"), "{error}");
+        assert!(error.contains('7'), "{error}");
+
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644))
+            .expect("not executable");
+        let error = launch_vscode(&workspace, vec![executable.clone()]).unwrap_err();
+        assert!(error.contains("VS Code failed to launch"), "{error}");
+        let error = launch_vscode(&executable, vec![]).unwrap_err();
+        assert!(error.contains("not a directory"), "{error}");
+        fs::remove_dir_all(&root).expect("remove VS Code test directory");
+    }
 
     #[test]
     fn copilot_executable_preserves_path_precedence_over_user_install() {
@@ -4497,7 +4636,7 @@ mod tests {
             copilot_executable_from(Some(extensionless_shim.as_os_str()), None, None),
             Some(executable.clone())
         );
-        let output = copilot_command_for(&executable)
+        let output = command_for_executable(&executable)
             .arg("hello")
             .output()
             .expect("start CLI shim");
@@ -4815,6 +4954,33 @@ mod tests {
         assert_eq!(sessions[0].id, "session-1");
         assert_eq!(sessions[0].project_id, "project-1");
         assert_eq!(sessions[0].task_id.as_deref(), Some("task-1"));
+        assert!(sessions[0].worktree_path.is_none());
+        assert!(task_worktree_path(&connection, "project-1", "task-1").is_err());
+        connection
+            .execute(
+                "UPDATE agent_sessions SET worktree_path = '/tmp/task worktree' WHERE id = 'session-1'",
+                [],
+            )
+            .expect("prepared worktree");
+        assert_eq!(
+            task_worktree_path(&connection, "project-1", "task-1").unwrap(),
+            "/tmp/task worktree"
+        );
+        assert!(task_worktree_path(&connection, "other-project", "task-1").is_err());
+        assert!(task_worktree_path(&connection, "project-1", "missing-task").is_err());
+        let prepared = list_agent_sessions_from_connection(&connection, None, None, None)
+            .expect("prepared worktree session query");
+        assert_eq!(
+            prepared[0].worktree_path.as_deref(),
+            Some("/tmp/task worktree")
+        );
+        connection
+            .execute(
+                "UPDATE agent_sessions SET worktree_path = '   ' WHERE id = 'session-1'",
+                [],
+            )
+            .expect("empty worktree");
+        assert!(task_worktree_path(&connection, "project-1", "task-1").is_err());
         assert_eq!(
             sessions[0].external_session_id.as_deref(),
             Some("sess_external_1")

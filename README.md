@@ -23,6 +23,9 @@ in.
   or an assigned task completes, with separate controls in Settings.
 - **Outcome review** — see completed, failed, and review-ready work and inspect
   results before marking tasks done.
+- **Task worktrees in VS Code** — open a prepared worktree from task details or
+  outcome review with **Open in VS Code**. Install VS Code's `code` command on
+  `PATH`; missing executables and launch failures are reported in the workspace.
 - **Project tools in context** — browse diffs, terminals, pipelines,
   dependencies, and skills alongside each project.
 - **Copilot and Claude Code support** — enable local CLI providers and select a

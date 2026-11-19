@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { open } from "@tauri-apps/plugin-dialog";
 import { isPermissionGranted, onAction, requestPermission } from "@tauri-apps/plugin-notification";
 import appMetadata from "../package.json";
+import { OpenTaskInVSCodeButton } from "./project/OpenTaskInVSCodeButton";
 import {
   ProjectDependenciesTab,
   ProjectDiffsTab,
@@ -129,6 +130,7 @@ type AgentSession = {
   taskArchived: boolean;
   projectId?: string;
   taskId?: string | null;
+  worktreePath?: string | null;
 };
 
 type TranscriptMessage = {
@@ -1452,6 +1454,14 @@ function TaskOutcomesView({
                 >
                   Open task
                 </button>
+                {selectedSession.projectId && selectedSession.taskId && (
+                  <OpenTaskInVSCodeButton
+                    key={selectedSession.id}
+                    projectId={selectedSession.projectId}
+                    taskId={selectedSession.taskId}
+                    worktreePath={selectedSession.worktreePath}
+                  />
+                )}
               </div>
             </article>
           ) : (
