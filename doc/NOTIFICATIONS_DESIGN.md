@@ -12,9 +12,10 @@ Alert users through native operating-system notifications when an agent needs
 their attention or a task reaches a terminal result. Notifications supplement
 the app's existing attention and outcome views; they do not replace them.
 Task outcomes are loaded from persisted session and task state, not notification
-events. Task outcomes show completed sessions until their task is marked done
-or archived. Archiving a session also removes it from Task outcomes. Failed
-sessions are not shown there.
+events. Task outcomes show completed sessions for tasks that are not archived,
+including tasks marked done; linked project-task status is shown independently
+of the agent session status. Archiving a task or session removes it from Task
+outcomes. Failed sessions are not shown there.
 
 The design targets Windows, macOS, and Linux. Platform-specific authorization
 and delivery requirements must be respected, and the UI must not imply that a

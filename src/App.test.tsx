@@ -1264,7 +1264,7 @@ describe("App", () => {
     await waitFor(() => expect(onTaskUpdated).toHaveBeenCalledOnce());
   });
 
-  it.each(["done", "archived", "done and archived", "session archived"])("removes a completed task from outcomes when %s, including on notification click", async (action) => {
+  it.each(["done", "archived", "done and archived", "session archived"])("updates completed task outcomes when %s, including on notification click", async (action) => {
     let session = {
       id: "review-session",
       task: "Review this task",
@@ -1306,9 +1306,16 @@ describe("App", () => {
       archived: action === "session archived",
     };
     fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
-    await waitFor(() => expect(outcomesList.queryByRole("button", { name: /Review this task/ })).toBeNull());
-    expect(screen.getByRole("heading", { name: "Task history 0" })).toBeTruthy();
-    expect(within(screen.getByRole("button", { name: /^Task outcomes/ })).queryByText("1")).toBeNull();
+    if (action === "done") {
+      const doneOutcome = await outcomesList.findByRole("button", { name: /Review this task/ });
+      expect(within(doneOutcome).getByText("Done")).toBeTruthy();
+      expect(screen.getByRole("heading", { name: "Task history 1" })).toBeTruthy();
+      expect(within(screen.getByRole("button", { name: /^Task outcomes/ })).getByText("1")).toBeTruthy();
+    } else {
+      await waitFor(() => expect(outcomesList.queryByRole("button", { name: /Review this task/ })).toBeNull());
+      expect(screen.getByRole("heading", { name: "Task history 0" })).toBeTruthy();
+      expect(within(screen.getByRole("button", { name: /^Task outcomes/ })).queryByText("1")).toBeNull();
+    }
     await waitFor(() => expect(testNotificationEvents.actionHandlers.length).toBeGreaterThan(0));
     await act(async () => {
       testNotificationEvents.actionHandlers[0]({
@@ -1317,10 +1324,12 @@ describe("App", () => {
       });
     });
     await waitFor(() => expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled());
-    expect(outcomesList.queryByRole("button", { name: /Review this task/ })).toBeNull();
+    if (action !== "done") {
+      expect(outcomesList.queryByRole("button", { name: /Review this task/ })).toBeNull();
+    }
   });
 
-  it("shows only completed sessions for tasks not done or archived with working filters", async () => {
+  it("shows completed sessions and project task outcomes with working filters", async () => {
     const sessions = [
       {
         id: "completed-session",
@@ -1455,19 +1464,20 @@ describe("App", () => {
 
     render(<App />);
     const taskOutcomesNavItem = screen.getByRole("button", { name: /Task outcomes/ });
-    expect(await within(taskOutcomesNavItem).findByText("2")).toBeTruthy();
+    expect(await within(taskOutcomesNavItem).findByText("3")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /^Task outcomes/ }));
 
-    expect(await screen.findByRole("heading", { name: "Task history 2" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Task history 3" })).toBeTruthy();
     const outcomesList = within(screen.getByRole("region", { name: "Completed sessions" }));
     const filters = within(screen.getByRole("group", { name: "Filter task outcomes" }));
     expect(outcomesList.getByRole("button", { name: /Hi hello, this is a test\./ })).toBeTruthy();
-    expect(outcomesList.getByRole("button", { name: /Write release notes/ })).toBeTruthy();
+    expect(within(outcomesList.getByRole("button", { name: /Write release notes/ })).getByText("Ready for review")).toBeTruthy();
+    expect(within(outcomesList.getByRole("button", { name: /Already accepted task/ })).getByText("Done")).toBeTruthy();
+    expect(outcomesList.getByRole("button", { name: /Already accepted task/ })).toBeTruthy();
     expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();
     fireEvent.click(outcomesList.getByRole("button", { name: /Hi hello, this is a test\./ }));
     expect(screen.getByRole("heading", { level: 3, name: "Hi hello, this is a test." })).toBeTruthy();
     expect(screen.queryByText(/Task completion protocol/)).toBeNull();
-    expect(outcomesList.queryByRole("button", { name: /Already accepted task/ })).toBeNull();
     expect(outcomesList.queryByRole("button", { name: /Archived task/ })).toBeNull();
 
     fireEvent.click(filters.getByRole("button", { name: /^Ready for review/ }));
@@ -1476,7 +1486,7 @@ describe("App", () => {
     expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();
     fireEvent.click(filters.getByRole("button", { name: /^Completed/ }));
     expect(outcomesList.getByRole("button", { name: /Hi hello, this is a test\./ })).toBeTruthy();
-    expect(outcomesList.queryByRole("button", { name: /Already accepted task/ })).toBeNull();
+    expect(outcomesList.getByRole("button", { name: /Already accepted task/ })).toBeTruthy();
     expect(outcomesList.queryByRole("button", { name: /Write release notes/ })).toBeNull();
     expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();
     expect(filters.queryByRole("button", { name: /^Failed/ })).toBeNull();
@@ -1497,7 +1507,7 @@ describe("App", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: /^Task outcomes/ }));
-    expect(await screen.findByRole("heading", { name: "Task history 2" })).toBeTruthy();
+    expect(await screen.findByRole("heading", { name: "Task history 3" })).toBeTruthy();
     const reopenedOutcomesList = within(screen.getByRole("region", { name: "Completed sessions" }));
     fireEvent.click(reopenedOutcomesList.getByRole("button", { name: /Hi hello, this is a test\./ }));
     expect(screen.getByRole("button", { name: "Open task" })).toBeEnabled();

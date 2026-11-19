@@ -1298,6 +1298,12 @@ function TaskOutcomesView({
   const normalizedQuery = query.trim().toLowerCase();
   const isReadyForReview = (session: AgentSession) =>
     session.status === "completed" && !session.taskDone && session.step === taskReadyForReviewStep;
+  const isTaskDone = (session: AgentSession) => session.status === "completed" && session.taskDone;
+  const outcomeBadge = (session: AgentSession) => isReadyForReview(session)
+    ? <span className="task-outcome-review-badge">Ready for review</span>
+    : isTaskDone(session)
+      ? <span className="task-outcome-review-badge">Done</span>
+      : <SessionStatusBadge status={session.status} />;
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all"
       || (filter === "review" ? isReadyForReview(session) : session.status === filter && !isReadyForReview(session));
@@ -1389,9 +1395,7 @@ function TaskOutcomesView({
                   <strong>{stripTaskCompletionProtocol(session.task)}</strong>
                   <span>{session.project} <i>·</i> {providerLabel(session.provider)}</span>
                   <span className="task-outcome-row-meta">
-                    {isReadyForReview(session)
-                      ? <span className="task-outcome-review-badge">Ready for review</span>
-                      : <SessionStatusBadge status={session.status} />}
+                    {outcomeBadge(session)}
                     <time>{formatLocalTimestamp(session.updatedAt)}</time>
                   </span>
                 </span>
@@ -1415,13 +1419,13 @@ function TaskOutcomesView({
             <article className="task-outcome-detail">
               <div className="task-outcome-detail-status">
                 <span className="task-outcome-icon completed" aria-hidden="true">✓</span>
-                {isReadyForReview(selectedSession)
-                  ? <span className="task-outcome-review-badge">Ready for review</span>
-                  : <SessionStatusBadge status={selectedSession.status} />}
+                {outcomeBadge(selectedSession)}
               </div>
               <h3>{stripTaskCompletionProtocol(selectedSession.task)}</h3>
               <p className="task-outcome-detail-summary">
-                {selectedSession.statusReason || selectedSession.lastEvent || selectedSession.step || "The session finished successfully."}
+                {isTaskDone(selectedSession)
+                  ? "Task marked done."
+                  : selectedSession.statusReason || selectedSession.lastEvent || selectedSession.step || "The session finished successfully."}
               </p>
               <dl className="attention-metadata task-outcome-metadata">
                 <div><dt>PROJECT</dt><dd>{selectedSession.project}</dd></div>
@@ -2073,7 +2077,7 @@ function App() {
       const sessions = await invoke<AgentSession[]>("list_agent_sessions", { archived: false });
       setActivitySessions(sessions);
       setTaskOutcomes(sessions
-        .filter((session) => session.status === "completed" && !session.taskDone && !session.taskArchived)
+        .filter((session) => session.status === "completed" && !session.taskArchived)
         .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)));
       let snapshotAttentionItems: AttentionItem[] | null = null;
       try {
