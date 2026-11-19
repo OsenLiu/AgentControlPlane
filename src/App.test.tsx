@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import App, { getGreetingForLocalTime } from "./App";
 import { ProjectDiffsTab, ProjectTasksTab } from "./project/ProjectFeatureTabs";
+import { OpenTaskInVSCodeButton } from "./project/OpenTaskInVSCodeButton";
 
 const testNotificationEvents = vi.hoisted(() => ({
   handlers: new Map<string, (event: { payload: unknown }) => void>(),
@@ -816,6 +817,37 @@ describe("App", () => {
     expect(invokeMock).toHaveBeenCalledWith("list_project_skills", { projectId: "/work/website" });
   });
 
+  it.each([null, "", "   "])("hides the task editor button for an unprepared worktree (%s)", (worktreePath) => {
+    render(<OpenTaskInVSCodeButton projectId="project-1" taskId="task-1" worktreePath={worktreePath} />);
+    expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
+  });
+
+  it.each([
+    "VS Code executable was not found. Install its `code` command on PATH and try again.",
+    "VS Code failed to launch (exit status: 1). Launch error",
+  ])("reports editor errors and allows retry: %s", async (message) => {
+    let rejectLaunch: (reason: string) => void = () => {};
+    invokeMock.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectLaunch = reject;
+    }));
+    render(<OpenTaskInVSCodeButton projectId="project-1" taskId="task-1" worktreePath="/work/task folder" />);
+    fireEvent.click(screen.getByRole("button", { name: "Open in VS Code" }));
+    const pendingButton = screen.getByRole("button", { name: "Opening in VS Code..." });
+    expect(pendingButton).toBeDisabled();
+    fireEvent.click(pendingButton);
+    expect(invokeMock).toHaveBeenCalledTimes(1);
+    expect(invokeMock).toHaveBeenCalledWith("open_task_in_vscode", { projectId: "project-1", taskId: "task-1" });
+    await act(async () => rejectLaunch(message));
+    expect(screen.getByRole("alert")).toHaveTextContent(message);
+    expect(screen.getByRole("button", { name: "Open in VS Code" })).toBeEnabled();
+
+    invokeMock.mockResolvedValueOnce(undefined);
+    fireEvent.click(screen.getByRole("button", { name: "Open in VS Code" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open in VS Code" })).toBeEnabled());
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(invokeMock).toHaveBeenCalledTimes(2);
+  });
+
   it("creates a project task and links it to a new Copilot session", async () => {
     const project = {
       id: "/work/website",
@@ -881,6 +913,7 @@ describe("App", () => {
       if (command === "get_pending_session_permission") return null;
       if (command === "get_session_transcript") return [];
       if (command === "load_settings") return bothProvidersEnabled;
+      if (command === "open_task_in_vscode") return undefined;
       if (command === "list_project_tasks") return task ? [task] : [];
       if (command === "set_project_task_loop_enabled") {
         if (task) task = { ...task, loopEnabled: Boolean(payload.enabled) };
@@ -978,6 +1011,7 @@ describe("App", () => {
     expect(screen.getByText("Permission mode")).toBeTruthy();
     expect(screen.getByText("Auto", { selector: ".project-task-setting-value" })).toBeTruthy();
     expect(screen.getByText("Created when the task starts.")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
     expect(screen.getByRole("progressbar", { name: "Steps used" })).toHaveAttribute("aria-valuenow", "0");
     expect(invokeMock).toHaveBeenCalledWith("create_project_task", {
       projectId: "/work/website",
@@ -1043,6 +1077,13 @@ describe("App", () => {
     expect(await screen.findByText("Linked session")).toBeTruthy();
     expect(await screen.findByText("session-1")).toBeTruthy();
     expect(await screen.findByText("/work/website-worktrees/task-1")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open in VS Code" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open in VS Code" })).toBeEnabled());
+    expect(invokeMock).toHaveBeenCalledWith("open_task_in_vscode", {
+      projectId: "/work/website",
+      taskId: "task-1",
+    });
+    expect(screen.getByRole("heading", { name: "Ship onboarding flow" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Edit" }));
     expect(screen.getByRole("checkbox", { name: "Run in a new Git worktree" })).toHaveProperty("disabled", true);
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
@@ -1335,6 +1376,7 @@ describe("App", () => {
         id: "completed-session",
         projectId: "project-1",
         taskId: "task-1",
+        worktreePath: "/tmp/demo-worktrees/task-1",
         project: "demo",
         task: "Hi hello, this is a test. \n\n# Task completion protocol\nEnd your response with one fenced apt-status JSON block. Use state `working` or `complete`.",
         branch: "docs/setup",
@@ -1458,6 +1500,7 @@ describe("App", () => {
       if (command === "list_agent_sessions") return sessions;
       if (command === "list_projects") return [project];
       if (command === "list_project_tasks") return [linkedTask];
+      if (command === "open_task_in_vscode") return undefined;
       if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
       return defaultImplementation(command, args);
     });
@@ -1477,10 +1520,17 @@ describe("App", () => {
     expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();
     fireEvent.click(outcomesList.getByRole("button", { name: /Hi hello, this is a test\./ }));
     expect(screen.getByRole("heading", { level: 3, name: "Hi hello, this is a test." })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Open in VS Code" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Open in VS Code" })).toBeEnabled());
+    expect(invokeMock).toHaveBeenCalledWith("open_task_in_vscode", {
+      projectId: "project-1",
+      taskId: "task-1",
+    });
     expect(screen.queryByText(/Task completion protocol/)).toBeNull();
     expect(outcomesList.queryByRole("button", { name: /Archived task/ })).toBeNull();
 
     fireEvent.click(filters.getByRole("button", { name: /^Ready for review/ }));
+    expect(screen.queryByRole("button", { name: "Open in VS Code" })).toBeNull();
     expect(outcomesList.getByRole("button", { name: /Write release notes/ })).toBeTruthy();
     expect(outcomesList.queryByRole("button", { name: /Hi hello, this is a test\./ })).toBeNull();
     expect(outcomesList.queryByRole("button", { name: /Build the app/ })).toBeNull();

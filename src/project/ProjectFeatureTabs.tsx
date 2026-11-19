@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { createPortal } from "react-dom";
 import type { Terminal as XTerm } from "@xterm/xterm";
+import { OpenTaskInVSCodeButton } from "./OpenTaskInVSCodeButton";
 import "@xterm/xterm/css/xterm.css";
 
 type ProjectReference = {
@@ -1178,6 +1179,12 @@ function ProjectTaskDetail({
                   ? task.status === "backlog" ? "Created when the task starts." : "Worktree path unavailable."
                   : "Runs in the project folder."}
             </span>
+            <OpenTaskInVSCodeButton
+              key={task.id}
+              projectId={task.projectId}
+              taskId={task.id}
+              worktreePath={task.worktreePath}
+            />
           </div>
         </div>
       </section>
