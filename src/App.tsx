@@ -79,6 +79,8 @@ type Settings = {
   githubUsername: string;
   githubAuthMethod: "token" | "cli";
   githubTokenConfigured: boolean;
+  jiraEmail: string;
+  jiraTokenConfigured: boolean;
   defaultProvider: "copilot" | "gemini" | "claudeCode";
   transcriptFontSize: number;
   uiFontScale: number;
@@ -89,7 +91,7 @@ type Settings = {
 
 type AgentProvider = "copilot" | "claudeCode";
 
-type SettingsForm = Settings & { githubToken: string };
+type SettingsForm = Settings & { githubToken: string; jiraToken: string };
 
 type SessionStatus = "starting" | "running" | "waiting" | "idle" | "paused" | "completed" | "failed" | "orphaned" | "unknown";
 type NotificationStatus = "unknown" | "available" | "blocked";
@@ -291,6 +293,8 @@ const emptySettings = (): Settings => ({
   githubUsername: "",
   githubAuthMethod: "token",
   githubTokenConfigured: false,
+  jiraEmail: "",
+  jiraTokenConfigured: false,
   defaultProvider: "claudeCode",
   transcriptFontSize: 16,
   uiFontScale: 100,
@@ -471,6 +475,16 @@ function SettingsView({
               : "Delivery is controlled by the operating system and desktop environment; this app cannot confirm that a notification was displayed. If no notification appears, check your OS notification settings."}</p>
             {notificationError && <p role="alert">{notificationError}</p>}
             {notificationStatus === "blocked" && <button className="text-button" type="button" onClick={onCheckNotificationPermission}>Check permission again</button>}
+          </div>
+        </div>
+      </section>
+      <section className="settings-section">
+        <div className="section-header"><div><h2>Jira connection</h2><span className="section-caption">Import Jira tickets into a project task using your Jira account and the default AI agent.</span></div></div>
+        <div className="github-card">
+          <div className="github-heading"><div className="github-logo" aria-hidden="true">J</div><div><h3>Jira account</h3><span>Credentials are stored securely in your operating system credential vault.</span></div><span className={`github-connection-state ${settings.jiraTokenConfigured ? "configured" : ""}`}><span aria-hidden="true" />{settings.jiraTokenConfigured ? "Token saved" : "Not connected"}</span></div>
+          <div className="github-fields">
+            <div><label className="field-label" htmlFor="jira-email">JIRA EMAIL</label><input id="jira-email" className="settings-input" type="email" autoComplete="email" value={settings.jiraEmail} onChange={(event) => setSettings({ ...settings, jiraEmail: event.currentTarget.value })} placeholder="you@example.com" /></div>
+            <div><label className="field-label" htmlFor="jira-token">JIRA API TOKEN</label><input id="jira-token" className="settings-input" type="password" autoComplete="new-password" value={settings.jiraToken} onChange={(event) => setSettings({ ...settings, jiraToken: event.currentTarget.value })} placeholder={settings.jiraTokenConfigured ? "Leave blank to keep saved token" : "Paste your Jira API token"} /><span className="github-field-help">A saved token is kept when this field is left blank.</span></div>
           </div>
         </div>
       </section>
@@ -1819,7 +1833,10 @@ function ProjectWorkspaceView({
           {activeSection === "tasks" && (
             <ProjectTasksTab
               project={project}
-              providerSettings={taskProviderSettings}
+              providerSettings={{
+                ...taskProviderSettings,
+                jiraConfigured: settings.jiraTokenConfigured && settings.jiraEmail.trim().length > 0,
+              }}
               initialTaskId={initialTaskId}
               onTaskUpdated={onTaskOutcomesRefresh}
               onOpenSession={(sessionId) => {
@@ -1856,7 +1873,7 @@ function App() {
   const [savingProject, setSavingProject] = useState(false);
   const [pickingProjectFolder, setPickingProjectFolder] = useState(false);
   const [error, setError] = useState("");
-  const [settings, setSettings] = useState<SettingsForm>({ ...emptySettings(), githubToken: "" });
+  const [settings, setSettings] = useState<SettingsForm>({ ...emptySettings(), githubToken: "", jiraToken: "" });
   const [savingSettings, setSavingSettings] = useState(false);
   const [notificationPromptOpen, setNotificationPromptOpen] = useState(false);
   const [notificationStatus, setNotificationStatus] = useState<NotificationStatus>("unknown");
@@ -2332,7 +2349,7 @@ function App() {
   async function loadSettings() {
     try {
       const loaded = await invoke<Settings>("load_settings");
-      const normalized = { ...emptySettings(), ...loaded, transcriptFontSize: loaded.transcriptFontSize ?? 16, uiFontScale: loaded.uiFontScale ?? 100, githubToken: "" };
+      const normalized = { ...emptySettings(), ...loaded, transcriptFontSize: loaded.transcriptFontSize ?? 16, uiFontScale: loaded.uiFontScale ?? 100, githubToken: "", jiraToken: "" };
       setSettings(normalized);
       applySavedNotificationPreferences(normalized);
     } catch (reason) {
@@ -2345,11 +2362,15 @@ function App() {
     setSavingSettings(true);
     setError("");
     try {
-      const { githubToken, ...input } = settings;
+      const { githubToken, jiraToken, ...input } = settings;
       const saved = await invoke<Settings>("save_settings", {
-        input: { ...input, githubToken: input.githubAuthMethod === "token" ? githubToken : "" },
+        input: {
+          ...input,
+          githubToken: input.githubAuthMethod === "token" ? githubToken : "",
+          jiraToken,
+        },
       });
-      const normalized = { ...emptySettings(), ...saved, transcriptFontSize: saved.transcriptFontSize ?? 16, uiFontScale: saved.uiFontScale ?? 100, githubToken: "" };
+      const normalized = { ...emptySettings(), ...saved, transcriptFontSize: saved.transcriptFontSize ?? 16, uiFontScale: saved.uiFontScale ?? 100, githubToken: "", jiraToken: "" };
       setSettings(normalized);
       applySavedNotificationPreferences(normalized);
     } catch (reason) {

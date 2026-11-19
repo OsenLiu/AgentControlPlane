@@ -56,6 +56,8 @@ const settings = {
   githubUsername: "",
   githubAuthMethod: "token" as const,
   githubTokenConfigured: false,
+  jiraEmail: "",
+  jiraTokenConfigured: false,
   defaultProvider: "claudeCode" as const,
   transcriptFontSize: 16,
   uiFontScale: 100,
@@ -683,6 +685,37 @@ describe("App", () => {
     ));
   });
 
+  it("saves Jira email and API token settings without retaining the token in the form", async () => {
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "save_settings") {
+        return { ...settings, jiraEmail: "developer@example.com", jiraTokenConfigured: true };
+      }
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    fireEvent.change(screen.getByLabelText("JIRA EMAIL"), {
+      target: { value: "developer@example.com" },
+    });
+    fireEvent.change(screen.getByLabelText("JIRA API TOKEN"), {
+      target: { value: "jira-token-value" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
+      "save_settings",
+      { input: expect.objectContaining({
+        jiraEmail: "developer@example.com",
+        jiraToken: "jira-token-value",
+      }) },
+    ));
+    expect(await screen.findByText("Token saved")).toBeTruthy();
+    expect(screen.getByLabelText("JIRA API TOKEN")).toHaveValue("");
+  });
+
   it("opens the project directory and filters projects by search and Git state", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_projects") return [
@@ -1075,6 +1108,95 @@ describe("App", () => {
     }));
   });
 
+  it("uses a Jira ticket to draft a task and creates it in the project backlog", async () => {
+    const project = { id: "/work/demo", name: "demo" };
+    const importedTask = {
+      id: "jira-task-1",
+      projectId: project.id,
+      title: "Add ticket import",
+      description: "Create a Jira import flow with acceptance criteria.",
+      provider: "copilot",
+      mode: "acceptEdits",
+      model: "auto",
+      stepBudget: 30,
+      stepsUsed: 0,
+      autoApprove: false,
+      useWorktree: false,
+      workspaceLocked: false,
+      status: "backlog",
+      loopEnabled: true,
+      origin: "user",
+      sessionId: null,
+      createdAt: "2026-11-19 10:00:00",
+      updatedAt: "2026-11-19 10:00:00",
+      archived: false,
+      reviewPending: false,
+    };
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_project_tasks") return [importedTask];
+      if (command === "import_jira_ticket") {
+        return {
+          title: importedTask.title,
+          description: importedTask.description,
+        };
+      }
+      if (command === "create_project_task") return importedTask;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(
+      <ProjectTasksTab
+        project={project}
+        providerSettings={{
+          copilotEnabled: true,
+          claudeCodeEnabled: false,
+          defaultProvider: "copilot",
+          jiraConfigured: true,
+        }}
+        onOpenSession={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "+ New task" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Jira ticket URL" }), {
+      target: { value: "https://example.atlassian.net/browse/ACP-42" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Import ticket" }));
+
+    expect(await screen.findByDisplayValue(importedTask.title)).toBeTruthy();
+    expect(screen.getByDisplayValue(importedTask.description)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Create task" }));
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("import_jira_ticket", {
+        url: "https://example.atlassian.net/browse/ACP-42",
+      });
+      expect(invokeMock).toHaveBeenCalledWith("create_project_task", expect.objectContaining({
+        projectId: project.id,
+        title: importedTask.title,
+        description: importedTask.description,
+      }));
+    });
+  });
+
+  it("disables Jira import until credentials are configured", async () => {
+    render(
+      <ProjectTasksTab
+        project={{ id: "/work/demo", name: "demo" }}
+        providerSettings={{
+          copilotEnabled: true,
+          claudeCodeEnabled: false,
+          defaultProvider: "copilot",
+          jiraConfigured: false,
+        }}
+        onOpenSession={vi.fn()}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "+ New task" }));
+
+    expect(screen.getByText("Add your Jira email and API token in Settings → Integrations to import tickets.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Import ticket" })).toHaveProperty("disabled", true);
+  });
+
   it("loads an empty Attention inbox from the backend", async () => {
     render(<App />);
     fireEvent.click(screen.getByRole("button", { name: /^Attention inbox/ }));
@@ -1118,6 +1240,7 @@ describe("App", () => {
           copilotEnabled: true,
           claudeCodeEnabled: true,
           defaultProvider: "copilot",
+          jiraConfigured: true,
         }}
         onOpenSession={vi.fn()}
         onTaskUpdated={onTaskUpdated}

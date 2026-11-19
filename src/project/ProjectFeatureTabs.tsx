@@ -17,6 +17,7 @@ type AgentProviderSettings = {
   copilotEnabled: boolean;
   claudeCodeEnabled: boolean;
   defaultProvider: AgentProvider;
+  jiraConfigured: boolean;
 };
 
 type ProjectTask = {
@@ -274,6 +275,7 @@ export function ProjectTasksTab({
   const [error, setError] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState("");
   const [startingTaskId, setStartingTaskId] = useState("");
+  const [importingJira, setImportingJira] = useState(false);
   const initialTaskSelectionApplied = useRef(false);
 
   const loadTasks = useCallback(async () => {
@@ -351,6 +353,15 @@ export function ProjectTasksTab({
       setError(messageFromError(saveError));
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function importJiraTicket(url: string) {
+    setImportingJira(true);
+    try {
+      return await invoke<{ title: string; description: string }>("import_jira_ticket", { url });
+    } finally {
+      setImportingJira(false);
     }
   }
 
@@ -554,6 +565,7 @@ export function ProjectTasksTab({
         <ProjectTaskDialog
           initial={taskDialog === "new" ? null : taskDialog}
           providerSettings={providerSettings}
+          importingJira={importingJira}
           error={error}
           saving={saving}
           onClose={() => {
@@ -561,6 +573,7 @@ export function ProjectTasksTab({
             setError("");
           }}
           onSave={(input) => void saveTask(input)}
+          onImportJira={importJiraTicket}
         />
       )}
     </section>
@@ -690,21 +703,27 @@ function TaskSettingHelp({ label, text }: { label: string; text: string }) {
 function ProjectTaskDialog({
   initial,
   providerSettings,
+  importingJira,
   error,
   saving,
   onClose,
   onSave,
+  onImportJira,
 }: {
   initial: ProjectTask | null;
   providerSettings: AgentProviderSettings;
+  importingJira: boolean;
   error: string;
   saving: boolean;
   onClose: () => void;
   onSave: (input: ProjectTaskInput) => void;
+  onImportJira: (url: string) => Promise<{ title: string; description: string }>;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
   const [title, setTitle] = useState(initial?.title ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
+  const [jiraUrl, setJiraUrl] = useState("");
+  const [jiraImportError, setJiraImportError] = useState("");
   const [provider, setProvider] = useState<AgentProvider>(initial?.provider ?? providerSettings.defaultProvider);
   const [mode, setMode] = useState<ProjectTask["mode"]>(initial?.mode ?? "acceptEdits");
   const initialModel = initial?.model ?? "auto";
@@ -727,11 +746,11 @@ function ProjectTaskDialog({
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape" && !saving) onClose();
+      if (event.key === "Escape" && !saving && !importingJira) onClose();
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose, saving]);
+  }, [importingJira, onClose, saving]);
 
   const model = modelChoice === "custom" ? customModel.trim() : modelChoice;
   const modelGroups = provider === "claudeCode"
@@ -747,6 +766,17 @@ function ProjectTaskDialog({
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (valid) onSave({ title, description, provider, mode, model, stepBudget, autoApprove, useWorktree });
+  }
+
+  async function importJira() {
+    setJiraImportError("");
+    try {
+      const draft = await onImportJira(jiraUrl.trim());
+      setTitle(draft.title);
+      setDescription(draft.description);
+    } catch (reason) {
+      setJiraImportError(messageFromError(reason));
+    }
   }
 
   function chooseProvider(nextProvider: AgentProvider) {
@@ -766,7 +796,7 @@ function ProjectTaskDialog({
     <div
       className="task-dialog-backdrop"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !saving) onClose();
+        if (event.target === event.currentTarget && !saving && !importingJira) onClose();
       }}
     >
       <section
@@ -794,9 +824,35 @@ function ProjectTaskDialog({
       >
         <header className="task-dialog-header">
           <h2 id="task-dialog-title">{initial ? "Edit task" : "New task"}</h2>
-          <button className="project-feature-quiet" type="button" disabled={saving} onClick={onClose}>Close</button>
+          <button className="project-feature-quiet" type="button" disabled={saving || importingJira} onClick={onClose}>Close</button>
         </header>
         <form onSubmit={submit}>
+          {!initial && (
+            <section className="task-jira-import" aria-label="Import Jira ticket">
+              <label className="task-dialog-field">
+                <span>Import from Jira</span>
+                <input
+                  type="url"
+                  value={jiraUrl}
+                  onChange={(event) => setJiraUrl(event.currentTarget.value)}
+                  placeholder="https://your-team.atlassian.net/browse/ABC-123"
+                  aria-label="Jira ticket URL"
+                />
+              </label>
+              <button
+                className="project-feature-button"
+                type="button"
+                disabled={!providerSettings.jiraConfigured || !jiraUrl.trim() || importingJira || saving}
+                onClick={() => void importJira()}
+              >
+                {importingJira ? "Generating task…" : "Import ticket"}
+              </button>
+              {!providerSettings.jiraConfigured && (
+                <p className="task-agent-help">Add your Jira email and API token in Settings → Integrations to import tickets.</p>
+              )}
+              {jiraImportError && <p className="project-feature-error" role="alert">{jiraImportError}</p>}
+            </section>
+          )}
           <fieldset className="task-agent-picker">
             <legend>Agent</legend>
             <div className="task-agent-options">
@@ -948,8 +1004,8 @@ function ProjectTaskDialog({
           </div>
           {error && <p className="project-feature-error" role="alert">{error}</p>}
           <footer className="task-dialog-actions">
-            <button className="project-feature-button" type="button" disabled={saving} onClick={onClose}>Cancel</button>
-            <button className="project-feature-primary" type="submit" disabled={saving || !valid}>
+            <button className="project-feature-button" type="button" disabled={saving || importingJira} onClick={onClose}>Cancel</button>
+            <button className="project-feature-primary" type="submit" disabled={saving || importingJira || !valid}>
               {saving ? "Saving…" : initial ? "Save task" : "Create task"}
             </button>
           </footer>

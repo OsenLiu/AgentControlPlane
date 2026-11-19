@@ -13,6 +13,8 @@ in.
   agent sessions, and pipeline health from the dashboard.
 - **Task-based delegation** — organize project backlogs and give agents clear
   work to pick up.
+- **Jira ticket import** — save your Jira email and API token in Settings, then
+  draft a project task from a ticket URL with your default AI agent.
 - **Live session supervision** — follow streaming transcripts, inspect session
   state, and resume conversations.
 - **Human-in-the-loop controls** — review permission requests and failed
