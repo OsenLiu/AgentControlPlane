@@ -2037,4 +2037,74 @@ describe("App", () => {
       });
     });
   });
+
+  it("opens the full transcript modal, loads full history, filters messages, and closes", async () => {
+    const session = {
+      id: "long-session",
+      project: "demo",
+      task: "Refactor transcript viewer",
+      branch: "feature/transcript",
+      provider: "copilot",
+      status: "completed",
+      step: "Completed",
+      elapsed: "2026-11-09 11:20:00",
+      tokens: "4.2k",
+      permissionMode: "plan",
+      managed: true,
+      lastEvent: "Done",
+      archived: false,
+    };
+    const previewTranscript = [
+      { role: "assistant", content: "Latest summary message", timestamp: "2026-11-09 11:25:00" },
+    ];
+    const fullTranscript = [
+      { role: "user", content: "Initial prompt from earlier", timestamp: "2026-11-09 11:20:00" },
+      { role: "assistant", content: "Latest summary message", timestamp: "2026-11-09 11:25:00" },
+    ];
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_projects") return [];
+      if (command === "load_settings") return settings;
+      if (command === "list_agent_sessions") return [session];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "get_session_transcript") {
+        const payload = args as { sessionId?: string; full?: boolean } | undefined;
+        return payload?.full ? fullTranscript : previewTranscript;
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    const openButton = await screen.findByRole("button", { name: /Open full transcript/i });
+    fireEvent.click(openButton);
+
+    await waitFor(() => {
+      expect(invokeMock).toHaveBeenCalledWith("get_session_transcript", {
+        sessionId: "long-session",
+        full: true,
+      });
+    });
+
+    const dialog = await screen.findByRole("dialog", { name: "Refactor transcript viewer" });
+    expect(dialog.textContent).toContain("Initial prompt from earlier");
+    expect(dialog.textContent).toContain("Latest summary message");
+    expect(dialog.textContent).toContain("2 messages");
+
+    const filterInput = screen.getByRole("textbox", { name: "Filter transcript messages" });
+    fireEvent.change(filterInput, { target: { value: "Initial" } });
+    expect(dialog.textContent).toContain("Initial prompt from earlier");
+    expect(dialog.textContent).not.toContain("Latest summary message");
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Refactor transcript viewer" })).toBeNull();
+    });
+
+    fireEvent.click(openButton);
+    await screen.findByRole("dialog", { name: "Refactor transcript viewer" });
+    fireEvent.click(screen.getByRole("button", { name: "Close full transcript" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Refactor transcript viewer" })).toBeNull();
+    });
+  });
 });

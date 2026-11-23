@@ -586,6 +586,14 @@ function AgentSessionsView({
   const [stoppingSession, setStoppingSession] = useState(false);
   const [launcherOpen, setLauncherOpen] = useState(false);
   const [transcript, setTranscript] = useState<TranscriptMessage[]>([]);
+  const [fullTranscriptOpen, setFullTranscriptOpen] = useState(false);
+  const [fullTranscript, setFullTranscript] = useState<TranscriptMessage[]>([]);
+  const [fullTranscriptLoading, setFullTranscriptLoading] = useState(false);
+  const [fullTranscriptError, setFullTranscriptError] = useState("");
+  const [fullTranscriptQuery, setFullTranscriptQuery] = useState("");
+  const [copiedTranscript, setCopiedTranscript] = useState(false);
+  const fullTranscriptOpenRef = useRef(false);
+  const fullTranscriptListRef = useRef<HTMLDivElement | null>(null);
   const [messageDraft, setMessageDraft] = useState("");
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [archivedView, setArchivedView] = useState(initialArchived);
@@ -630,6 +638,34 @@ function AgentSessionsView({
   const visibleTranscript = transcript
     .map((message) => ({ ...message, content: getTranscriptDisplayContent(message) }))
     .filter((message) => message.role !== "assistant" || message.content.length > 0);
+  const visibleFullTranscript = fullTranscript
+    .map((message) => ({ ...message, content: getTranscriptDisplayContent(message) }))
+    .filter((message) => message.role !== "assistant" || message.content.length > 0);
+  const normalizedFullTranscriptQuery = fullTranscriptQuery.trim().toLowerCase();
+  const filteredFullTranscript = normalizedFullTranscriptQuery
+    ? visibleFullTranscript.filter((message) => {
+      const roleLabel = message.role === "user" ? "you" : selectedSession?.provider.toLowerCase() ?? "agent";
+      return (
+        message.content.toLowerCase().includes(normalizedFullTranscriptQuery) ||
+        roleLabel.includes(normalizedFullTranscriptQuery)
+      );
+    })
+    : visibleFullTranscript;
+
+  useEffect(() => {
+    fullTranscriptOpenRef.current = fullTranscriptOpen;
+  }, [fullTranscriptOpen]);
+
+  useEffect(() => {
+    if (!fullTranscriptOpen) return;
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setFullTranscriptOpen(false);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [fullTranscriptOpen]);
 
   useEffect(() => {
     void loadSessions(archivedView);
@@ -642,6 +678,11 @@ function AgentSessionsView({
   }, [archivedView, projectId]);
 
   useEffect(() => {
+    setFullTranscriptOpen(false);
+    setFullTranscript([]);
+    setFullTranscriptError("");
+    setFullTranscriptQuery("");
+    setCopiedTranscript(false);
     if (!selectedSession) {
       setTranscript([]);
       return;
@@ -657,6 +698,9 @@ function AgentSessionsView({
       void loadSessions();
       if (event.payload === selectedSession?.id) {
         void loadTranscript(event.payload);
+        if (fullTranscriptOpenRef.current) {
+          void loadFullTranscript(event.payload, false);
+        }
       }
     }).then((unlisten) => {
       unsubscribe = unlisten;
@@ -710,6 +754,57 @@ function AgentSessionsView({
     } catch (reason) {
       setLoadError(reason instanceof Error ? reason.message : String(reason));
     }
+  }
+
+  async function loadFullTranscript(sessionId: string, showLoading = true) {
+    if (showLoading) {
+      setFullTranscriptLoading(true);
+    }
+    setFullTranscriptError("");
+    try {
+      const loaded = await invoke<TranscriptMessage[]>("get_session_transcript", {
+        sessionId,
+        full: true,
+      });
+      setFullTranscript(loaded);
+    } catch (reason) {
+      setFullTranscriptError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (showLoading) {
+        setFullTranscriptLoading(false);
+      }
+    }
+  }
+
+  function openFullTranscript() {
+    if (!selectedSession) return;
+    setFullTranscriptQuery("");
+    setCopiedTranscript(false);
+    setFullTranscriptOpen(true);
+    void loadFullTranscript(selectedSession.id);
+  }
+
+  async function copyFullTranscript() {
+    if (!selectedSession || visibleFullTranscript.length === 0 || !navigator.clipboard?.writeText) return;
+    const text = visibleFullTranscript
+      .map((message) => {
+        const speaker = message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase();
+        return `[${formatLocalTimestamp(message.timestamp)}] ${speaker}\n${message.content}`;
+      })
+      .join("\n\n");
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedTranscript(true);
+      window.setTimeout(() => setCopiedTranscript(false), 2000);
+    } catch {
+      setFullTranscriptError("Unable to copy transcript to clipboard.");
+    }
+  }
+
+  function jumpToFullTranscriptBottom() {
+    const container = fullTranscriptListRef.current;
+    if (!container) return;
+    container.scrollTop = container.scrollHeight;
   }
 
   async function refreshSessions() {
@@ -957,7 +1052,7 @@ function AgentSessionsView({
           </form>}
           <div className="detail-metrics"><div><span>Current step</span><strong>{selectedSession.step}</strong></div><div><span>Elapsed</span><strong>{formatLocalTimestamp(selectedSession.elapsed)}</strong></div><div><span>Context tokens</span><strong>{selectedSession.tokens}</strong></div><div><span>Context window</span><strong>{formatContextWindow(selectedSession)}</strong></div><div><span>Session</span><strong className="mono" title={selectedSession.externalSessionId ?? selectedSession.id}>{selectedSession.externalSessionId || selectedSession.id}</strong></div></div>
 
-          <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button">Open full transcript <span>↗</span></button></div>
+          <div className="transcript-heading"><div><h3>Live transcript</h3><span className="live-caption"><span /> Updates every few seconds</span></div><button className="text-button" type="button" onClick={openFullTranscript}>Open full transcript <span>↗</span></button></div>
           <div className="transcript" style={{ "--transcript-font-size": `${transcriptFontSize}px` } as CSSProperties}>
             {visibleTranscript.length === 0 && <div className="transcript-line active-line"><time>{formatLocalTimestamp(selectedSession.elapsed)}</time><div><span className="transcript-label agent-label">{selectedSession.provider.toUpperCase()}</span><p>{selectedSession.lastEvent || "No transcript events have been recorded."}</p><span className="typing-indicator"><i /><i /><i /> {selectedSession.status === "running" ? "Working" : "Idle"}</span></div></div>}
             {visibleTranscript.map((message, index) => (
@@ -1010,6 +1105,114 @@ function AgentSessionsView({
           </div>
         </section>
       </div>
+      {fullTranscriptOpen && selectedSession && (
+        <div className="modal-backdrop" role="presentation" onClick={() => setFullTranscriptOpen(false)}>
+          <section
+            className="modal full-transcript-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="full-transcript-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="modal-title full-transcript-header">
+              <div className="full-transcript-title-copy">
+                <p className="eyebrow">FULL TRANSCRIPT · {selectedSessionProviderName.toUpperCase()}</p>
+                <h2 id="full-transcript-title" title={selectedSession.task}>{selectedSession.task}</h2>
+                <div className="full-transcript-meta">
+                  <SessionStatusBadge status={selectedSession.status} />
+                  <span>{selectedSession.project}</span>
+                  <span>·</span>
+                  <code>{selectedSession.branch}</code>
+                  <span>·</span>
+                  <span>{visibleFullTranscript.length} {visibleFullTranscript.length === 1 ? "message" : "messages"}</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="close-button"
+                onClick={() => setFullTranscriptOpen(false)}
+                aria-label="Close full transcript"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="full-transcript-toolbar">
+              <label className="session-search full-transcript-search">
+                <span aria-hidden="true">⌕</span>
+                <input
+                  value={fullTranscriptQuery}
+                  onChange={(event) => setFullTranscriptQuery(event.currentTarget.value)}
+                  placeholder="Filter transcript messages"
+                  aria-label="Filter transcript messages"
+                />
+              </label>
+              <div className="full-transcript-toolbar-actions">
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={jumpToFullTranscriptBottom}
+                  disabled={filteredFullTranscript.length === 0}
+                >
+                  Jump to bottom
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={() => void copyFullTranscript()}
+                  disabled={visibleFullTranscript.length === 0}
+                >
+                  {copiedTranscript ? "Copied" : "Copy"}
+                </button>
+              </div>
+            </div>
+
+            {fullTranscriptError && (
+              <div className="error-banner" role="alert">
+                <span>{fullTranscriptError}</span>
+                <button type="button" className="secondary-button" onClick={() => void loadFullTranscript(selectedSession.id)}>
+                  Retry
+                </button>
+              </div>
+            )}
+
+            <div
+              ref={fullTranscriptListRef}
+              className="transcript full-transcript-body"
+              style={{ "--transcript-font-size": `${transcriptFontSize}px` } as CSSProperties}
+            >
+              {fullTranscriptLoading && visibleFullTranscript.length === 0 && (
+                <div className="full-transcript-empty">Loading full transcript…</div>
+              )}
+              {!fullTranscriptLoading && !fullTranscriptError && visibleFullTranscript.length === 0 && (
+                <div className="full-transcript-empty">
+                  {selectedSession.lastEvent || "No transcript events have been recorded."}
+                </div>
+              )}
+              {!fullTranscriptLoading && visibleFullTranscript.length > 0 && filteredFullTranscript.length === 0 && (
+                <div className="full-transcript-empty">No transcript messages match "{fullTranscriptQuery}".</div>
+              )}
+              {filteredFullTranscript.map((message, index) => (
+                <div
+                  className={`transcript-line ${index === filteredFullTranscript.length - 1 ? "active-line" : ""}`}
+                  key={`full-${message.timestamp}-${index}`}
+                >
+                  <time>{formatLocalTimestamp(message.timestamp)}</time>
+                  <div>
+                    <span className={`transcript-label ${message.role === "user" ? "user-label" : "agent-label"}`}>
+                      {message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase()}
+                    </span>
+                    <p>{message.content}</p>
+                    {index === filteredFullTranscript.length - 1 && selectedSession.status === "running" && (
+                      <span className="typing-indicator"><i /><i /><i /> Working</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

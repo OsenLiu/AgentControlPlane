@@ -2266,36 +2266,39 @@ fn list_agent_sessions_from_connection(
         .map_err(|error| format!("Unable to decode agent session data: {error}"))
 }
 
-#[tauri::command]
-fn get_session_transcript(
-    session_id: String,
-    database: State<'_, Database>,
+fn load_session_transcript_from_connection(
+    connection: &Connection,
+    session_id: &str,
+    full: bool,
 ) -> Result<Vec<TranscriptMessage>, String> {
-    let connection = database
-        .0
-        .lock()
-        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
     let exists: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_sessions WHERE id = ?1)",
-            [&session_id],
+            [session_id],
             |row| row.get(0),
         )
         .map_err(|error| format!("Unable to verify agent session: {error}"))?;
     if !exists {
         return Err("Agent session was not found.".to_owned());
     }
+    let query = if full {
+        "SELECT role, content, created_at
+         FROM session_messages
+         WHERE session_id = ?1
+           AND (role = 'user' OR content <> '')
+         ORDER BY sequence ASC"
+    } else {
+        "SELECT role, content, created_at
+         FROM session_messages
+         WHERE session_id = ?1
+           AND (role = 'user' OR content <> '')
+         ORDER BY sequence DESC
+         LIMIT 100"
+    };
     let mut statement = connection
-        .prepare(
-            "SELECT role, content, created_at
-             FROM session_messages
-             WHERE session_id = ?1
-               AND (role = 'user' OR content <> '')
-             ORDER BY sequence DESC
-             LIMIT 100",
-        )
+        .prepare(query)
         .map_err(|error| format!("Unable to query local session transcript: {error}"))?;
-    let rows = statement
+    let mut messages = statement
         .query_map([session_id], |row| {
             Ok(TranscriptMessage {
                 role: row.get(0)?,
@@ -2306,9 +2309,23 @@ fn get_session_transcript(
         .map_err(|error| format!("Unable to read local session transcript: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode local session transcript: {error}"))?;
-    let mut messages = rows;
-    messages.reverse();
+    if !full {
+        messages.reverse();
+    }
     Ok(messages)
+}
+
+#[tauri::command]
+fn get_session_transcript(
+    session_id: String,
+    full: Option<bool>,
+    database: State<'_, Database>,
+) -> Result<Vec<TranscriptMessage>, String> {
+    let connection = database
+        .0
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    load_session_transcript_from_connection(&connection, &session_id, full.unwrap_or(false))
 }
 
 #[tauri::command]
@@ -5098,6 +5115,42 @@ mod tests {
                 ("assistant".to_owned(), "All tests passed.".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn full_transcript_returns_all_messages_in_chronological_order() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions (id, project_id, provider, task, status, origin)
+                 VALUES ('session-full', 'proj-1', 'codex', 'Long session', 'completed', 'app')",
+                [],
+            )
+            .expect("insert session");
+
+        for index in 1..=105 {
+            let role = if index % 2 == 1 { "user" } else { "assistant" };
+            insert_session_message(
+                &connection,
+                "session-full",
+                role,
+                &format!("Message {index}"),
+            )
+            .expect("insert message");
+        }
+
+        let preview = load_session_transcript_from_connection(&connection, "session-full", false)
+            .expect("preview transcript");
+        assert_eq!(preview.len(), 100);
+        assert_eq!(preview.first().map(|m| m.content.as_str()), Some("Message 6"));
+        assert_eq!(preview.last().map(|m| m.content.as_str()), Some("Message 105"));
+
+        let full = load_session_transcript_from_connection(&connection, "session-full", true)
+            .expect("full transcript");
+        assert_eq!(full.len(), 105);
+        assert_eq!(full.first().map(|m| m.content.as_str()), Some("Message 1"));
+        assert_eq!(full.last().map(|m| m.content.as_str()), Some("Message 105"));
     }
 
     #[test]
