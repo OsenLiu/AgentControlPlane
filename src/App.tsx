@@ -373,7 +373,7 @@ function dashboardProjectPipelineStatus(snapshot: ProjectPipelines | null): Proj
 
 function GithubIssueHostSettings() {
   const [hosts, setHosts] = useState<{ host: string; method: string }[]>([]);
-  const [host, setHost] = useState("github.com");
+  const [host, setHost] = useState("");
   const [method, setMethod] = useState("cli");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -408,7 +408,7 @@ function GithubIssueHostSettings() {
   return (
     <div className="github-issue-import-settings">
       <div className="github-issue-import-header">
-        <div><h3>GitHub issue import hosts</h3><span>GitHub.com defaults to GitHub CLI. Add each Enterprise host here; credentials are stored per host in the OS vault.</span></div>
+        <div><h3>GitHub issue import hosts</h3><span>GitHub.com uses the GitHub connection above. Add each Enterprise host here; credentials are stored per host in the OS vault.</span></div>
       </div>
       {hosts.length > 0 && (
         <div className="github-issue-host-list">
@@ -430,7 +430,7 @@ function GithubIssueHostSettings() {
         </div>
       )}
       <div className="github-fields">
-        <div><label className="field-label" htmlFor="github-issue-host">GITHUB HOST</label><input id="github-issue-host" className="settings-input" value={host} onChange={(event) => { setHost(event.currentTarget.value); setMethod("cli"); }} placeholder="github.company.com" /></div>
+        <div><label className="field-label" htmlFor="github-issue-host">ENTERPRISE HOST</label><input id="github-issue-host" className="settings-input" value={host} onChange={(event) => { setHost(event.currentTarget.value); setMethod("cli"); }} placeholder="github.company.com" /></div>
         <div><label className="field-label" htmlFor="github-issue-auth">AUTHENTICATION</label><select id="github-issue-auth" className="settings-input" value={method} onChange={(event) => setMethod(event.currentTarget.value)}><option value="cli">GitHub CLI</option><option value="token">Personal access token</option></select></div>
         {method === "token" && <div><label className="field-label" htmlFor="github-issue-token">PERSONAL ACCESS TOKEN</label><input id="github-issue-token" className="settings-input" type="password" autoComplete="new-password" ref={tokenRef} placeholder="Leave blank to keep saved token" /></div>}
       </div>

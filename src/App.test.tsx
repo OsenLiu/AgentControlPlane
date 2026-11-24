@@ -720,7 +720,7 @@ describe("App", () => {
   it("configures an Enterprise issue host and clears its token input", async () => {
     const defaultImplementation = invokeMock.getMockImplementation();
     invokeMock.mockImplementation(async (command, args) => {
-      if (command === "list_github_issue_hosts") return [{ host: "github.com", method: "cli" }];
+      if (command === "list_github_issue_hosts") return [{ host: "existing.example.com", method: "cli" }];
       if (command === "configure_github_issue_host") return undefined;
       if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
       return defaultImplementation(command, args);
@@ -730,7 +730,8 @@ describe("App", () => {
     const issueHostsHeading = screen.getByRole("heading", { name: "GitHub issue import hosts" });
     expect(issueHostsHeading.closest(".settings-section")?.querySelector("h2")?.textContent)
       .toBe("GitHub connection");
-    fireEvent.change(screen.getByLabelText("GITHUB HOST"), { target: { value: "git.example.com" } });
+    expect(screen.getByText(/GitHub.com uses the GitHub connection above/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("ENTERPRISE HOST"), { target: { value: "git.example.com" } });
     fireEvent.change(screen.getByLabelText("AUTHENTICATION"), { target: { value: "token" } });
     const token = screen.getByLabelText("PERSONAL ACCESS TOKEN", { selector: "#github-issue-token" });
     fireEvent.change(token, { target: { value: "host-token-value" } });

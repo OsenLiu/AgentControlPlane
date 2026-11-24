@@ -1,4 +1,4 @@
-use crate::{Database, jira};
+use crate::{Database, GITHUB_CREDENTIAL_SERVICE, GITHUB_CREDENTIAL_USER, jira};
 use keyring::Entry;
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use rusqlite::{OptionalExtension, params};
@@ -60,6 +60,11 @@ fn validate_host(host: &str) -> Result<String, String> {
     if location.host != host || host.parse::<std::net::IpAddr>().is_ok() {
         return Err("Enter a GitHub hostname without a scheme, port, or path.".to_owned());
     }
+    if host == "github.com" {
+        return Err(
+            "Configure GitHub.com authentication in the GitHub connection settings.".to_owned(),
+        );
+    }
     Ok(host)
 }
 
@@ -107,10 +112,15 @@ pub(crate) fn configure_github_issue_host(
 }
 
 fn auth_method(connection: &rusqlite::Connection, host: &str) -> Result<String, String> {
+    let settings_key = if host == "github.com" {
+        "github_auth_method".to_owned()
+    } else {
+        host_settings_key(host)
+    };
     let configured = connection
         .query_row(
             "SELECT value FROM app_settings WHERE key = ?1",
-            [host_settings_key(host)],
+            [settings_key],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -119,12 +129,25 @@ fn auth_method(connection: &rusqlite::Connection, host: &str) -> Result<String, 
         Some("cli") => Ok("cli".to_owned()),
         Some("token") => Ok("token".to_owned()),
         Some(_) => Err("Invalid GitHub host authentication configuration.".to_owned()),
-        None if host == "github.com" => Ok("cli".to_owned()),
+        None if host == "github.com" => Ok("token".to_owned()),
         None => Err(
             "Configure this GitHub Enterprise host in Settings → Integrations before importing."
                 .to_owned(),
         ),
     }
+}
+
+fn issue_credential<'a>(host: &'a str) -> (&'static str, &'a str) {
+    if host == "github.com" {
+        (GITHUB_CREDENTIAL_SERVICE, GITHUB_CREDENTIAL_USER)
+    } else {
+        (CREDENTIAL_SERVICE, host)
+    }
+}
+
+fn issue_token(host: &str) -> Result<String, keyring::Error> {
+    let (service, account) = issue_credential(host);
+    Entry::new(service, account)?.get_password()
 }
 
 #[derive(Serialize)]
@@ -153,15 +176,7 @@ pub(crate) fn list_github_issue_hosts(
         .map_err(|_| "Unable to read GitHub host settings.".to_owned())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| "Unable to read GitHub host settings.".to_owned())?;
-    if !hosts.iter().any(|entry| entry.host == "github.com") {
-        hosts.insert(
-            0,
-            GithubIssueHost {
-                host: "github.com".to_owned(),
-                method: "cli".to_owned(),
-            },
-        );
-    }
+    hosts.retain(|entry| entry.host != "github.com");
     Ok(hosts)
 }
 
@@ -516,14 +531,16 @@ pub(crate) async fn import_github_issue(
         (method, provider)
     };
     let (issue, token) = if method == "token" {
-        let token = Entry::new(CREDENTIAL_SERVICE, &location.host)
-            .and_then(|entry| entry.get_password())
-            .map_err(|error| match error {
-                keyring::Error::NoEntry => {
-                    "No personal access token is configured for this GitHub host.".to_owned()
-                }
-                _ => "Unable to access the OS credential vault.".to_owned(),
-            })?;
+        let token = issue_token(&location.host).map_err(|error| match error {
+            keyring::Error::NoEntry if location.host == "github.com" => {
+                "No personal access token is configured in the GitHub connection settings."
+                    .to_owned()
+            }
+            keyring::Error::NoEntry => {
+                "No personal access token is configured for this GitHub host.".to_owned()
+            }
+            _ => "Unable to access the OS credential vault.".to_owned(),
+        })?;
         if !token.is_empty() && url.contains(&token) {
             return Err(
                 "The issue URL contains credential-like content and cannot be imported safely."
@@ -751,10 +768,18 @@ mod tests {
     }
 
     #[test]
-    fn selects_only_the_configured_host_authentication() {
+    fn uses_github_connection_auth_for_github_com_and_host_auth_for_enterprise() {
+        let defaults = rusqlite::Connection::open_in_memory().unwrap();
+        defaults
+            .execute_batch("CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        assert_eq!(auth_method(&defaults, "github.com").unwrap(), "token");
+
         let db = rusqlite::Connection::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO app_settings VALUES ('github_auth_method', 'cli');
+            INSERT INTO app_settings VALUES ('github_issue_host:github.com', 'token');
             INSERT INTO app_settings VALUES ('github_issue_host:git.example.com', 'token');
             INSERT INTO app_settings VALUES ('github_issue_host:other.example.com', 'cli');",
         )
@@ -762,6 +787,12 @@ mod tests {
         assert_eq!(auth_method(&db, "github.com").unwrap(), "cli");
         assert_eq!(auth_method(&db, "git.example.com").unwrap(), "token");
         assert_eq!(auth_method(&db, "other.example.com").unwrap(), "cli");
+        db.execute(
+            "UPDATE app_settings SET value = 'token' WHERE key = 'github_auth_method'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(auth_method(&db, "github.com").unwrap(), "token");
         assert!(
             auth_method(&db, "unknown.example.com")
                 .unwrap_err()
@@ -769,7 +800,24 @@ mod tests {
         );
         assert!(validate_host("https://git.example.com").is_err());
         assert!(validate_host("127.0.0.1").is_err());
+        assert!(
+            validate_host("github.com")
+                .unwrap_err()
+                .contains("GitHub connection")
+        );
         assert_eq!(validate_host("Git.Example.Com").unwrap(), "git.example.com");
+    }
+
+    #[test]
+    fn issue_imports_use_shared_github_credentials_only_for_github_com() {
+        assert_eq!(
+            issue_credential("github.com"),
+            (GITHUB_CREDENTIAL_SERVICE, GITHUB_CREDENTIAL_USER)
+        );
+        assert_eq!(
+            issue_credential("git.example.com"),
+            (CREDENTIAL_SERVICE, "git.example.com")
+        );
     }
 
     #[test]
@@ -975,8 +1023,13 @@ mod tests {
         let issue = match method.as_str() {
             "cli" => cli_issue(&location).expect("GitHub CLI issue retrieval"),
             "token" => {
+                let default_source = if location.host == "github.com" {
+                    "github-connection"
+                } else {
+                    "issue-import"
+                };
                 let source =
-                    std::env::var("ACP_TOKEN_SOURCE").unwrap_or_else(|_| "issue-import".to_owned());
+                    std::env::var("ACP_TOKEN_SOURCE").unwrap_or_else(|_| default_source.to_owned());
                 let (service, account) = match source.as_str() {
                     "issue-import" => (CREDENTIAL_SERVICE, location.host.as_str()),
                     "github-connection" if location.host == "github.com" => (
