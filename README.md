@@ -15,6 +15,11 @@ in.
   work to pick up.
 - **Jira ticket import** — save your Jira email and API token in Settings, then
   draft a project task from a ticket URL with your default AI agent.
+- **GitHub issue import** — draft a reviewable project task from a GitHub or
+  GitHub Enterprise issue URL. GitHub.com imports reuse the GitHub connection;
+  configure Enterprise hosts in that section with GitHub CLI or a host-specific
+  token stored in the OS credential vault. The issue's source is recorded,
+  duplicate imports within a project are blocked, and comments are not imported.
 - **Live session supervision** — follow streaming transcripts, inspect session
   state, and resume conversations.
 - **Human-in-the-loop controls** — review permission requests and failed
