@@ -2142,8 +2142,21 @@ describe("App", () => {
     ];
     const fullTranscript = [
       { role: "user", content: "Initial prompt from earlier", timestamp: "2026-11-09 11:20:00" },
+      {
+        role: "activity",
+        eventType: "tool_output",
+        status: "completed",
+        content: "Tool result tool-1",
+        details: '{"content":"Found 3 passing tests"}',
+        timestamp: "2026-11-09 11:24:00",
+      },
       { role: "assistant", content: "Latest summary message", timestamp: "2026-11-09 11:25:00" },
     ];
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
     invokeMock.mockImplementation(async (command, args) => {
       if (command === "list_projects") return [];
       if (command === "load_settings") return settings;
@@ -2171,12 +2184,30 @@ describe("App", () => {
     const dialog = await screen.findByRole("dialog", { name: "Refactor transcript viewer" });
     expect(dialog.textContent).toContain("Initial prompt from earlier");
     expect(dialog.textContent).toContain("Latest summary message");
-    expect(dialog.textContent).toContain("2 messages");
+    expect(dialog.textContent).toContain("3 entries");
+    expect(dialog.textContent).toContain("TOOL OUTPUT");
+    expect(dialog.textContent).toContain("completed");
 
     const filterInput = screen.getByRole("textbox", { name: "Filter transcript messages" });
     fireEvent.change(filterInput, { target: { value: "Initial" } });
     expect(dialog.textContent).toContain("Initial prompt from earlier");
     expect(dialog.textContent).not.toContain("Latest summary message");
+
+    fireEvent.change(filterInput, { target: { value: "" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter transcript by type" }), {
+      target: { value: "activity" },
+    });
+    expect(dialog.textContent).toContain("Tool result tool-1");
+    expect(dialog.textContent).not.toContain("Initial prompt from earlier");
+    fireEvent.click(screen.getByText("Show details"));
+    expect(dialog.textContent).toContain("Found 3 passing tests");
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    await waitFor(() => {
+      expect(writeText).toHaveBeenCalledWith(
+        expect.stringContaining("TOOL OUTPUT · COMPLETED"),
+      );
+    });
+    expect(writeText.mock.calls[0][0]).toContain("Found 3 passing tests");
 
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => {

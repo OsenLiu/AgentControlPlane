@@ -112,9 +112,17 @@ h2 { color: #e8ecf8; font-size: 15px; letter-spacing: -.2px; }.section-caption {
 .full-transcript-meta code { color: #8b99bd; }
 .full-transcript-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .full-transcript-search { flex: 1; min-width: 0; }
+.full-transcript-filter { min-width: 130px; padding: 9px 10px; border: 1px solid #293858; border-radius: 5px; color: #aeb8cd; background: #10182b; font-size: 10px; }
 .full-transcript-toolbar-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 .full-transcript-body { flex: 1; min-height: 0; max-height: none; margin: 0; padding-right: 10px; border: 1px solid #202b48; border-radius: 8px; background: #10182b; }
 .full-transcript-body .transcript-line p { max-width: none; white-space: pre-wrap; }
+.activity-line { border-color: #47627b; background: #111d30; }
+.activity-status { display: inline-block; margin-top: 7px; padding: 3px 6px; border-radius: 4px; color: #9eacc6; background: #202c42; font-size: 8px; text-transform: uppercase; }
+.activity-status-failed, .activity-status-denied { color: #f0a2b1; background: #3a202e; }
+.activity-status-allowed, .activity-status-completed { color: #74dfb0; background: #18372f; }
+.activity-details { margin-top: 8px; color: #8b99b6; font-size: 9px; }
+.activity-details summary { width: fit-content; cursor: pointer; color: #9caad0; }
+.activity-details pre { max-height: 320px; margin-top: 8px; overflow: auto; padding: 10px; border: 1px solid #273550; border-radius: 5px; color: #abb8d2; background: #0c1425; font: 9px/1.5 "JetBrains Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .full-transcript-empty { padding: 32px 16px; color: #7885a3; font-size: 12px; text-align: center; }
 @media (max-width: 1250px) { .main-content { padding: 30px 28px; }.sidebar { width: 210px; flex-basis: 210px; }.main-content { width: calc(100% - 210px); }.table-row { grid-template-columns: minmax(220px, 2fr) 1fr 1fr 1fr 1fr 18px; gap: 8px; }.progress-track { width: 50px; }.provider-grid, .default-agent-card { grid-template-columns: 1fr; max-width: 560px; } }
 @media (max-width: 1180px) { .sessions-workspace { grid-template-columns: minmax(290px, .7fr) minmax(570px, 1.3fr); }.session-summary-card { padding: 13px; }.detail-metrics { gap: 8px; padding-inline: 15px; }.detail-header, .transcript-heading { padding-inline: 15px; }.transcript, .control-panel { margin-inline: 15px; } }

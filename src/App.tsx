@@ -134,9 +134,12 @@ type AgentSession = {
 };
 
 type TranscriptMessage = {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "activity";
   content: string;
   timestamp: string;
+  eventType?: string;
+  status?: string;
+  details?: string;
 };
 
 function stripTaskCompletionProtocol(content: string): string {
@@ -661,6 +664,7 @@ function AgentSessionsView({
   const [fullTranscriptLoading, setFullTranscriptLoading] = useState(false);
   const [fullTranscriptError, setFullTranscriptError] = useState("");
   const [fullTranscriptQuery, setFullTranscriptQuery] = useState("");
+  const [fullTranscriptTypeFilter, setFullTranscriptTypeFilter] = useState<"all" | "messages" | "activity">("all");
   const [copiedTranscript, setCopiedTranscript] = useState(false);
   const fullTranscriptOpenRef = useRef(false);
   const fullTranscriptListRef = useRef<HTMLDivElement | null>(null);
@@ -714,13 +718,20 @@ function AgentSessionsView({
   const normalizedFullTranscriptQuery = fullTranscriptQuery.trim().toLowerCase();
   const filteredFullTranscript = normalizedFullTranscriptQuery
     ? visibleFullTranscript.filter((message) => {
-      const roleLabel = message.role === "user" ? "you" : selectedSession?.provider.toLowerCase() ?? "agent";
+      const roleLabel = message.role === "activity"
+        ? `${message.eventType ?? "activity"} ${message.status ?? ""}`
+        : message.role === "user" ? "you" : selectedSession?.provider.toLowerCase() ?? "agent";
       return (
         message.content.toLowerCase().includes(normalizedFullTranscriptQuery) ||
-        roleLabel.includes(normalizedFullTranscriptQuery)
+        roleLabel.toLowerCase().includes(normalizedFullTranscriptQuery) ||
+        (message.details?.toLowerCase().includes(normalizedFullTranscriptQuery) ?? false)
       );
     })
     : visibleFullTranscript;
+  const filteredFullTranscriptByType = filteredFullTranscript.filter((message) =>
+    fullTranscriptTypeFilter === "all" ||
+    (fullTranscriptTypeFilter === "activity" ? message.role === "activity" : message.role !== "activity"),
+  );
 
   useEffect(() => {
     fullTranscriptOpenRef.current = fullTranscriptOpen;
@@ -752,6 +763,7 @@ function AgentSessionsView({
     setFullTranscript([]);
     setFullTranscriptError("");
     setFullTranscriptQuery("");
+    setFullTranscriptTypeFilter("all");
     setCopiedTranscript(false);
     if (!selectedSession) {
       setTranscript([]);
@@ -782,6 +794,16 @@ function AgentSessionsView({
     }).then((unlisten) => {
       unsubscribePermission = unlisten;
     });
+    let unsubscribeActivityError: (() => void) | undefined;
+    void listen<{ sessionId: string; error: string }>("agent-session-activity-error", (event) => {
+      if (event.payload.sessionId === selectedSession?.id) {
+        const message = `Unable to capture or save session activity: ${event.payload.error}`;
+        setLoadError(message);
+        setFullTranscriptError(message);
+      }
+    }).then((unlisten) => {
+      unsubscribeActivityError = unlisten;
+    });
     if (selectedSession) {
       void invoke<PermissionRequest | null>("get_pending_session_permission", {
         sessionId: selectedSession.id,
@@ -794,6 +816,7 @@ function AgentSessionsView({
     return () => {
       unsubscribe?.();
       unsubscribePermission?.();
+      unsubscribeActivityError?.();
     };
   }, [selectedSession?.id]);
 
@@ -855,11 +878,16 @@ function AgentSessionsView({
   }
 
   async function copyFullTranscript() {
-    if (!selectedSession || visibleFullTranscript.length === 0 || !navigator.clipboard?.writeText) return;
-    const text = visibleFullTranscript
+    if (!selectedSession || filteredFullTranscriptByType.length === 0 || !navigator.clipboard?.writeText) return;
+    const text = filteredFullTranscriptByType
       .map((message) => {
-        const speaker = message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase();
-        return `[${formatLocalTimestamp(message.timestamp)}] ${speaker}\n${message.content}`;
+        const speaker = message.role === "activity"
+          ? `${message.eventType?.replace(/_/g, " ").toUpperCase() ?? "ACTIVITY"} · ${message.status?.toUpperCase() ?? "OBSERVED"}`
+          : message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase();
+        return [
+          `[${formatLocalTimestamp(message.timestamp)}] ${speaker}\n${message.content}`,
+          message.details ? `Details:\n${message.details}` : "",
+        ].filter(Boolean).join("\n");
       })
       .join("\n\n");
     try {
@@ -1194,7 +1222,7 @@ function AgentSessionsView({
                   <span>·</span>
                   <code>{selectedSession.branch}</code>
                   <span>·</span>
-                  <span>{visibleFullTranscript.length} {visibleFullTranscript.length === 1 ? "message" : "messages"}</span>
+                  <span>{visibleFullTranscript.length} {visibleFullTranscript.length === 1 ? "entry" : "entries"}</span>
                 </div>
               </div>
               <button
@@ -1217,12 +1245,22 @@ function AgentSessionsView({
                   aria-label="Filter transcript messages"
                 />
               </label>
+              <select
+                className="full-transcript-filter"
+                aria-label="Filter transcript by type"
+                value={fullTranscriptTypeFilter}
+                onChange={(event) => setFullTranscriptTypeFilter(event.currentTarget.value as typeof fullTranscriptTypeFilter)}
+              >
+                <option value="all">All entries</option>
+                <option value="messages">Messages</option>
+                <option value="activity">Agent activity</option>
+              </select>
               <div className="full-transcript-toolbar-actions">
                 <button
                   type="button"
                   className="secondary-button"
                   onClick={jumpToFullTranscriptBottom}
-                  disabled={filteredFullTranscript.length === 0}
+                  disabled={filteredFullTranscriptByType.length === 0}
                 >
                   Jump to bottom
                 </button>
@@ -1230,7 +1268,7 @@ function AgentSessionsView({
                   type="button"
                   className="secondary-button"
                   onClick={() => void copyFullTranscript()}
-                  disabled={visibleFullTranscript.length === 0}
+                  disabled={filteredFullTranscriptByType.length === 0}
                 >
                   {copiedTranscript ? "Copied" : "Copy"}
                 </button>
@@ -1259,21 +1297,34 @@ function AgentSessionsView({
                   {selectedSession.lastEvent || "No transcript events have been recorded."}
                 </div>
               )}
-              {!fullTranscriptLoading && visibleFullTranscript.length > 0 && filteredFullTranscript.length === 0 && (
+              {!fullTranscriptLoading && visibleFullTranscript.length > 0 && filteredFullTranscriptByType.length === 0 && (
                 <div className="full-transcript-empty">No transcript messages match "{fullTranscriptQuery}".</div>
               )}
-              {filteredFullTranscript.map((message, index) => (
+              {filteredFullTranscriptByType.map((message, index) => (
                 <div
-                  className={`transcript-line ${index === filteredFullTranscript.length - 1 ? "active-line" : ""}`}
-                  key={`full-${message.timestamp}-${index}`}
+                  className={`transcript-line ${message.role === "activity" ? "activity-line" : ""} ${index === filteredFullTranscriptByType.length - 1 ? "active-line" : ""}`}
+                  key={`full-${message.timestamp}-${message.eventType ?? message.role}-${index}`}
                 >
                   <time>{formatLocalTimestamp(message.timestamp)}</time>
                   <div>
                     <span className={`transcript-label ${message.role === "user" ? "user-label" : "agent-label"}`}>
-                      {message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase()}
+                      {message.role === "activity"
+                        ? message.eventType?.replace(/_/g, " ").toUpperCase() ?? "AGENT ACTIVITY"
+                        : message.role === "user" ? "YOU" : selectedSession.provider.toUpperCase()}
                     </span>
                     <p>{message.content}</p>
-                    {index === filteredFullTranscript.length - 1 && selectedSession.status === "running" && (
+                    {message.role === "activity" && message.status && (
+                      <span className={`activity-status activity-status-${message.status.toLowerCase()}`}>
+                        {message.status.replace(/_/g, " ")}
+                      </span>
+                    )}
+                    {message.role === "activity" && message.details && (
+                      <details className="activity-details">
+                        <summary>Show details</summary>
+                        <pre>{message.details}</pre>
+                      </details>
+                    )}
+                    {index === filteredFullTranscriptByType.length - 1 && message.role !== "activity" && selectedSession.status === "running" && (
                       <span className="typing-indicator"><i /><i /><i /> Working</span>
                     )}
                   </div>

@@ -118,6 +118,23 @@ struct TranscriptMessage {
     role: String,
     content: String,
     timestamp: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+    #[serde(skip)]
+    sequence: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptActivity {
+    event_type: String,
+    label: String,
+    status: String,
+    details: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -133,6 +150,7 @@ struct ClaudeObservation {
     text: Option<String>,
     step: Option<String>,
     result: Option<String>,
+    activities: Vec<TranscriptActivity>,
     completed: bool,
     failed: bool,
     token_count: Option<i64>,
@@ -685,6 +703,169 @@ fn copilot_session_id() -> String {
     format!("copilot-{timestamp:x}")
 }
 
+const MAX_ACTIVITY_DETAILS_BYTES: usize = 24 * 1024;
+const MAX_TRANSCRIPT_MESSAGE_BYTES: usize = 2 * 1024 * 1024;
+const TRANSCRIPT_TRUNCATION_MARKER: &str = "\n[Transcript output truncated at 2 MiB]";
+
+fn redact_activity_text(text: &str) -> String {
+    let lower = text.to_ascii_lowercase();
+    let markers = [
+        "bearer ",
+        "token=",
+        "api_key=",
+        "apikey=",
+        "password=",
+        "secret=",
+        "authorization=",
+    ];
+    let mut ranges = Vec::new();
+    for marker in markers {
+        let mut cursor = 0;
+        while cursor + marker.len() <= lower.len() {
+            let Some(offset) = lower[cursor..]
+                .as_bytes()
+                .windows(marker.len())
+                .position(|window| window == marker.as_bytes())
+            else {
+                break;
+            };
+            let start = cursor + offset + marker.len();
+            let end = text.as_bytes()[start..]
+                .iter()
+                .position(|byte| {
+                    byte.is_ascii_whitespace() || matches!(*byte, b'"' | b'\'' | b'&' | b';' | b',')
+                })
+                .map(|offset| start + offset)
+                .unwrap_or(text.len());
+            if end > start {
+                ranges.push((start, end));
+            }
+            cursor = end.max(start).saturating_add(1);
+        }
+    }
+    ranges.sort_unstable();
+    ranges.dedup();
+    let mut redacted = text.to_owned();
+    for (start, end) in ranges.into_iter().rev() {
+        redacted.replace_range(start..end, "[REDACTED]");
+    }
+    redacted
+}
+
+fn redact_activity_value(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let normalized = key.to_ascii_lowercase();
+                    let sensitive = [
+                        "token",
+                        "secret",
+                        "password",
+                        "authorization",
+                        "credential",
+                        "api_key",
+                        "apikey",
+                    ]
+                    .iter()
+                    .any(|marker| normalized.contains(marker));
+                    (
+                        key.clone(),
+                        if sensitive {
+                            Value::String("[REDACTED]".to_owned())
+                        } else {
+                            redact_activity_value(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
+        Value::Array(values) => Value::Array(values.iter().map(redact_activity_value).collect()),
+        Value::String(text) => Value::String(redact_activity_text(text)),
+        _ => value.clone(),
+    }
+}
+
+fn bounded_activity_details(value: &Value) -> String {
+    let sanitized = redact_activity_value(value);
+    let encoded = serde_json::to_string_pretty(&sanitized)
+        .unwrap_or_else(|_| "\"Unable to format provider details\"".to_owned());
+    if encoded.len() <= MAX_ACTIVITY_DETAILS_BYTES {
+        return encoded;
+    }
+
+    const SUFFIX: &str = "…[truncated]";
+    let mut end = MAX_ACTIVITY_DETAILS_BYTES - SUFFIX.len();
+    while !encoded.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &encoded[..end], SUFFIX)
+}
+
+fn copilot_activity_from_message(message: &Value) -> Option<TranscriptActivity> {
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if method == "session/request_permission" {
+        let title = message["params"]["toolCall"]["title"]
+            .as_str()
+            .unwrap_or("Copilot requested permission");
+        return Some(TranscriptActivity {
+            event_type: "permission_request".to_owned(),
+            label: title.to_owned(),
+            status: "requested".to_owned(),
+            details: message["params"].clone(),
+        });
+    }
+    if let Some(error) = message.get("error") {
+        let label = error["message"]
+            .as_str()
+            .unwrap_or("Copilot returned an ACP error");
+        return Some(TranscriptActivity {
+            event_type: "error".to_owned(),
+            label: label.to_owned(),
+            status: "failed".to_owned(),
+            details: error.clone(),
+        });
+    }
+    if method == "session/update" {
+        let update = &message["params"]["update"];
+        let update_type = update["sessionUpdate"].as_str()?;
+        if matches!(update_type, "agent_message_chunk" | "user_message_chunk") {
+            return None;
+        }
+        let (event_type, label, fallback_status) = match update_type {
+            "tool_call" => (
+                "tool_call",
+                update["title"].as_str().unwrap_or("Copilot tool call"),
+                "started",
+            ),
+            "tool_call_update" => (
+                "tool_update",
+                update["title"].as_str().unwrap_or("Copilot tool update"),
+                "updated",
+            ),
+            _ => (
+                "provider_update",
+                update["title"].as_str().unwrap_or(update_type),
+                "observed",
+            ),
+        };
+        return Some(TranscriptActivity {
+            event_type: event_type.to_owned(),
+            label: label.to_owned(),
+            status: update["status"]
+                .as_str()
+                .unwrap_or(fallback_status)
+                .to_owned(),
+            details: update.clone(),
+        });
+    }
+    None
+}
+
 fn claude_observation_from_line(line: &str) -> Result<ClaudeObservation, String> {
     let message: Value = serde_json::from_str(line)
         .map_err(|error| format!("Claude Code returned invalid stream JSON: {error}"))?;
@@ -709,16 +890,93 @@ fn claude_observation_from_line(line: &str) -> Result<ClaudeObservation, String>
             })
         }
         "assistant" => {
-            let step = message["message"]["content"]
-                .as_array()
+            let content = message["message"]["content"].as_array();
+            let activities = content
                 .into_iter()
                 .flatten()
-                .find(|block| block["type"].as_str() == Some("tool_use"))
-                .and_then(|block| block["name"].as_str())
-                .map(|name| format!("Claude Code is using {name}"));
+                .filter(|block| block["type"].as_str() == Some("tool_use"))
+                .map(|block| TranscriptActivity {
+                    event_type: "tool_call".to_owned(),
+                    label: block["name"]
+                        .as_str()
+                        .unwrap_or("Claude Code tool call")
+                        .to_owned(),
+                    status: "started".to_owned(),
+                    details: block.clone(),
+                })
+                .collect::<Vec<_>>();
+            let step = activities
+                .first()
+                .map(|activity| format!("Claude Code is using {}", activity.label));
             Ok(ClaudeObservation {
                 session_id,
                 step,
+                activities,
+                ..ClaudeObservation::default()
+            })
+        }
+        "user" => {
+            let activities = message["message"]["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|block| block["type"].as_str() == Some("tool_result"))
+                .map(|block| {
+                    let failed = block["is_error"].as_bool().unwrap_or(false);
+                    TranscriptActivity {
+                        event_type: if failed {
+                            "tool_error".to_owned()
+                        } else {
+                            "tool_output".to_owned()
+                        },
+                        label: block["tool_use_id"]
+                            .as_str()
+                            .map(|id| format!("Tool result {id}"))
+                            .unwrap_or_else(|| "Claude Code tool result".to_owned()),
+                        status: if failed {
+                            "failed".to_owned()
+                        } else {
+                            "completed".to_owned()
+                        },
+                        details: block.clone(),
+                    }
+                })
+                .collect();
+            Ok(ClaudeObservation {
+                session_id,
+                activities,
+                ..ClaudeObservation::default()
+            })
+        }
+        "control_request" | "control_response" => {
+            let is_request = event_type == "control_request";
+            let details = message.get("request").or_else(|| message.get("response"));
+            let details = details.cloned().unwrap_or_else(|| message.clone());
+            let request_text = details.to_string().to_ascii_lowercase();
+            let permission_event = request_text.contains("permission")
+                || request_text.contains("approval")
+                || request_text.contains("allow");
+            let activity = permission_event.then(|| TranscriptActivity {
+                event_type: if is_request {
+                    "permission_request".to_owned()
+                } else {
+                    "permission_decision".to_owned()
+                },
+                label: if is_request {
+                    "Claude Code requested permission".to_owned()
+                } else {
+                    "Claude Code permission decision".to_owned()
+                },
+                status: if is_request {
+                    "requested".to_owned()
+                } else {
+                    "decided".to_owned()
+                },
+                details,
+            });
+            Ok(ClaudeObservation {
+                session_id,
+                activities: activity.into_iter().collect(),
                 ..ClaudeObservation::default()
             })
         }
@@ -733,9 +991,22 @@ fn claude_observation_from_line(line: &str) -> Result<ClaudeObservation, String>
             .into_iter()
             .flatten()
             .fold(0_u64, u64::saturating_add);
+            let result = message["result"].as_str().map(str::to_owned);
+            let activities = (message["subtype"].as_str() != Some("success"))
+                .then(|| TranscriptActivity {
+                    event_type: "error".to_owned(),
+                    label: result
+                        .clone()
+                        .unwrap_or_else(|| "Claude Code reported a failed request".to_owned()),
+                    status: "failed".to_owned(),
+                    details: message.clone(),
+                })
+                .into_iter()
+                .collect();
             Ok(ClaudeObservation {
                 session_id,
-                result: message["result"].as_str().map(str::to_owned),
+                result,
+                activities,
                 completed: true,
                 failed: message["subtype"].as_str() != Some("success"),
                 token_count: i64::try_from(token_count).ok(),
@@ -857,6 +1128,78 @@ fn send_acp_message(input: &Sender<String>, message: Value) -> Result<(), String
         .map_err(|_| "Copilot session input is no longer available.".to_owned())
 }
 
+fn persist_session_activity(
+    database: &Arc<Mutex<Connection>>,
+    session_id: &str,
+    activity: &TranscriptActivity,
+) -> Result<(), String> {
+    let connection = database
+        .lock()
+        .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    let sequence: i64 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(sequence), 0) + 1
+             FROM (
+               SELECT sequence FROM session_messages WHERE session_id = ?1
+               UNION ALL
+               SELECT sequence FROM session_events WHERE session_id = ?1
+             )",
+            [session_id],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("Unable to sequence transcript activity: {error}"))?;
+    let payload = serde_json::json!({
+        "label": redact_activity_text(&activity.label),
+        "status": activity.status,
+        "details": bounded_activity_details(&activity.details),
+    });
+    let payload = serde_json::to_string(&payload)
+        .map_err(|error| format!("Unable to encode transcript activity: {error}"))?;
+    connection
+        .execute(
+            "INSERT INTO session_events
+             (id, session_id, sequence, event_type, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                copilot_session_id(),
+                session_id,
+                sequence,
+                activity.event_type,
+                payload
+            ],
+        )
+        .map_err(|error| format!("Unable to persist transcript activity: {error}"))?;
+    connection
+        .execute(
+            "UPDATE agent_sessions
+             SET last_seen_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            [session_id],
+        )
+        .map_err(|error| format!("Unable to update agent session activity time: {error}"))?;
+    Ok(())
+}
+
+fn capture_session_activity(
+    database: &Arc<Mutex<Connection>>,
+    app: &tauri::AppHandle,
+    session_id: &str,
+    activity: &TranscriptActivity,
+) {
+    match persist_session_activity(database, session_id, activity) {
+        Ok(()) => {
+            let _ = app.emit("agent-session-updated", session_id);
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            let _ = app.emit(
+                "agent-session-activity-error",
+                serde_json::json!({ "sessionId": session_id, "error": error }),
+            );
+        }
+    }
+}
+
 fn permission_outcome(
     permission: &PendingPermission,
     option_id: Option<&str>,
@@ -944,7 +1287,11 @@ fn insert_session_message(
     let sequence: i64 = connection
         .query_row(
             "SELECT COALESCE(MAX(sequence), 0) + 1
-             FROM session_messages WHERE session_id = ?1",
+             FROM (
+               SELECT sequence FROM session_messages WHERE session_id = ?1
+               UNION ALL
+               SELECT sequence FROM session_events WHERE session_id = ?1
+             )",
             [session_id],
             |row| row.get(0),
         )
@@ -969,11 +1316,44 @@ fn append_assistant_chunk(
     let connection = database
         .lock()
         .map_err(|_| "Agent session database is unavailable.".to_owned())?;
+    let existing = connection
+        .query_row(
+            "SELECT content FROM session_messages
+             WHERE id = ?1 AND session_id = ?2 AND role = 'assistant'",
+            params![message_id, session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| format!("Unable to read assistant transcript: {error}"))?;
+    let content_limit = MAX_TRANSCRIPT_MESSAGE_BYTES - TRANSCRIPT_TRUNCATION_MARKER.len();
+    if existing.len() >= content_limit {
+        let mut keep_end = content_limit.saturating_sub(TRANSCRIPT_TRUNCATION_MARKER.len());
+        while !existing.is_char_boundary(keep_end) {
+            keep_end -= 1;
+        }
+        let replacement = format!("{}{}", &existing[..keep_end], TRANSCRIPT_TRUNCATION_MARKER);
+        connection
+            .execute(
+                "UPDATE session_messages SET content = ?2
+                 WHERE id = ?1 AND session_id = ?3 AND role = 'assistant'",
+                params![message_id, replacement, session_id],
+            )
+            .map_err(|error| format!("Unable to bound assistant transcript: {error}"))?;
+        return Ok(());
+    }
+    let remaining = content_limit - existing.len();
+    let mut end = content.len().min(remaining);
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut bounded_chunk = content[..end].to_owned();
+    if end < content.len() {
+        bounded_chunk.push_str(TRANSCRIPT_TRUNCATION_MARKER);
+    }
     connection
         .execute(
             "UPDATE session_messages SET content = content || ?2
              WHERE id = ?1 AND session_id = ?3 AND role = 'assistant'",
-            params![message_id, content, session_id],
+            params![message_id, bounded_chunk, session_id],
         )
         .map_err(|error| format!("Unable to save Copilot response: {error}"))?;
     connection
@@ -2282,38 +2662,80 @@ fn load_session_transcript_from_connection(
     if !exists {
         return Err("Agent session was not found.".to_owned());
     }
-    let query = if full {
-        "SELECT role, content, created_at
-         FROM session_messages
-         WHERE session_id = ?1
-           AND (role = 'user' OR content <> '')
-         ORDER BY sequence ASC"
-    } else {
-        "SELECT role, content, created_at
-         FROM session_messages
-         WHERE session_id = ?1
-           AND (role = 'user' OR content <> '')
-         ORDER BY sequence DESC
-         LIMIT 100"
-    };
     let mut statement = connection
-        .prepare(query)
+        .prepare(
+            "SELECT role, content, created_at, sequence
+             FROM session_messages
+             WHERE session_id = ?1
+               AND (role = 'user' OR content <> '')",
+        )
         .map_err(|error| format!("Unable to query local session transcript: {error}"))?;
-    let mut messages = statement
+    let mut entries = statement
         .query_map([session_id], |row| {
             Ok(TranscriptMessage {
                 role: row.get(0)?,
                 content: row.get(1)?,
                 timestamp: row.get(2)?,
+                event_type: None,
+                status: None,
+                details: None,
+                sequence: row.get(3)?,
             })
         })
         .map_err(|error| format!("Unable to read local session transcript: {error}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("Unable to decode local session transcript: {error}"))?;
-    if !full {
-        messages.reverse();
+    if full {
+        let mut statement = connection
+            .prepare(
+                "SELECT event_type, payload, observed_at, sequence
+                 FROM session_events WHERE session_id = ?1",
+            )
+            .map_err(|error| format!("Unable to query local session activity: {error}"))?;
+        let activity_rows = statement
+            .query_map([session_id], |row| {
+                let event_type = row.get::<_, String>(0)?;
+                let payload = row.get::<_, String>(1)?;
+                let timestamp = row.get::<_, String>(2)?;
+                let sequence = row.get::<_, i64>(3)?;
+                Ok((event_type, payload, timestamp, sequence))
+            })
+            .map_err(|error| format!("Unable to read local session activity: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("Unable to decode local session activity: {error}"))?;
+        for (event_type, payload, timestamp, sequence) in activity_rows {
+            let payload: Value = serde_json::from_str(&payload).map_err(|error| {
+                format!("Unable to decode local session activity payload: {error}")
+            })?;
+            let Some(label) = payload.get("label").and_then(Value::as_str) else {
+                continue;
+            };
+            entries.push(TranscriptMessage {
+                role: "activity".to_owned(),
+                content: label.to_owned(),
+                timestamp,
+                event_type: Some(event_type),
+                status: payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                details: payload
+                    .get("details")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                sequence,
+            });
+        }
     }
-    Ok(messages)
+    entries.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then(left.sequence.cmp(&right.sequence))
+    });
+    if !full && entries.len() > 100 {
+        entries.drain(..entries.len() - 100);
+    }
+    Ok(entries)
 }
 
 #[tauri::command]
@@ -2447,6 +2869,28 @@ fn respond_session_permission(
             "result": { "outcome": outcome }
         }),
     )?;
+    capture_session_activity(
+        &database.0,
+        &app,
+        &session_id,
+        &TranscriptActivity {
+            event_type: "permission_decision".to_owned(),
+            label: if option_id.is_some() {
+                format!("Permission allowed: {}", permission.title)
+            } else {
+                format!("Permission denied: {}", permission.title)
+            },
+            status: if option_id.is_some() {
+                "allowed".to_owned()
+            } else {
+                "denied".to_owned()
+            },
+            details: serde_json::json!({
+                "optionId": option_id,
+                "outcome": outcome
+            }),
+        },
+    );
     control
         .permission_requests
         .lock()
@@ -2592,7 +3036,12 @@ fn persist_copilot_observation(
 
     let sequence: i64 = connection
         .query_row(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM session_events WHERE session_id = ?1",
+            "SELECT COALESCE(MAX(sequence), 0) + 1
+             FROM (
+               SELECT sequence FROM session_messages WHERE session_id = ?1
+               UNION ALL
+               SELECT sequence FROM session_events WHERE session_id = ?1
+             )",
             [session_id],
             |row| row.get(0),
         )
@@ -2690,10 +3139,43 @@ fn spawn_copilot_acp(
     let reader_session_id = session_id.to_owned();
     thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else {
-                break;
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    let message = format!("Unable to read Copilot ACP output: {error}");
+                    capture_session_activity(
+                        &database,
+                        &app,
+                        &reader_session_id,
+                        &TranscriptActivity {
+                            event_type: "error".to_owned(),
+                            label: message.clone(),
+                            status: "failed".to_owned(),
+                            details: Value::Null,
+                        },
+                    );
+                    let _ = update_session_status(
+                        &database,
+                        &reader_session_id,
+                        "failed",
+                        "Unable to read Copilot protocol output",
+                        &message,
+                    );
+                    break;
+                }
             };
             let Ok(message) = serde_json::from_str::<Value>(&line) else {
+                capture_session_activity(
+                    &database,
+                    &app,
+                    &reader_session_id,
+                    &TranscriptActivity {
+                        event_type: "error".to_owned(),
+                        label: "Copilot returned invalid ACP JSON".to_owned(),
+                        status: "failed".to_owned(),
+                        details: Value::String(line.clone()),
+                    },
+                );
                 let _ = update_session_status(
                     &database,
                     &reader_session_id,
@@ -2704,6 +3186,10 @@ fn spawn_copilot_acp(
                 let _ = app.emit("agent-session-updated", &reader_session_id);
                 continue;
             };
+
+            if let Some(activity) = copilot_activity_from_message(&message) {
+                capture_session_activity(&database, &app, &reader_session_id, &activity);
+            }
 
             match copilot_usage_update_for_session(&database, &message, &reader_session_id) {
                 Ok(Some((token_count, context_window_size))) => {
@@ -2781,6 +3267,20 @@ fn spawn_copilot_acp(
                             }),
                         ) {
                             Ok(()) => {
+                                capture_session_activity(
+                                    &database,
+                                    &app,
+                                    &reader_session_id,
+                                    &TranscriptActivity {
+                                        event_type: "permission_decision".to_owned(),
+                                        label: format!("Allowed once: {}", permission.title),
+                                        status: "allowed".to_owned(),
+                                        details: serde_json::json!({
+                                            "optionId": option_id,
+                                            "automatic": true
+                                        }),
+                                    },
+                                );
                                 let observation = CopilotObservation {
                                     status: Some("running".to_owned()),
                                     step: Some("Looping task permission approved once".to_owned()),
@@ -2830,6 +3330,17 @@ fn spawn_copilot_acp(
                             "result": { "outcome": { "outcome": "cancelled" } }
                         }),
                     );
+                    capture_session_activity(
+                        &database,
+                        &app,
+                        &reader_session_id,
+                        &TranscriptActivity {
+                            event_type: "permission_decision".to_owned(),
+                            label: format!("Cancelled: {}", permission.title),
+                            status: "cancelled".to_owned(),
+                            details: serde_json::json!({ "automatic": true }),
+                        },
+                    );
                     if let Ok(mut requests) = reader_control.permission_requests.lock() {
                         requests.remove(&permission.request_id);
                     }
@@ -2869,12 +3380,20 @@ fn spawn_copilot_acp(
                         {
                             if let Ok(message_id) = reader_control.assistant_message_id.lock() {
                                 if let Some(message_id) = message_id.as_deref() {
-                                    let _ = append_assistant_chunk(
+                                    if let Err(error) = append_assistant_chunk(
                                         &database,
                                         &reader_session_id,
                                         message_id,
                                         &content,
-                                    );
+                                    ) {
+                                        let _ = app.emit(
+                                            "agent-session-activity-error",
+                                            serde_json::json!({
+                                                "sessionId": reader_session_id,
+                                                "error": error
+                                            }),
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2937,6 +3456,27 @@ fn spawn_copilot_acp(
             "Copilot ACP process exited unexpectedly."
         };
         let _ = update_session_status(&database, &reader_session_id, status, reason, reason);
+        capture_session_activity(
+            &database,
+            &app,
+            &reader_session_id,
+            &TranscriptActivity {
+                event_type: "process_exit".to_owned(),
+                label: "Copilot ACP process exited".to_owned(),
+                status: if stopped {
+                    "stopped".to_owned()
+                } else if success {
+                    "completed".to_owned()
+                } else {
+                    "failed".to_owned()
+                },
+                details: serde_json::json!({
+                    "success": success,
+                    "stopped": stopped,
+                    "stderr": stderr_text
+                }),
+            },
+        );
         if let Ok(mut active) = processes.lock() {
             active.remove(&reader_session_id);
         }
@@ -3947,10 +4487,29 @@ fn start_claude_turn(
             let observation = match claude_observation_from_line(&line) {
                 Ok(observation) => observation,
                 Err(error) => {
+                    capture_session_activity(
+                        &reader_database,
+                        &reader_app,
+                        &reader_session_id,
+                        &TranscriptActivity {
+                            event_type: "error".to_owned(),
+                            label: error.clone(),
+                            status: "failed".to_owned(),
+                            details: serde_json::json!({ "line": line }),
+                        },
+                    );
                     stream_error = Some(error);
                     continue;
                 }
             };
+            for activity in &observation.activities {
+                capture_session_activity(
+                    &reader_database,
+                    &reader_app,
+                    &reader_session_id,
+                    activity,
+                );
+            }
             if let Some(id) = observation.session_id {
                 external_id = Some(id);
             }
@@ -3966,12 +4525,20 @@ fn start_claude_turn(
             if let Some(text) = observation.text {
                 if !text.is_empty() {
                     saw_text = true;
-                    let _ = append_assistant_chunk(
+                    if let Err(error) = append_assistant_chunk(
                         &reader_database,
                         &reader_session_id,
                         &assistant_message_id,
                         &text,
-                    );
+                    ) {
+                        let _ = reader_app.emit(
+                            "agent-session-activity-error",
+                            serde_json::json!({
+                                "sessionId": reader_session_id,
+                                "error": error
+                            }),
+                        );
+                    }
                     let _ = reader_app.emit("agent-session-updated", &reader_session_id);
                 }
             }
@@ -4005,6 +4572,19 @@ fn start_claude_turn(
                 String::new()
             }
         };
+        if !stderr.is_empty() && (stream_error.is_some() || !got_result) {
+            capture_session_activity(
+                &reader_database,
+                &reader_app,
+                &reader_session_id,
+                &TranscriptActivity {
+                    event_type: "error".to_owned(),
+                    label: "Claude Code reported an error".to_owned(),
+                    status: "failed".to_owned(),
+                    details: Value::String(stderr.clone()),
+                },
+            );
+        }
         let exit_success = child
             .lock()
             .map_err(|_| "Claude Code process state is unavailable.".to_owned())
@@ -4059,12 +4639,20 @@ fn start_claude_turn(
         }
         if !saw_text {
             if let Some(text) = result_text.as_deref().filter(|text| !text.is_empty()) {
-                let _ = append_assistant_chunk(
+                if let Err(error) = append_assistant_chunk(
                     &reader_database,
                     &reader_session_id,
                     &assistant_message_id,
                     text,
-                );
+                ) {
+                    let _ = reader_app.emit(
+                        "agent-session-activity-error",
+                        serde_json::json!({
+                            "sessionId": reader_session_id,
+                            "error": error
+                        }),
+                    );
+                }
             }
         }
 
@@ -4075,6 +4663,39 @@ fn start_claude_turn(
         } else {
             ("idle", "Ready for your message", "")
         };
+        if let Some(error) = failure.as_deref() {
+            capture_session_activity(
+                &reader_database,
+                &reader_app,
+                &reader_session_id,
+                &TranscriptActivity {
+                    event_type: "error".to_owned(),
+                    label: "Claude Code session failed".to_owned(),
+                    status: "failed".to_owned(),
+                    details: Value::String(error.to_owned()),
+                },
+            );
+        }
+        capture_session_activity(
+            &reader_database,
+            &reader_app,
+            &reader_session_id,
+            &TranscriptActivity {
+                event_type: "turn_update".to_owned(),
+                label: "Claude Code turn ended".to_owned(),
+                status: if stopped {
+                    "stopped".to_owned()
+                } else if failure.is_some() {
+                    "failed".to_owned()
+                } else {
+                    "completed".to_owned()
+                },
+                details: serde_json::json!({
+                    "resultReceived": got_result,
+                    "textReceived": saw_text
+                }),
+            },
+        );
         let _ = update_session_status(&reader_database, &reader_session_id, status, step, reason);
         if let Ok(mut active) = reader_processes.lock() {
             active.remove(&reader_session_id);
@@ -5119,6 +5740,34 @@ mod tests {
     }
 
     #[test]
+    fn oversized_assistant_output_is_bounded_and_marked() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        initialize_schema(&connection).expect("schema");
+        let assistant_id =
+            insert_session_message(&connection, "session-1", "assistant", "").expect("assistant");
+        let database = Arc::new(Mutex::new(connection));
+
+        append_assistant_chunk(
+            &database,
+            "session-1",
+            &assistant_id,
+            &"x".repeat(MAX_TRANSCRIPT_MESSAGE_BYTES + 32),
+        )
+        .expect("append oversized response");
+
+        let connection = database.lock().expect("database lock");
+        let content = connection
+            .query_row(
+                "SELECT content FROM session_messages WHERE id = ?1",
+                [&assistant_id],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("bounded response");
+        assert!(content.len() <= MAX_TRANSCRIPT_MESSAGE_BYTES);
+        assert!(content.ends_with(TRANSCRIPT_TRUNCATION_MARKER));
+    }
+
+    #[test]
     fn full_transcript_returns_all_messages_in_chronological_order() {
         let connection = Connection::open_in_memory().expect("in-memory database");
         initialize_schema(&connection).expect("schema");
@@ -5144,8 +5793,14 @@ mod tests {
         let preview = load_session_transcript_from_connection(&connection, "session-full", false)
             .expect("preview transcript");
         assert_eq!(preview.len(), 100);
-        assert_eq!(preview.first().map(|m| m.content.as_str()), Some("Message 6"));
-        assert_eq!(preview.last().map(|m| m.content.as_str()), Some("Message 105"));
+        assert_eq!(
+            preview.first().map(|m| m.content.as_str()),
+            Some("Message 6")
+        );
+        assert_eq!(
+            preview.last().map(|m| m.content.as_str()),
+            Some("Message 105")
+        );
 
         let full = load_session_transcript_from_connection(&connection, "session-full", true)
             .expect("full transcript");
@@ -5347,6 +6002,142 @@ mod tests {
         assert!(failure.completed);
         assert!(failure.failed);
         assert_eq!(failure.result.as_deref(), Some("Tool failed"));
+    }
+
+    #[test]
+    fn copilot_activity_parser_captures_tool_updates_permissions_and_errors() {
+        let tool = copilot_activity_from_message(&serde_json::json!({
+            "method": "session/update",
+            "params": { "update": {
+                "sessionUpdate": "tool_call_update",
+                "title": "Run tests",
+                "status": "completed",
+                "input": { "command": "cargo test" }
+            } }
+        }))
+        .expect("tool update");
+        assert_eq!(tool.event_type, "tool_update");
+        assert_eq!(tool.status, "completed");
+        assert_eq!(tool.label, "Run tests");
+
+        let permission = copilot_activity_from_message(&serde_json::json!({
+            "id": 8,
+            "method": "session/request_permission",
+            "params": { "toolCall": { "title": "Write file" }, "options": [] }
+        }))
+        .expect("permission request");
+        assert_eq!(permission.event_type, "permission_request");
+        assert_eq!(permission.status, "requested");
+
+        let error = copilot_activity_from_message(&serde_json::json!({
+            "error": { "message": "Provider rejected the call" }
+        }))
+        .expect("provider error");
+        assert_eq!(error.event_type, "error");
+        assert_eq!(error.status, "failed");
+    }
+
+    #[test]
+    fn claude_structured_events_capture_tool_io_and_permission_decisions() {
+        let tool = claude_observation_from_line(
+            r#"{"type":"assistant","session_id":"claude-session","message":{"content":[{"type":"thinking","thinking":"not exposed as transcript activity"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+        )
+        .expect("Claude tool event");
+        assert_eq!(tool.activities.len(), 1);
+        assert_eq!(tool.activities[0].event_type, "tool_call");
+        assert_eq!(tool.activities[0].label, "Bash");
+
+        let output = claude_observation_from_line(
+            r#"{"type":"user","session_id":"claude-session","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"tests passed","is_error":false}]}}"#,
+        )
+        .expect("Claude tool output");
+        assert_eq!(output.activities[0].event_type, "tool_output");
+        assert_eq!(output.activities[0].status, "completed");
+
+        let permission = claude_observation_from_line(
+            r#"{"type":"control_request","session_id":"claude-session","request":{"subtype":"permission_request","tool_name":"Bash"}}"#,
+        )
+        .expect("Claude permission request");
+        assert_eq!(permission.activities[0].event_type, "permission_request");
+
+        let decision = claude_observation_from_line(
+            r#"{"type":"control_response","session_id":"claude-session","response":{"subtype":"permission_response","behavior":"allow"}}"#,
+        )
+        .expect("Claude permission decision");
+        assert_eq!(decision.activities[0].event_type, "permission_decision");
+    }
+
+    #[test]
+    fn transcript_activity_is_redacted_bounded_and_persisted_in_chronological_order() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-control-plane-transcript-{}-{}.sqlite",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let connection = Connection::open(&path).expect("database");
+        initialize_schema(&connection).expect("schema");
+        connection
+            .execute(
+                "INSERT INTO projects (id, name, path, branch, current_commit, git_state)
+                 VALUES ('project-1', 'Project', '/tmp/project', 'main', 'abc', 'clean')",
+                [],
+            )
+            .expect("project");
+        connection
+            .execute(
+                "INSERT INTO agent_sessions (id, project_id, provider, task, status)
+                 VALUES ('session-1', 'project-1', 'copilot', 'Task', 'completed')",
+                [],
+            )
+            .expect("session");
+        insert_session_message(&connection, "session-1", "user", "Run tests")
+            .expect("user message");
+        let database = Arc::new(Mutex::new(connection));
+        persist_session_activity(
+            &database,
+            "session-1",
+            &TranscriptActivity {
+                event_type: "tool_call".to_owned(),
+                label: "Run tests".to_owned(),
+                status: "started".to_owned(),
+                details: serde_json::json!({
+                    "token": "private-token",
+                    "command": "curl -H 'Authorization: Bearer private-bearer' " ,
+                    "output": "x".repeat(MAX_ACTIVITY_DETAILS_BYTES + 100)
+                }),
+            },
+        )
+        .expect("persist activity");
+        insert_session_message(
+            &database.lock().expect("lock"),
+            "session-1",
+            "assistant",
+            "Done",
+        )
+        .expect("assistant message");
+        drop(database);
+
+        let connection = Connection::open(&path).expect("reopen persisted database");
+        let transcript = load_session_transcript_from_connection(&connection, "session-1", true)
+            .expect("full transcript");
+        let _ = fs::remove_file(path);
+
+        assert_eq!(
+            transcript
+                .iter()
+                .map(|entry| entry.role.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user", "activity", "assistant"]
+        );
+        let details = transcript[1].details.as_deref().expect("activity details");
+        assert!(details.len() <= MAX_ACTIVITY_DETAILS_BYTES);
+        assert!(details.contains("[REDACTED]"));
+        assert!(!details.contains("private-token"));
+        assert!(!details.contains("private-bearer"));
+        assert!(details.contains("[truncated]"));
     }
 
     #[test]
