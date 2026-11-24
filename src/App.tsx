@@ -406,23 +406,37 @@ function GithubIssueHostSettings() {
   }
 
   return (
-    <section className="settings-section">
-      <div className="section-header"><div><h2>GitHub issue import hosts</h2><span className="section-caption">GitHub.com defaults to GitHub CLI. Add each Enterprise host explicitly; credentials are stored per host in the OS vault.</span></div></div>
-      <div className="github-card">
-        {hosts.length > 0 && <div>Configured: {hosts.map((entry) => (
-          <button key={entry.host} type="button" className="text-button" onClick={() => { setHost(entry.host); setMethod(entry.method); if (tokenRef.current) tokenRef.current.value = ""; }}>
-            {entry.host} ({entry.method === "cli" ? "GitHub CLI" : "token"})
-          </button>
-        ))}</div>}
-        <div className="github-fields">
-          <div><label className="field-label" htmlFor="github-issue-host">GITHUB HOST</label><input id="github-issue-host" className="settings-input" value={host} onChange={(event) => { setHost(event.currentTarget.value); setMethod("cli"); }} placeholder="github.company.com" /></div>
-          <div><label className="field-label" htmlFor="github-issue-auth">AUTHENTICATION</label><select id="github-issue-auth" className="settings-input" value={method} onChange={(event) => setMethod(event.currentTarget.value)}><option value="cli">GitHub CLI</option><option value="token">Personal access token</option></select></div>
-          {method === "token" && <div><label className="field-label" htmlFor="github-issue-token">PERSONAL ACCESS TOKEN</label><input id="github-issue-token" className="settings-input" type="password" autoComplete="new-password" ref={tokenRef} placeholder="Leave blank to keep saved token" /></div>}
-        </div>
-        <button type="button" className="project-feature-button" disabled={busy || !host.trim()} onClick={() => void saveHost()}>{busy ? "Saving…" : "Save issue host"}</button>
-        {message && <p role="status">{message}</p>}
+    <div className="github-issue-import-settings">
+      <div className="github-issue-import-header">
+        <div><h3>GitHub issue import hosts</h3><span>GitHub.com defaults to GitHub CLI. Add each Enterprise host here; credentials are stored per host in the OS vault.</span></div>
       </div>
-    </section>
+      {hosts.length > 0 && (
+        <div className="github-issue-host-list">
+          <span>Configured hosts</span>
+          <div>{hosts.map((entry) => (
+            <button
+              key={entry.host}
+              type="button"
+              className="text-button"
+              onClick={() => {
+                setHost(entry.host);
+                setMethod(entry.method);
+                if (tokenRef.current) tokenRef.current.value = "";
+              }}
+            >
+              {entry.host} ({entry.method === "cli" ? "GitHub CLI" : "PAT"})
+            </button>
+          ))}</div>
+        </div>
+      )}
+      <div className="github-fields">
+        <div><label className="field-label" htmlFor="github-issue-host">GITHUB HOST</label><input id="github-issue-host" className="settings-input" value={host} onChange={(event) => { setHost(event.currentTarget.value); setMethod("cli"); }} placeholder="github.company.com" /></div>
+        <div><label className="field-label" htmlFor="github-issue-auth">AUTHENTICATION</label><select id="github-issue-auth" className="settings-input" value={method} onChange={(event) => setMethod(event.currentTarget.value)}><option value="cli">GitHub CLI</option><option value="token">Personal access token</option></select></div>
+        {method === "token" && <div><label className="field-label" htmlFor="github-issue-token">PERSONAL ACCESS TOKEN</label><input id="github-issue-token" className="settings-input" type="password" autoComplete="new-password" ref={tokenRef} placeholder="Leave blank to keep saved token" /></div>}
+      </div>
+      <button type="button" className="project-feature-button" disabled={busy || !host.trim()} onClick={() => void saveHost()}>{busy ? "Saving…" : "Save issue host"}</button>
+      {message && <p role="status">{message}</p>}
+    </div>
   );
 }
 
@@ -545,7 +559,6 @@ function SettingsView({
           </div>
         </div>
       </section>
-      <GithubIssueHostSettings />
       <section className="settings-section">
         <div className="section-header"><div><h2>GitHub connection</h2><span className="section-caption">Choose how Agent Control Plane authenticates with GitHub.</span></div></div>
         <div className="github-card">
@@ -586,6 +599,7 @@ function SettingsView({
               <div><strong>Use your existing GitHub CLI login</strong><p>Run this once in a terminal if you have not authenticated yet:</p><code>gh auth login</code><small>GitHub requests will use the CLI’s secure credential store. No token is copied into this app.</small></div>
             </div>
           )}
+          <GithubIssueHostSettings />
         </div>
       </section>
     </form>

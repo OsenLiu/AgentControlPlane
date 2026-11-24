@@ -727,6 +727,9 @@ describe("App", () => {
     });
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    const issueHostsHeading = screen.getByRole("heading", { name: "GitHub issue import hosts" });
+    expect(issueHostsHeading.closest(".settings-section")?.querySelector("h2")?.textContent)
+      .toBe("GitHub connection");
     fireEvent.change(screen.getByLabelText("GITHUB HOST"), { target: { value: "git.example.com" } });
     fireEvent.change(screen.getByLabelText("AUTHENTICATION"), { target: { value: "token" } });
     const token = screen.getByLabelText("PERSONAL ACCESS TOKEN", { selector: "#github-issue-token" });

@@ -16,11 +16,11 @@ in.
 - **Jira ticket import** — save your Jira email and API token in Settings, then
   draft a project task from a ticket URL with your default AI agent.
 - **GitHub issue import** — draft a reviewable project task from a GitHub or
-  GitHub Enterprise issue URL. Configure each Enterprise host in Settings;
-  choose GitHub CLI (the default) or a host-specific token stored in the OS
-  credential vault. The issue's source is recorded, duplicate imports within a
-  project are blocked, and comments are not imported. Issue-import host
-  settings are separate from the GitHub Actions connection.
+  GitHub Enterprise issue URL. Configure issue-import hosts in the GitHub
+  connection section of Settings; choose GitHub CLI (the default) or a
+  host-specific token stored in the OS credential vault. The issue's source is
+  recorded, duplicate imports within a project are blocked, and comments are
+  not imported. Issue-import credentials remain host-specific.
 - **Live session supervision** — follow streaming transcripts, inspect session
   state, and resume conversations.
 - **Human-in-the-loop controls** — review permission requests and failed

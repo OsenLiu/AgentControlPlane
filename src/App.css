@@ -650,6 +650,14 @@ select.settings-input option { color: #dce4f8; background-color: #0d1528; }
 .github-cli-details p { margin-top: 5px; }
 .github-cli-details code { display: inline-block; margin: 9px 0; padding: 7px 9px; border: 1px solid #293650; border-radius: 6px; color: #9fe2bd; background: #0b1424; font-size: 11px; }
 .github-cli-details small { color: #8b98b3; }
+.github-issue-import-settings { margin-top: 26px; padding-top: 22px; border-top: 1px solid #293650; }
+.github-issue-import-header h3 { margin: 0; color: #e4e9f7; font-size: 12px; font-weight: 600; }
+.github-issue-import-header span { display: block; margin-top: 5px; color: #8b98b3; font-size: 11px; line-height: 1.5; }
+.github-issue-host-list { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 16px; color: #aab5cd; font-size: 11px; }
+.github-issue-host-list > div { display: flex; flex-wrap: wrap; gap: 5px 12px; }
+.github-issue-import-settings .github-fields { margin-top: 16px; }
+.github-issue-import-settings .project-feature-button { margin-top: 15px; }
+.github-issue-import-settings [role="status"] { margin-bottom: 0; color: #9ba8c3; font-size: 11px; }
 @media (max-width: 760px) {
   .github-auth-methods, .github-fields { grid-template-columns: 1fr; }
   .github-connection-state { font-size: 10px; }
