@@ -65,6 +65,8 @@ pub(crate) struct ProjectTask {
     updated_at: String,
     archived: bool,
     review_pending: bool,
+    source_url: Option<String>,
+    source_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -420,6 +422,24 @@ pub(crate) fn initialize_schema(connection: &Connection) -> rusqlite::Result<()>
                     }
                 })
         })
+        .and_then(|_| {
+            connection.execute("ALTER TABLE project_tasks ADD COLUMN source_url TEXT", [])
+                .or_else(|error| {
+                    if error.to_string().contains("duplicate column name: source_url") { Ok(0) } else { Err(error) }
+                })
+        })
+        .and_then(|_| {
+            connection.execute("ALTER TABLE project_tasks ADD COLUMN source_key TEXT", [])
+                .or_else(|error| {
+                    if error.to_string().contains("duplicate column name: source_key") { Ok(0) } else { Err(error) }
+                })
+        })
+        .and_then(|_| {
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_tasks_source ON project_tasks(project_id, source_key) WHERE source_key IS NOT NULL",
+                [],
+            )
+        })
         .map(|_| ())
 }
 
@@ -486,6 +506,8 @@ fn task_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectTask> {
         review_pending: row.get::<_, i64>(18)? != 0,
         use_worktree: row.get::<_, i64>(19)? != 0,
         workspace_locked: row.get::<_, i64>(20)? != 0,
+        source_url: row.get(21)?,
+        source_key: row.get(22)?,
     })
 }
 
@@ -502,7 +524,7 @@ fn list_tasks(connection: &Connection, project_id: &str) -> Result<Vec<ProjectTa
                       WHERE s.id = project_tasks.session_id AND s.status = 'completed'
                         AND s.current_step = 'Task ready for review'
                     ) THEN 1 ELSE 0 END,
-                    use_worktree, workspace_locked
+                    use_worktree, workspace_locked, source_url, source_key
              FROM project_tasks
              WHERE project_id = ?1
              ORDER BY CASE status WHEN 'backlog' THEN 0 WHEN 'in_progress' THEN 1 ELSE 2 END,
@@ -527,7 +549,7 @@ fn task_by_id(connection: &Connection, task_id: &str) -> rusqlite::Result<Projec
                   WHERE s.id = project_tasks.session_id AND s.status = 'completed'
                     AND s.current_step = 'Task ready for review'
                 ) THEN 1 ELSE 0 END,
-                use_worktree, workspace_locked
+                use_worktree, workspace_locked, source_url, source_key
          FROM project_tasks WHERE id = ?1",
         [task_id],
         task_from_row,
@@ -590,6 +612,8 @@ pub(crate) fn create_project_task(
     step_budget: i64,
     auto_approve: bool,
     use_worktree: bool,
+    source_url: Option<String>,
+    source_key: Option<String>,
     database: State<'_, Database>,
 ) -> Result<ProjectTask, String> {
     let title = title.trim();
@@ -607,6 +631,14 @@ pub(crate) fn create_project_task(
     let mode = validate_task_mode(&mode)?;
     let model = validate_task_model(&model)?;
     validate_task_step_budget(step_budget)?;
+    if let Some(url) = source_url.as_deref() {
+        let location = crate::github_issue::parse_issue_url(url)?;
+        if source_key.as_deref() != Some(location.source_key.as_str()) {
+            return Err("The task source does not match the GitHub issue URL.".to_owned());
+        }
+    } else if source_key.is_some() {
+        return Err("A task source URL is required with its source key.".to_owned());
+    }
     let id = new_id("task");
     let connection = database
         .0
@@ -615,11 +647,15 @@ pub(crate) fn create_project_task(
     ensure_project_exists(&connection, &project_id)?;
     connection
         .execute(
-            "INSERT INTO project_tasks (id, project_id, title, description, provider, mode, model, step_budget, auto_approve, use_worktree)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![id, project_id, title, description.trim(), provider, mode, model, step_budget, auto_approve, use_worktree],
+            "INSERT INTO project_tasks (id, project_id, title, description, provider, mode, model, step_budget, auto_approve, use_worktree, source_url, source_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![id, project_id, title, description.trim(), provider, mode, model, step_budget, auto_approve, use_worktree, source_url, source_key],
         )
-        .map_err(|error| format!("Unable to create project task: {error}"))?;
+        .map_err(|error| match &error {
+            rusqlite::Error::SqliteFailure(code, _) if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+                "A task imported from this issue already exists in this project.".to_owned(),
+            _ => format!("Unable to create project task: {error}"),
+        })?;
     task_by_id(&connection, &id)
         .map_err(|error| format!("Unable to read the new project task: {error}"))
 }
@@ -1131,8 +1167,7 @@ fn new_id(prefix: &str) -> String {
 fn git_output(path: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut cmd = Command::new("git");
     hide_console_window(&mut cmd);
-    cmd
-        .arg("-C")
+    cmd.arg("-C")
         .arg(path)
         .args(args)
         .output()
@@ -1949,17 +1984,13 @@ fn github_repository(remote: &str) -> Option<String> {
 fn github_cli_token() -> Result<String, String> {
     let mut cmd = Command::new("gh");
     hide_console_window(&mut cmd);
-    let output = cmd
-        .args(["auth", "token"])
-        .output()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "GitHub CLI was not found. Install `gh` or choose a personal access token."
-                    .to_owned()
-            } else {
-                format!("Unable to start GitHub CLI: {error}")
-            }
-        })?;
+    let output = cmd.args(["auth", "token"]).output().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "GitHub CLI was not found. Install `gh` or choose a personal access token.".to_owned()
+        } else {
+            format!("Unable to start GitHub CLI: {error}")
+        }
+    })?;
     if !output.status.success() {
         return Err(
             "GitHub CLI is not authenticated. Run `gh auth login` and try again.".to_owned(),
@@ -2483,6 +2514,42 @@ mod tests {
         assert_eq!(name.as_deref(), Some("review"));
         assert_eq!(description.as_deref(), Some("Code review steps"));
         assert_eq!(parse_skill_frontmatter("No frontmatter"), (None, None));
+    }
+
+    #[test]
+    fn task_sources_are_persisted_and_unique_per_project() {
+        let connection = Connection::open_in_memory().expect("in-memory database");
+        connection.execute_batch(
+            "CREATE TABLE projects (id TEXT PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, status TEXT, current_step TEXT, worktree_path TEXT);
+             INSERT INTO projects VALUES ('p1', '/tmp'), ('p2', '/tmp');"
+        ).expect("core schema");
+        initialize_schema(&connection).expect("feature schema");
+        initialize_schema(&connection).expect("idempotent migration");
+        connection.execute(
+            "INSERT INTO project_tasks (id, project_id, title, source_url, source_key) VALUES (?1, ?2, 'title', ?3, ?4)",
+            params!["t1", "p1", "https://github.com/a/b/issues/1", "github:github.com/a/b/1"],
+        ).expect("source task");
+        let task = task_by_id(&connection, "t1").expect("task readback");
+        assert_eq!(
+            task.source_url.as_deref(),
+            Some("https://github.com/a/b/issues/1")
+        );
+        assert_eq!(task.source_key.as_deref(), Some("github:github.com/a/b/1"));
+        assert!(connection.execute(
+            "INSERT INTO project_tasks (id, project_id, title, source_key) VALUES ('t2', 'p1', 'title', 'github:github.com/a/b/1')",
+            [],
+        ).is_err());
+        connection.execute_batch(
+            "INSERT INTO project_tasks (id, project_id, title, source_key) VALUES ('t3', 'p2', 'title', 'github:github.com/a/b/1');
+             INSERT INTO project_tasks (id, project_id, title) VALUES ('t4', 'p1', 'manual'), ('t5', 'p1', 'manual');"
+        ).expect("other projects and manual tasks");
+        assert_eq!(
+            task_by_id(&connection, "t4")
+                .expect("manual task")
+                .source_key,
+            None
+        );
     }
 
     #[test]

@@ -566,6 +566,7 @@ export function ProjectTasksTab({
       {taskDialog && (
         <ProjectTaskDialog
           initial={taskDialog === "new" ? null : taskDialog}
+          projectId={project.id}
           providerSettings={providerSettings}
           importingJira={importingJira}
           error={error}
@@ -591,6 +592,8 @@ type ProjectTaskInput = {
   stepBudget: number;
   autoApprove: boolean;
   useWorktree: boolean;
+  sourceUrl?: string;
+  sourceKey?: string;
 };
 
 function TaskSettingHelp({ label, text }: { label: string; text: string }) {
@@ -704,6 +707,7 @@ function TaskSettingHelp({ label, text }: { label: string; text: string }) {
 
 function ProjectTaskDialog({
   initial,
+  projectId,
   providerSettings,
   importingJira,
   error,
@@ -713,6 +717,7 @@ function ProjectTaskDialog({
   onImportJira,
 }: {
   initial: ProjectTask | null;
+  projectId: string;
   providerSettings: AgentProviderSettings;
   importingJira: boolean;
   error: string;
@@ -726,6 +731,10 @@ function ProjectTaskDialog({
   const [description, setDescription] = useState(initial?.description ?? "");
   const [jiraUrl, setJiraUrl] = useState("");
   const [jiraImportError, setJiraImportError] = useState("");
+  const [githubUrl, setGithubUrl] = useState("");
+  const [githubImportError, setGithubImportError] = useState("");
+  const [githubStage, setGithubStage] = useState<"fetching" | "generating" | null>(null);
+  const [source, setSource] = useState<{ sourceUrl: string; sourceKey: string } | null>(null);
   const [provider, setProvider] = useState<AgentProvider>(initial?.provider ?? providerSettings.defaultProvider);
   const [mode, setMode] = useState<ProjectTask["mode"]>(initial?.mode ?? "acceptEdits");
   const initialModel = initial?.model ?? "auto";
@@ -748,11 +757,11 @@ function ProjectTaskDialog({
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent) {
-      if (event.key === "Escape" && !saving && !importingJira) onClose();
+      if (event.key === "Escape" && !saving && !importingJira && !githubStage) onClose();
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [importingJira, onClose, saving]);
+  }, [githubStage, importingJira, onClose, saving]);
 
   const model = modelChoice === "custom" ? customModel.trim() : modelChoice;
   const modelGroups = provider === "claudeCode"
@@ -767,7 +776,7 @@ function ProjectTaskDialog({
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (valid) onSave({ title, description, provider, mode, model, stepBudget, autoApprove, useWorktree });
+    if (valid) onSave({ title, description, provider, mode, model, stepBudget, autoApprove, useWorktree, ...(source ?? {}) });
   }
 
   async function importJira() {
@@ -776,8 +785,32 @@ function ProjectTaskDialog({
       const draft = await onImportJira(jiraUrl.trim());
       setTitle(draft.title);
       setDescription(draft.description);
+      setSource(null);
     } catch (reason) {
       setJiraImportError(messageFromError(reason));
+    }
+  }
+
+  async function importGithub() {
+    setGithubImportError("");
+    setGithubStage("fetching");
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    let unlisten: (() => void) | undefined;
+    try {
+      unlisten = await listen<string>("github-issue-import-stage", (event) => {
+        if (event.payload === requestId) setGithubStage("generating");
+      });
+      const draft = await invoke<{ title: string; description: string; sourceUrl: string; sourceKey: string }>(
+        "import_github_issue", { url: githubUrl.trim(), projectId, requestId },
+      );
+      setTitle(draft.title);
+      setDescription(draft.description);
+      setSource({ sourceUrl: draft.sourceUrl, sourceKey: draft.sourceKey });
+    } catch (reason) {
+      setGithubImportError(messageFromError(reason));
+    } finally {
+      unlisten?.();
+      setGithubStage(null);
     }
   }
 
@@ -798,7 +831,7 @@ function ProjectTaskDialog({
     <div
       className="task-dialog-backdrop"
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !saving && !importingJira) onClose();
+        if (event.target === event.currentTarget && !saving && !importingJira && !githubStage) onClose();
       }}
     >
       <section
@@ -826,7 +859,7 @@ function ProjectTaskDialog({
       >
         <header className="task-dialog-header">
           <h2 id="task-dialog-title">{initial ? "Edit task" : "New task"}</h2>
-          <button className="project-feature-quiet" type="button" disabled={saving || importingJira} onClick={onClose}>Close</button>
+          <button className="project-feature-quiet" type="button" disabled={saving || importingJira || !!githubStage} onClick={onClose}>Close</button>
         </header>
         <form onSubmit={submit}>
           {!initial && (
@@ -844,13 +877,28 @@ function ProjectTaskDialog({
               <button
                 className="project-feature-button"
                 type="button"
-                disabled={!providerSettings.jiraConfigured || !jiraUrl.trim() || importingJira || saving}
+                disabled={!providerSettings.jiraConfigured || !jiraUrl.trim() || importingJira || !!githubStage || saving}
                 onClick={() => void importJira()}
               >
                 {importingJira ? "Generating task…" : "Import ticket"}
               </button>
               {!providerSettings.jiraConfigured && (
                 <p className="task-agent-help">Add your Jira email and API token in Settings → Integrations to import tickets.</p>
+              )}
+              {!initial && (
+                <section className="task-jira-import" aria-label="Import GitHub issue">
+                  <label className="task-dialog-field">
+                    <span>Import from GitHub</span>
+                    <input type="url" value={githubUrl} onChange={(event) => setGithubUrl(event.currentTarget.value)}
+                      placeholder="https://github.com/owner/repository/issues/123" aria-label="GitHub issue URL" />
+                  </label>
+                  <button className="project-feature-button" type="button"
+                    disabled={!githubUrl.trim() || !!githubStage || importingJira || saving}
+                    onClick={() => void importGithub()}>
+                    {githubStage === "fetching" ? "Fetching issue…" : githubStage === "generating" ? "Generating task…" : "Import issue"}
+                  </button>
+                  {githubImportError && <p className="project-feature-error" role="alert">{githubImportError}</p>}
+                </section>
               )}
               {jiraImportError && <p className="project-feature-error" role="alert">{jiraImportError}</p>}
             </section>
@@ -1006,8 +1054,8 @@ function ProjectTaskDialog({
           </div>
           {error && <p className="project-feature-error" role="alert">{error}</p>}
           <footer className="task-dialog-actions">
-            <button className="project-feature-button" type="button" disabled={saving || importingJira} onClick={onClose}>Cancel</button>
-            <button className="project-feature-primary" type="submit" disabled={saving || importingJira || !valid}>
+            <button className="project-feature-button" type="button" disabled={saving || importingJira || !!githubStage} onClick={onClose}>Cancel</button>
+            <button className="project-feature-primary" type="submit" disabled={saving || importingJira || !!githubStage || !valid}>
               {saving ? "Saving…" : initial ? "Save task" : "Create task"}
             </button>
           </footer>

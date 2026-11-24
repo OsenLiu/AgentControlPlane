@@ -717,6 +717,28 @@ describe("App", () => {
     expect(screen.getByLabelText("JIRA API TOKEN")).toHaveValue("");
   });
 
+  it("configures an Enterprise issue host and clears its token input", async () => {
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_github_issue_hosts") return [{ host: "github.com", method: "cli" }];
+      if (command === "configure_github_issue_host") return undefined;
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    fireEvent.change(screen.getByLabelText("GITHUB HOST"), { target: { value: "git.example.com" } });
+    fireEvent.change(screen.getByLabelText("AUTHENTICATION"), { target: { value: "token" } });
+    const token = screen.getByLabelText("PERSONAL ACCESS TOKEN", { selector: "#github-issue-token" });
+    fireEvent.change(token, { target: { value: "host-token-value" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save issue host" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("configure_github_issue_host", {
+      host: "git.example.com", method: "token", token: "host-token-value",
+    }));
+    expect(token).toHaveValue("");
+    expect(await screen.findByText("GitHub issue host saved.")).toBeTruthy();
+  });
+
   it("opens the project directory and filters projects by search and Git state", async () => {
     invokeMock.mockImplementation(async (command) => {
       if (command === "list_projects") return [
@@ -1227,6 +1249,63 @@ describe("App", () => {
         description: importedTask.description,
       }));
     });
+  });
+
+  it("imports a GitHub issue for review and saves its original source only after confirmation", async () => {
+    const url = "https://github.com/team/repo/issues/12?from=link";
+    let finishImport: ((value: unknown) => void) | undefined;
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_project_tasks") return [];
+      if (command === "import_github_issue") return new Promise((resolve) => { finishImport = resolve; });
+      if (command === "create_project_task") return { id: "created" };
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    render(<ProjectTasksTab project={{ id: "project-1", name: "demo" }}
+      providerSettings={{ copilotEnabled: true, claudeCodeEnabled: false, defaultProvider: "copilot", jiraConfigured: true }}
+      onOpenSession={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "+ New task" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "GitHub issue URL" }), { target: { value: url } });
+    fireEvent.click(screen.getByRole("button", { name: "Import issue" }));
+    expect(await screen.findByRole("button", { name: "Fetching issue…" })).toBeDisabled();
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("import_github_issue", expect.anything()));
+    const importCall = invokeMock.mock.calls.find(([command]) => command === "import_github_issue");
+    const args = importCall?.[1] as { requestId: string; projectId: string; url: string };
+    expect(args).toMatchObject({ projectId: "project-1", url });
+    act(() => testNotificationEvents.handlers.get("github-issue-import-stage")?.({ payload: args.requestId }));
+    expect(screen.getByRole("button", { name: "Generating task…" })).toBeDisabled();
+    act(() => finishImport?.({ title: "Fix login", description: "Handle failed login.", sourceUrl: url, sourceKey: "github:github.com/team/repo/12" }));
+    expect(await screen.findByDisplayValue("Fix login")).toBeTruthy();
+    expect(screen.getByDisplayValue("Handle failed login.")).toBeTruthy();
+    expect(invokeMock).not.toHaveBeenCalledWith("create_project_task", expect.anything());
+    fireEvent.click(screen.getByRole("button", { name: "Create task" }));
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("create_project_task", expect.objectContaining({
+      sourceUrl: url, sourceKey: "github:github.com/team/repo/12", title: "Fix login",
+    })));
+  });
+
+  it.each([
+    "A task imported from this issue already exists in this project.",
+    "GitHub CLI is not authenticated for this host.",
+    "GitHub rate limit reached. Try again later.",
+    "The AI agent returned invalid task content.",
+  ])("preserves the task draft when GitHub import fails: %s", async (message) => {
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_project_tasks") return [];
+      if (command === "import_github_issue") throw new Error(message);
+      throw new Error(`Unexpected command: ${command}`);
+    });
+    render(<ProjectTasksTab project={{ id: "project-1", name: "demo" }}
+      providerSettings={{ copilotEnabled: true, claudeCodeEnabled: false, defaultProvider: "copilot", jiraConfigured: false }}
+      onOpenSession={vi.fn()} />);
+    fireEvent.click(await screen.findByRole("button", { name: "+ New task" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Task title" }), { target: { value: "Existing title" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Brief" }), { target: { value: "Existing brief" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "GitHub issue URL" }), { target: { value: "https://github.com/a/b/issues/1" } });
+    fireEvent.click(screen.getByRole("button", { name: "Import issue" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(message);
+    expect(screen.getByDisplayValue("Existing title")).toBeTruthy();
+    expect(screen.getByDisplayValue("Existing brief")).toBeTruthy();
+    expect(invokeMock).not.toHaveBeenCalledWith("create_project_task", expect.anything());
   });
 
   it("disables Jira import until credentials are configured", async () => {

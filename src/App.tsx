@@ -371,6 +371,61 @@ function dashboardProjectPipelineStatus(snapshot: ProjectPipelines | null): Proj
   return latestRun ? pipelineRunStatus(latestRun) : { status: "unknown", label: "No runs" };
 }
 
+function GithubIssueHostSettings() {
+  const [hosts, setHosts] = useState<{ host: string; method: string }[]>([]);
+  const [host, setHost] = useState("github.com");
+  const [method, setMethod] = useState("cli");
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  const tokenRef = useRef<HTMLInputElement>(null);
+
+  async function loadHosts() {
+    const result = await invoke<{ host: string; method: string }[]>("list_github_issue_hosts");
+    if (!Array.isArray(result)) throw new Error("Unable to read GitHub host settings.");
+    setHosts(result);
+  }
+
+  useEffect(() => {
+    void loadHosts().catch((reason) => setMessage(reason instanceof Error ? reason.message : String(reason)));
+  }, []);
+
+  async function saveHost() {
+    setBusy(true);
+    setMessage("");
+    const token = tokenRef.current?.value ?? "";
+    if (tokenRef.current) tokenRef.current.value = "";
+    try {
+      await invoke("configure_github_issue_host", { host: host.trim(), method, token });
+      await loadHosts();
+      setMessage("GitHub issue host saved.");
+    } catch (reason) {
+      setMessage(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="settings-section">
+      <div className="section-header"><div><h2>GitHub issue import hosts</h2><span className="section-caption">GitHub.com defaults to GitHub CLI. Add each Enterprise host explicitly; credentials are stored per host in the OS vault.</span></div></div>
+      <div className="github-card">
+        {hosts.length > 0 && <div>Configured: {hosts.map((entry) => (
+          <button key={entry.host} type="button" className="text-button" onClick={() => { setHost(entry.host); setMethod(entry.method); if (tokenRef.current) tokenRef.current.value = ""; }}>
+            {entry.host} ({entry.method === "cli" ? "GitHub CLI" : "token"})
+          </button>
+        ))}</div>}
+        <div className="github-fields">
+          <div><label className="field-label" htmlFor="github-issue-host">GITHUB HOST</label><input id="github-issue-host" className="settings-input" value={host} onChange={(event) => { setHost(event.currentTarget.value); setMethod("cli"); }} placeholder="github.company.com" /></div>
+          <div><label className="field-label" htmlFor="github-issue-auth">AUTHENTICATION</label><select id="github-issue-auth" className="settings-input" value={method} onChange={(event) => setMethod(event.currentTarget.value)}><option value="cli">GitHub CLI</option><option value="token">Personal access token</option></select></div>
+          {method === "token" && <div><label className="field-label" htmlFor="github-issue-token">PERSONAL ACCESS TOKEN</label><input id="github-issue-token" className="settings-input" type="password" autoComplete="new-password" ref={tokenRef} placeholder="Leave blank to keep saved token" /></div>}
+        </div>
+        <button type="button" className="project-feature-button" disabled={busy || !host.trim()} onClick={() => void saveHost()}>{busy ? "Saving…" : "Save issue host"}</button>
+        {message && <p role="status">{message}</p>}
+      </div>
+    </section>
+  );
+}
+
 function SettingsView({
   settings,
   setSettings,
@@ -490,6 +545,7 @@ function SettingsView({
           </div>
         </div>
       </section>
+      <GithubIssueHostSettings />
       <section className="settings-section">
         <div className="section-header"><div><h2>GitHub connection</h2><span className="section-caption">Choose how Agent Control Plane authenticates with GitHub.</span></div></div>
         <div className="github-card">

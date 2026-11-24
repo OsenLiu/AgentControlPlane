@@ -22,6 +22,7 @@ use tauri_plugin_notification::NotificationExt;
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+mod github_issue;
 mod jira;
 mod project_features;
 
@@ -3236,15 +3237,12 @@ fn start_copilot_session_blocking(
     }
 
     let (mut command, executable) = copilot_command()?;
-    let version = command
-        .arg("--version")
-        .output()
-        .map_err(|error| {
-            format!(
-                "Unable to start Copilot CLI at '{}': {error}",
-                executable.display()
-            )
-        })?;
+    let version = command.arg("--version").output().map_err(|error| {
+        format!(
+            "Unable to start Copilot CLI at '{}': {error}",
+            executable.display()
+        )
+    })?;
     if !version.status.success() {
         let detail = String::from_utf8_lossy(&version.stderr).trim().to_owned();
         return Err(if detail.is_empty() {
@@ -4435,6 +4433,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_current_username,
             jira::import_jira_ticket,
+            github_issue::configure_github_issue_host,
+            github_issue::list_github_issue_hosts,
+            github_issue::import_github_issue,
             list_projects,
             remove_project,
             set_project_automation,
@@ -5207,7 +5208,12 @@ mod tests {
 
     #[test]
     fn copilot_updates_preserve_pending_permission_attention() {
-        for update_type in ["tool_call", "tool_call_update", "agent_message_chunk", "user_message_chunk"] {
+        for update_type in [
+            "tool_call",
+            "tool_call_update",
+            "agent_message_chunk",
+            "user_message_chunk",
+        ] {
             let line = serde_json::json!({
                 "method": "session/update",
                 "params": { "update": {
@@ -5215,11 +5221,16 @@ mod tests {
                     "title": "Run tests",
                     "content": { "type": "text", "text": "Checking the repository" }
                 } }
-            }).to_string();
+            })
+            .to_string();
             let observation = copilot_observation_from_line(&line, true)
                 .expect("valid update")
                 .expect("update observation");
-            assert_eq!(observation.status.as_deref(), Some("waiting"), "{update_type}");
+            assert_eq!(
+                observation.status.as_deref(),
+                Some("waiting"),
+                "{update_type}"
+            );
             assert_eq!(observation.step.as_deref(), Some("Waiting for permission"));
 
             let resumed = copilot_observation_from_line(&line, false)
