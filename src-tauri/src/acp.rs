@@ -828,7 +828,7 @@ fn spawn_acp_process(
             }
 
             if let Some(commands) = acp_available_commands_from_message(&message) {
-                update_session_slash_commands(&app, &reader_session_id, commands);
+                update_session_slash_commands(&app, &reader_session_id, provider.id(), commands);
             }
 
             match acp_usage_update_for_session(&database, &message, &reader_session_id) {

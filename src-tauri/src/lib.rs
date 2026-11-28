@@ -46,6 +46,7 @@ use project_features::{
 pub(crate) struct Database(pub(crate) Arc<Mutex<Connection>>);
 pub(crate) struct SessionProcesses(pub(crate) Arc<Mutex<HashMap<String, SessionControl>>>);
 pub(crate) struct SessionSlashCommands(pub(crate) Arc<Mutex<HashMap<String, Vec<SlashCommand>>>>);
+pub(crate) struct ProviderSlashCommands(pub(crate) Arc<Mutex<HashMap<String, Vec<SlashCommand>>>>);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -55,14 +56,62 @@ pub(crate) struct SlashCommand {
     pub(crate) input_hint: Option<String>,
 }
 
+fn default_provider_slash_commands(provider: &str) -> Vec<SlashCommand> {
+    let entries: &[(&str, &str)] = match provider {
+        "claudeCode" => &[
+            ("plan", "Create an implementation plan before editing"),
+            ("compact", "Summarize conversation to free context"),
+            ("clear", "Clear conversation history"),
+            ("help", "Show available commands"),
+            ("review", "Review changes in the current workspace"),
+            ("cost", "Show token usage and cost"),
+            ("model", "Switch or inspect the active model"),
+            ("init", "Initialize project instructions"),
+            ("memory", "Edit project or user memory"),
+        ],
+        "copilot" => &[
+            ("help", "Show available commands"),
+            ("plan", "Create an implementation plan"),
+            ("compact", "Summarize conversation context"),
+            ("clear", "Clear conversation history"),
+            ("model", "Switch the active model"),
+            ("diff", "Inspect workspace changes"),
+            ("review", "Review code changes"),
+            ("agent", "Select or inspect an agent"),
+        ],
+        "antigravity" => &[
+            ("plan", "Create an implementation plan before executing"),
+            ("compact", "Summarize conversation to free context"),
+            ("help", "Show available commands"),
+            ("clear", "Clear conversation history"),
+        ],
+        _ => &[],
+    };
+    entries
+        .iter()
+        .map(|(name, description)| SlashCommand {
+            name: (*name).to_owned(),
+            description: Some((*description).to_owned()),
+            input_hint: None,
+        })
+        .collect()
+}
+
 pub(crate) fn update_session_slash_commands(
     app: &tauri::AppHandle,
     session_id: &str,
+    provider: &str,
     commands: Vec<SlashCommand>,
 ) {
     let state = app.state::<SessionSlashCommands>();
     if let Ok(mut map) = state.0.lock() {
         map.insert(session_id.to_owned(), commands.clone());
+    }
+    if !commands.is_empty() {
+        let provider_state = app.state::<ProviderSlashCommands>();
+        if let Ok(mut map) = provider_state.0.lock() {
+            map.insert(provider.to_owned(), commands.clone());
+        }
     }
     let _ = app.emit(
         "agent-session-commands-updated",
@@ -2569,6 +2618,23 @@ fn get_session_slash_commands(
 }
 
 #[tauri::command]
+fn get_provider_slash_commands(
+    provider: String,
+    provider_commands: State<'_, ProviderSlashCommands>,
+) -> Result<Vec<SlashCommand>, String> {
+    let cached = provider_commands
+        .0
+        .lock()
+        .map_err(|_| "Provider slash commands state is unavailable.".to_owned())?
+        .get(&provider)
+        .cloned();
+    Ok(match cached {
+        Some(commands) if !commands.is_empty() => commands,
+        _ => default_provider_slash_commands(&provider),
+    })
+}
+
+#[tauri::command]
 fn get_pending_session_permission(
     session_id: String,
     processes: State<'_, SessionProcesses>,
@@ -3369,7 +3435,7 @@ fn start_claude_turn(
                 external_id = Some(id);
             }
             if let Some(commands) = observation.slash_commands {
-                update_session_slash_commands(&reader_app, &reader_session_id, commands);
+                update_session_slash_commands(&reader_app, &reader_session_id, "claudeCode", commands);
             }
             if let Some(step) = observation.step {
                 let _ = update_session_status(
@@ -3907,6 +3973,7 @@ pub fn run() {
             app.manage(open_database(app.handle())?);
             app.manage(SessionProcesses(Arc::new(Mutex::new(HashMap::new()))));
             app.manage(SessionSlashCommands(Arc::new(Mutex::new(HashMap::new()))));
+            app.manage(ProviderSlashCommands(Arc::new(Mutex::new(HashMap::new()))));
             app.manage(TerminalManager::default());
             Ok(())
         })
@@ -3925,6 +3992,7 @@ pub fn run() {
             list_agent_sessions,
             send_session_message,
             get_session_slash_commands,
+            get_provider_slash_commands,
             get_pending_session_permission,
             respond_session_permission,
             stop_agent_session,
@@ -4877,6 +4945,18 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn default_provider_slash_commands_exist_for_supported_providers() {
+        for provider in ["claudeCode", "copilot", "antigravity"] {
+            let commands = default_provider_slash_commands(provider);
+            assert!(
+                commands.iter().any(|cmd| cmd.name == "plan"),
+                "expected /plan default command for {provider}"
+            );
+        }
+        assert!(default_provider_slash_commands("unknown").is_empty());
     }
 
     #[test]

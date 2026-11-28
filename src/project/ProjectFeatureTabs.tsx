@@ -5,6 +5,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { createPortal } from "react-dom";
 import type { Terminal as XTerm } from "@xterm/xterm";
 import { OpenTaskInVSCodeButton } from "./OpenTaskInVSCodeButton";
+import { SlashCommand, SlashCommandMenu, useSlashCommandAutocomplete } from "../SlashCommandMenu";
 import "@xterm/xterm/css/xterm.css";
 
 type ProjectReference = {
@@ -821,8 +822,10 @@ function ProjectTaskDialog({
   onImportJira: (url: string) => Promise<{ title: string; description: string }>;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
+  const briefRef = useRef<HTMLTextAreaElement | null>(null);
   const [title, setTitle] = useState(initial?.title ?? "");
   const [description, setDescription] = useState(initial?.description ?? "");
+  const [providerSlashCommands, setProviderSlashCommands] = useState<SlashCommand[]>([]);
   const [jiraUrl, setJiraUrl] = useState("");
   const [jiraImportError, setJiraImportError] = useState("");
   const [githubUrl, setGithubUrl] = useState("");
@@ -906,6 +909,24 @@ function ProjectTaskDialog({
       setGithubStage(null);
     }
   }
+
+  useEffect(() => {
+    void invoke<SlashCommand[]>("get_provider_slash_commands", {
+      provider,
+    }).then((loaded) => {
+      setProviderSlashCommands(Array.isArray(loaded) ? loaded : []);
+    }).catch(() => {
+      setProviderSlashCommands([]);
+    });
+  }, [provider]);
+
+  const briefSlash = useSlashCommandAutocomplete({
+    commands: providerSlashCommands,
+    value: description,
+    onChange: setDescription,
+    disabled: saving,
+    inputRef: briefRef,
+  });
 
   function chooseProvider(nextProvider: AgentProvider) {
     setProvider(nextProvider);
@@ -1049,14 +1070,25 @@ function ProjectTaskDialog({
           </label>
           <label className="task-dialog-field">
             <span>Brief</span>
-            <textarea
-              required
-              maxLength={20_000}
-              rows={4}
-              value={description}
-              onChange={(event) => setDescription(event.target.value)}
-              placeholder="What should the agent build? Be specific about the goal."
-            />
+            <div className="slash-command-anchor">
+              <SlashCommandMenu
+                isOpen={briefSlash.isOpen}
+                commands={briefSlash.filteredCommands}
+                activeIndex={briefSlash.activeIndex}
+                onSelect={briefSlash.selectCommand}
+                onHover={briefSlash.setActiveIndex}
+              />
+              <textarea
+                ref={briefRef}
+                required
+                maxLength={20_000}
+                rows={4}
+                value={description}
+                onChange={(event) => briefSlash.handleChange(event.currentTarget.value)}
+                onKeyDown={briefSlash.handleKeyDown}
+                placeholder="What should the agent build? Be specific about the goal."
+              />
+            </div>
           </label>
           <div className="task-dialog-setting">
             <label htmlFor="project-task-mode">Mode</label>

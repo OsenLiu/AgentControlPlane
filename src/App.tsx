@@ -14,6 +14,7 @@ import {
   ProjectTasksTab,
   ProjectTerminalsTab,
 } from "./project/ProjectFeatureTabs";
+import { SlashCommand, SlashCommandMenu, useSlashCommandAutocomplete } from "./SlashCommandMenu";
 import "./App.css";
 
 export function getGreetingForLocalTime(date: Date): string {
@@ -107,12 +108,6 @@ type NotificationEvent = {
 };
 
 const taskReadyForReviewStep = "Task ready for review";
-
-type SlashCommand = {
-  name: string;
-  description?: string | null;
-  inputHint?: string | null;
-};
 
 type AgentSession = {
   id: string;
@@ -680,9 +675,9 @@ function AgentSessionsView({
   const fullTranscriptListRef = useRef<HTMLDivElement | null>(null);
   const [messageDraft, setMessageDraft] = useState("");
   const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
-  const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
-  const [slashActiveIndex, setSlashActiveIndex] = useState(0);
+  const [providerSlashCommands, setProviderSlashCommands] = useState<SlashCommand[]>([]);
   const replyInputRef = useRef<HTMLInputElement | null>(null);
+  const taskPromptRef = useRef<HTMLTextAreaElement | null>(null);
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [archivedView, setArchivedView] = useState(initialArchived);
   const [renamingSession, setRenamingSession] = useState(false);
@@ -700,6 +695,43 @@ function AgentSessionsView({
       ?? enabledProviders[0]?.id
       ?? null;
   const activeProviderLabel = activeProvider ? providerLabel(activeProvider) : "Agent";
+  const chatInputDisabled = !selectedSession || !selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting";
+  const chatSlash = useSlashCommandAutocomplete({
+    commands: slashCommands,
+    value: messageDraft,
+    onChange: setMessageDraft,
+    disabled: chatInputDisabled,
+    inputRef: replyInputRef,
+  });
+  const taskPromptSlash = useSlashCommandAutocomplete({
+    commands: providerSlashCommands,
+    value: task,
+    onChange: setTask,
+    disabled: starting || !activeProvider,
+    inputRef: taskPromptRef,
+  });
+  const taskPromptField = <>
+    <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
+    <div className="slash-command-anchor">
+      <SlashCommandMenu
+        isOpen={taskPromptSlash.isOpen}
+        commands={taskPromptSlash.filteredCommands}
+        activeIndex={taskPromptSlash.activeIndex}
+        onSelect={taskPromptSlash.selectCommand}
+        onHover={taskPromptSlash.setActiveIndex}
+      />
+      <textarea
+        ref={taskPromptRef}
+        id="session-task"
+        className="session-task-input"
+        value={task}
+        onChange={(event) => taskPromptSlash.handleChange(event.currentTarget.value)}
+        onKeyDown={taskPromptSlash.handleKeyDown}
+        placeholder={`Describe what ${activeProviderLabel} should work on`}
+        rows={3}
+      />
+    </div>
+  </>;
   const selectedSessionProviderName = selectedSession?.provider === "copilot"
     ? "Copilot"
     : selectedSession ? providerLabel(selectedSession.provider) : "Agent";
@@ -772,6 +804,20 @@ function AgentSessionsView({
       setLoadError(reason instanceof Error ? reason.message : String(reason));
     });
   }, [archivedView, projectId]);
+
+  useEffect(() => {
+    if (!activeProvider) {
+      setProviderSlashCommands([]);
+      return;
+    }
+    void invoke<SlashCommand[]>("get_provider_slash_commands", {
+      provider: activeProvider,
+    }).then((loaded) => {
+      setProviderSlashCommands(Array.isArray(loaded) ? loaded : []);
+    }).catch(() => {
+      setProviderSlashCommands([]);
+    });
+  }, [activeProvider]);
 
   useEffect(() => {
     setFullTranscriptOpen(false);
@@ -1022,13 +1068,6 @@ function AgentSessionsView({
     }
   }
 
-  function selectSlashCommand(command: SlashCommand) {
-    setMessageDraft(`/${command.name} `);
-    setSlashMenuDismissed(true);
-    setSlashActiveIndex(0);
-    replyInputRef.current?.focus();
-  }
-
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedSession || !messageDraft.trim()) return;
@@ -1096,8 +1135,7 @@ function AgentSessionsView({
               {projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
             </select>
           </>}
-          <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
-          <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder={`Describe what ${activeProviderLabel} should work on`} rows={3} />
+          {taskPromptField}
           <button className="primary-button" type="submit" disabled={starting || !activeProvider || !task.trim()}>{starting ? `Starting ${activeProviderLabel}…` : `Start ${activeProviderLabel} session`} <span>↗</span></button>
         </form>}
       </div>
@@ -1127,8 +1165,7 @@ function AgentSessionsView({
             {projects.length === 0 ? <option value="">No projects connected</option> : projects.map((project) => <option value={project.id} key={project.id}>{project.name} · {project.branch}</option>)}
           </select>
         </>}
-        <label className="field-label" htmlFor="session-task">TASK PROMPT</label>
-        <textarea id="session-task" className="session-task-input" value={task} onChange={(event) => setTask(event.currentTarget.value)} placeholder={`Describe what ${activeProviderLabel} should work on`} rows={3} />
+        {taskPromptField}
         <button className="primary-button" type="submit" disabled={starting || !activeProvider || projects.length === 0 || !task.trim()}>{starting ? `Starting ${activeProviderLabel}…` : `Start ${activeProviderLabel} session`} <span>↗</span></button>
       </form>}
       {loadError && <p className="session-error" role="alert">{loadError}</p>}
@@ -1213,90 +1250,35 @@ function AgentSessionsView({
                 <button className="danger-button" onClick={() => void respondToPermission(null)}>Cancel request</button>
               </div>
             </div>}
-            {(() => {
-              const chatInputDisabled = !selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting";
-              const slashMatch = messageDraft.match(/^\/([^\s]*)$/);
-              const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : null;
-              const filteredSlashCommands = slashQuery === null
-                ? []
-                : [
-                  ...slashCommands.filter((command) => command.name.toLowerCase().startsWith(slashQuery)),
-                  ...slashCommands.filter((command) => !command.name.toLowerCase().startsWith(slashQuery) && command.name.toLowerCase().includes(slashQuery)),
-                ];
-              const slashMenuOpen = !chatInputDisabled && !slashMenuDismissed && slashQuery !== null && filteredSlashCommands.length > 0;
-              const clampedSlashIndex = filteredSlashCommands.length > 0 ? Math.min(slashActiveIndex, filteredSlashCommands.length - 1) : 0;
-
-              return (
-                <div className="reply-composer">
-                  {slashMenuOpen && (
-                    <div className="slash-command-menu" role="listbox" aria-label="Slash commands">
-                      {filteredSlashCommands.map((command, index) => (
-                        <button
-                          key={command.name}
-                          type="button"
-                          role="option"
-                          aria-selected={index === clampedSlashIndex}
-                          className={`slash-command-item ${index === clampedSlashIndex ? "active" : ""}`}
-                          onMouseDown={(event) => {
-                            event.preventDefault();
-                            selectSlashCommand(command);
-                          }}
-                          onMouseEnter={() => setSlashActiveIndex(index)}
-                        >
-                          <div className="slash-command-main">
-                            <span className="slash-command-name">/{command.name}</span>
-                            {command.inputHint && <span className="slash-command-hint">{command.inputHint}</span>}
-                          </div>
-                          {command.description && <span className="slash-command-desc">{command.description}</span>}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                  <form className="reply-row" onSubmit={sendMessage}>
-                    <input
-                      ref={replyInputRef}
-                      value={messageDraft}
-                      onChange={(event) => {
-                        setMessageDraft(event.currentTarget.value);
-                        setSlashMenuDismissed(false);
-                        setSlashActiveIndex(0);
-                      }}
-                      onKeyDown={(event) => {
-                        if (!slashMenuOpen) return;
-                        if (event.key === "ArrowDown") {
-                          event.preventDefault();
-                          setSlashActiveIndex((current) => (current + 1) % filteredSlashCommands.length);
-                        } else if (event.key === "ArrowUp") {
-                          event.preventDefault();
-                          setSlashActiveIndex((current) => (current - 1 + filteredSlashCommands.length) % filteredSlashCommands.length);
-                        } else if (event.key === "Enter" || event.key === "Tab") {
-                          const chosen = filteredSlashCommands[clampedSlashIndex];
-                          if (chosen) {
-                            event.preventDefault();
-                            selectSlashCommand(chosen);
-                          }
-                        } else if (event.key === "Escape") {
-                          event.preventDefault();
-                          setSlashMenuDismissed(true);
-                        }
-                      }}
-                      disabled={chatInputDisabled}
-                      placeholder={selectedSession.managed ? selectedSession.status === "waiting" ? `Reply to ${selectedSessionProviderName}…` : `Message ${selectedSessionProviderName}…` : "This session is read only"}
-                      aria-label={`Message ${selectedSessionProviderName}`}
-                      aria-expanded={slashMenuOpen}
-                      aria-autocomplete="list"
-                    />
-                    <button
-                      className="primary-button"
-                      type="submit"
-                      disabled={chatInputDisabled || !messageDraft.trim()}
-                    >
-                      {sendingMessage ? "Sending…" : "Send"} <span>↗</span>
-                    </button>
-                  </form>
-                </div>
-              );
-            })()}
+            <div className="reply-composer slash-command-anchor">
+              <SlashCommandMenu
+                isOpen={chatSlash.isOpen}
+                commands={chatSlash.filteredCommands}
+                activeIndex={chatSlash.activeIndex}
+                onSelect={chatSlash.selectCommand}
+                onHover={chatSlash.setActiveIndex}
+              />
+              <form className="reply-row" onSubmit={sendMessage}>
+                <input
+                  ref={replyInputRef}
+                  value={messageDraft}
+                  onChange={(event) => chatSlash.handleChange(event.currentTarget.value)}
+                  onKeyDown={chatSlash.handleKeyDown}
+                  disabled={chatInputDisabled}
+                  placeholder={selectedSession.managed ? selectedSession.status === "waiting" ? `Reply to ${selectedSessionProviderName}…` : `Message ${selectedSessionProviderName}…` : "This session is read only"}
+                  aria-label={`Message ${selectedSessionProviderName}`}
+                  aria-expanded={chatSlash.isOpen}
+                  aria-autocomplete="list"
+                />
+                <button
+                  className="primary-button"
+                  type="submit"
+                  disabled={chatInputDisabled || !messageDraft.trim()}
+                >
+                  {sendingMessage ? "Sending…" : "Send"} <span>↗</span>
+                </button>
+              </form>
+            </div>
             <div className="control-actions">
               <button
                 className="danger-button stop-session-button"

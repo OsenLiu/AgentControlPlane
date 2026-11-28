@@ -2456,4 +2456,53 @@ describe("App", () => {
     fireEvent.keyDown(input, { key: "Escape" });
     expect(screen.queryByRole("listbox", { name: "Slash commands" })).toBeNull();
   });
+
+  it("shows and autocompletes slash commands in Task Prompt and Task Brief", async () => {
+    const project = {
+      id: "proj-slash",
+      name: "AgentControlPlane",
+      path: "C:/repo",
+      branch: "main",
+      currentCommit: "abc1234",
+      gitState: "clean",
+      looping: false,
+      agentTaskCreation: false,
+    };
+    const providerCommands = [
+      { name: "plan", description: "Create an implementation plan", inputHint: null },
+      { name: "review", description: "Review workspace changes", inputHint: null },
+    ];
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [project];
+      if (command === "load_settings") return settings;
+      if (command === "list_agent_sessions") return [];
+      if (command === "get_provider_slash_commands") return providerCommands;
+      if (command === "list_project_tasks") return [];
+      if (command === "get_project_diff") return { files: [], summary: "", baseBranch: "main" };
+      if (command === "list_project_git_refs") return [];
+      if (command === "get_project_dependencies") return { manifests: [], errors: [] };
+      if (command === "list_project_skills") return { global: [], project: [], errors: [] };
+      if (command === "get_project_pipelines") return { runs: [], warning: null };
+      if (command === "list_project_terminals") return [];
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    const taskPrompt = (await screen.findByLabelText("TASK PROMPT")) as HTMLTextAreaElement;
+    fireEvent.change(taskPrompt, { target: { value: "/pl" } });
+    const promptListbox = await screen.findByRole("listbox", { name: "Slash commands" });
+    expect(within(promptListbox).getAllByRole("option")).toHaveLength(1);
+    fireEvent.keyDown(taskPrompt, { key: "Enter" });
+    expect(taskPrompt.value).toBe("/plan ");
+
+    fireEvent.click(screen.getByRole("button", { name: /AgentControlPlane/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /\+ New task/i }));
+    const brief = (await screen.findByLabelText("Brief")) as HTMLTextAreaElement;
+    fireEvent.change(brief, { target: { value: "First line\n/re" } });
+    const briefListbox = await screen.findByRole("listbox", { name: "Slash commands" });
+    expect(within(briefListbox).getAllByRole("option")).toHaveLength(1);
+    fireEvent.keyDown(brief, { key: "Tab" });
+    expect(brief.value).toBe("First line\n/review ");
+  });
 });
