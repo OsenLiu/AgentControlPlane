@@ -77,12 +77,13 @@ type Settings = {
   copilot: ToolSettings;
   gemini: ToolSettings;
   claudeCode: ToolSettings;
+  antigravity: ToolSettings;
   githubUsername: string;
   githubAuthMethod: "token" | "cli";
   githubTokenConfigured: boolean;
   jiraEmail: string;
   jiraTokenConfigured: boolean;
-  defaultProvider: "copilot" | "gemini" | "claudeCode";
+  defaultProvider: "copilot" | "gemini" | "claudeCode" | "antigravity";
   transcriptFontSize: number;
   uiFontScale: number;
   notificationsEnabled: boolean;
@@ -90,7 +91,7 @@ type Settings = {
   taskCompletionNotificationsEnabled: boolean;
 };
 
-type AgentProvider = "copilot" | "claudeCode";
+type AgentProvider = "copilot" | "claudeCode" | "antigravity";
 
 type SettingsForm = Settings & { githubToken: string; jiraToken: string };
 
@@ -256,6 +257,7 @@ function providerLabel(provider: string) {
   switch (provider) {
     case "copilot": return "GitHub Copilot";
     case "claudeCode": return "Claude Code";
+    case "antigravity": return "Antigravity";
     case "gemini": return "Gemini CLI";
     default: return provider;
   }
@@ -295,6 +297,7 @@ const emptySettings = (): Settings => ({
   copilot: emptyToolSettings(),
   gemini: emptyToolSettings(),
   claudeCode: emptyToolSettings(),
+  antigravity: emptyToolSettings(),
   githubUsername: "",
   githubAuthMethod: "token",
   githubTokenConfigured: false,
@@ -460,12 +463,13 @@ function SettingsView({
   notificationError: string;
   onCheckNotificationPermission: () => void;
 }) {
-  const updateTool = (key: "copilot" | "claudeCode", field: keyof ToolSettings, value: boolean) => {
+  const updateTool = (key: "copilot" | "claudeCode" | "antigravity", field: keyof ToolSettings, value: boolean) => {
     setSettings({ ...settings, [key]: { ...settings[key], [field]: value } });
   };
   const tools = [
     { key: "copilot" as const, label: "GitHub Copilot CLI", command: "copilot login", description: "Run copilot login in a terminal to start the browser-based GitHub sign-in flow." },
     { key: "claudeCode" as const, label: "Claude Code CLI", command: "claude", description: "Start Claude and follow the sign-in flow. Use /login inside Claude Code to switch accounts." },
+    { key: "antigravity" as const, label: "Antigravity CLI", command: "agy acp --login", description: "Run agy to sign in with Google in a browser, or agy acp --login for terminal sign-in." },
   ];
 
   return (
@@ -678,6 +682,7 @@ function AgentSessionsView({
   const enabledProviders: { id: AgentProvider; label: string }[] = [
     ...(settings.copilot.enabled ? [{ id: "copilot" as const, label: "GitHub Copilot CLI" }] : []),
     ...(settings.claudeCode.enabled ? [{ id: "claudeCode" as const, label: "Claude Code CLI" }] : []),
+    ...(settings.antigravity.enabled ? [{ id: "antigravity" as const, label: "Antigravity CLI" }] : []),
   ];
   const activeProvider = selectedProvider && enabledProviders.some((provider) => provider.id === selectedProvider)
     ? selectedProvider
@@ -697,12 +702,12 @@ function AgentSessionsView({
       disabled={enabledProviders.length < 2}
       onChange={(event) => {
         const value = event.currentTarget.value;
-        if (value === "copilot" || value === "claudeCode") setSelectedProvider(value);
+        if (value === "copilot" || value === "claudeCode" || value === "antigravity") setSelectedProvider(value);
       }}
     >
       {enabledProviders.map((provider) => <option value={provider.id} key={provider.id}>{provider.label}</option>)}
     </select>
-    {enabledProviders.length === 0 && <span className="session-provider-help">Enable Copilot CLI or Claude Code CLI in Settings to start an agent session.</span>}
+    {enabledProviders.length === 0 && <span className="session-provider-help">Enable Copilot CLI, Claude Code CLI, or Antigravity CLI in Settings to start an agent session.</span>}
   </div>;
   const visibleSessions = sessions.filter((session) => {
     const matchesFilter = filter === "all" || session.status === filter;
@@ -1139,7 +1144,7 @@ function AgentSessionsView({
             <div className="detail-actions">
               <button className="secondary-button" onClick={beginRenameSession} disabled={savingSessionName}>Rename</button>
               <button className="secondary-button archive-button" onClick={() => void updateArchiveState()} disabled={resuming}>{archivedView ? "Unarchive session" : "Archive session"}</button>
-              {selectedSession.managed && ["copilot", "claudeCode"].includes(selectedSession.provider) && ["completed", "failed", "orphaned"].includes(selectedSession.status) && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
+              {selectedSession.managed && ["copilot", "claudeCode", "antigravity"].includes(selectedSession.provider) && ["completed", "failed", "orphaned"].includes(selectedSession.status) && <button className="primary-button archive-button" onClick={() => void resumeSession()} disabled={resuming}>{resuming ? "Resuming…" : "Resume session"}</button>}
             </div>
           </div>
           {renamingSession && <form className="session-rename-form" onSubmit={renameSession}>
@@ -2035,7 +2040,11 @@ function ProjectWorkspaceView({
   const taskProviderSettings = {
     copilotEnabled: settings.copilot.enabled,
     claudeCodeEnabled: settings.claudeCode.enabled,
-    defaultProvider: settings.defaultProvider === "claudeCode" ? "claudeCode" as const : "copilot" as const,
+    antigravityEnabled: settings.antigravity.enabled,
+    defaultProvider:
+      settings.defaultProvider === "claudeCode" || settings.defaultProvider === "antigravity"
+        ? settings.defaultProvider
+        : "copilot" as const,
   };
 
   async function updateAutomation(looping: boolean, agentTaskCreation: boolean) {

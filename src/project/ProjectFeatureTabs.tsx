@@ -12,11 +12,12 @@ type ProjectReference = {
   name: string;
 };
 
-type AgentProvider = "copilot" | "claudeCode";
+type AgentProvider = "copilot" | "claudeCode" | "antigravity";
 
 type AgentProviderSettings = {
   copilotEnabled: boolean;
   claudeCodeEnabled: boolean;
+  antigravityEnabled?: boolean;
   defaultProvider: AgentProvider;
   jiraConfigured: boolean;
 };
@@ -104,12 +105,105 @@ const COPILOT_MODEL_GROUPS = [
   },
 ] as const;
 
+const ANTIGRAVITY_MODEL_GROUPS = [
+  {
+    provider: "Google",
+    models: [
+      { id: "gemini-4-hydrogen", label: "Gemini 4 Hydrogen" },
+      { id: "gemini-4-carbon", label: "Gemini 4 Carbon" },
+      { id: "gemini-4-neon", label: "Gemini 4 Neon" },
+      { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash" },
+      { id: "gemini-3.1-pro", label: "Gemini 3.1 Pro" },
+    ],
+  },
+  {
+    provider: "Anthropic",
+    models: [
+      { id: "claude-sonnet-5.5", label: "Claude Sonnet 5.5" },
+      { id: "claude-opus-5.5", label: "Claude Opus 5.5" },
+    ],
+  },
+  {
+    provider: "OpenAI / Open",
+    models: [
+      { id: "gpt-oss-120b", label: "GPT-OSS 120B" },
+    ],
+  },
+] as const;
+
 const COPILOT_MODEL_IDS = new Set<string>(
   COPILOT_MODEL_GROUPS.flatMap(({ models }) => models.map(({ id }) => id)),
 );
+const ANTHROPIC_MODEL_GROUPS = COPILOT_MODEL_GROUPS.filter(({ provider }) => provider === "Anthropic");
 const ANTHROPIC_MODEL_IDS = new Set<string>(
-  COPILOT_MODEL_GROUPS.find(({ provider }) => provider === "Anthropic")?.models.map(({ id }) => id) ?? [],
+  ANTHROPIC_MODEL_GROUPS.flatMap(({ models }) => models.map(({ id }) => id)),
 );
+const ANTIGRAVITY_MODEL_IDS = new Set<string>(
+  ANTIGRAVITY_MODEL_GROUPS.flatMap(({ models }) => models.map(({ id }) => id)),
+);
+
+const TASK_PROVIDER_META: Record<
+  AgentProvider,
+  {
+    title: string;
+    cliLabel: string;
+    shortLabel: string;
+    mark: string;
+    modelGroups: readonly { readonly provider: string; readonly models: readonly { readonly id: string; readonly label: string }[] }[];
+    modelIds: Set<string>;
+    modelHelp: string;
+    customModelPlaceholder: string;
+    customModelAriaLabel: string;
+  }
+> = {
+  copilot: {
+    title: "GitHub Copilot",
+    cliLabel: "GitHub Copilot CLI",
+    shortLabel: "Copilot",
+    mark: "Co",
+    modelGroups: COPILOT_MODEL_GROUPS,
+    modelIds: COPILOT_MODEL_IDS,
+    modelHelp:
+      "The model choices follow GitHub Copilot's supported-model catalog. Availability depends on your Copilot plan and the model support in your Copilot CLI/ACP version. Auto uses the CLI default; enter a custom model ID if needed.",
+    customModelPlaceholder: "Copilot model ID",
+    customModelAriaLabel: "Custom Copilot model ID",
+  },
+  claudeCode: {
+    title: "Claude Code",
+    cliLabel: "Claude Code CLI",
+    shortLabel: "Claude Code",
+    mark: "Cl",
+    modelGroups: ANTHROPIC_MODEL_GROUPS,
+    modelIds: ANTHROPIC_MODEL_IDS,
+    modelHelp:
+      "Choose Auto to use Claude Code's configured default, or select a Claude model. Availability depends on your Claude Code plan.",
+    customModelPlaceholder: "Claude model ID",
+    customModelAriaLabel: "Custom Claude Code model ID",
+  },
+  antigravity: {
+    title: "Antigravity",
+    cliLabel: "Antigravity CLI",
+    shortLabel: "Antigravity",
+    mark: "Ag",
+    modelGroups: ANTIGRAVITY_MODEL_GROUPS,
+    modelIds: ANTIGRAVITY_MODEL_IDS,
+    modelHelp:
+      "Choose Auto to use Antigravity's configured default, or select a model available to your Google account tier. Enter a custom model ID if needed.",
+    customModelPlaceholder: "Antigravity model ID",
+    customModelAriaLabel: "Custom Antigravity model ID",
+  },
+};
+
+function isProviderEnabled(provider: AgentProvider, providerSettings: AgentProviderSettings): boolean {
+  switch (provider) {
+    case "copilot":
+      return providerSettings.copilotEnabled;
+    case "claudeCode":
+      return providerSettings.claudeCodeEnabled;
+    case "antigravity":
+      return Boolean(providerSettings.antigravityEnabled);
+  }
+}
 
 type ProjectDiff = {
   branch: string;
@@ -742,7 +836,7 @@ function ProjectTaskDialog({
     ? "auto"
     : provider === "claudeCode" && !ANTHROPIC_MODEL_IDS.has(initialModel) && /^(gpt-|gemini-|mai-|grok-|kimi-)/i.test(initialModel)
       ? "auto"
-      : COPILOT_MODEL_IDS.has(initialModel) || initialModel.startsWith("claude-")
+      : TASK_PROVIDER_META[provider].modelIds.has(initialModel) || (provider === "claudeCode" && initialModel.startsWith("claude-"))
         ? initialModel
         : "custom";
   const [modelChoice, setModelChoice] = useState(
@@ -764,9 +858,8 @@ function ProjectTaskDialog({
   }, [githubStage, importingJira, onClose, saving]);
 
   const model = modelChoice === "custom" ? customModel.trim() : modelChoice;
-  const modelGroups = provider === "claudeCode"
-    ? COPILOT_MODEL_GROUPS.filter(({ provider: group }) => group === "Anthropic")
-    : COPILOT_MODEL_GROUPS;
+  const providerMeta = TASK_PROVIDER_META[provider];
+  const modelGroups = providerMeta.modelGroups;
   const valid = title.trim().length > 0 &&
     description.trim().length > 0 &&
     model.length > 0 &&
@@ -817,10 +910,9 @@ function ProjectTaskDialog({
   function chooseProvider(nextProvider: AgentProvider) {
     setProvider(nextProvider);
     if (
-      nextProvider === "claudeCode" &&
       modelChoice !== "auto" &&
       modelChoice !== "custom" &&
-      !ANTHROPIC_MODEL_IDS.has(modelChoice)
+      !TASK_PROVIDER_META[nextProvider].modelIds.has(modelChoice)
     ) {
       setModelChoice("auto");
       setCustomModel("");
@@ -909,6 +1001,7 @@ function ProjectTaskDialog({
               {([
                 { id: "copilot", title: "GitHub Copilot", subtitle: "Copilot CLI", enabled: providerSettings.copilotEnabled },
                 { id: "claudeCode", title: "Claude Code", subtitle: "Claude Code CLI", enabled: providerSettings.claudeCodeEnabled },
+                { id: "antigravity", title: "Antigravity", subtitle: "Antigravity CLI", enabled: Boolean(providerSettings.antigravityEnabled) },
               ] as const).map((agent) => (
                 <label
                   className={`task-agent-option ${provider === agent.id ? "selected" : ""}`}
@@ -922,7 +1015,7 @@ function ProjectTaskDialog({
                     onChange={() => chooseProvider(agent.id)}
                   />
                   <span className={`task-agent-mark ${agent.id}`} aria-hidden="true">
-                    {agent.id === "copilot" ? "Co" : "Cl"}
+                    {TASK_PROVIDER_META[agent.id].mark}
                   </span>
                   <span className="task-agent-copy">
                     <strong>{agent.title}</strong>
@@ -938,13 +1031,9 @@ function ProjectTaskDialog({
               ))}
             </div>
             <p className="task-agent-help" role="note">
-              {provider === "copilot"
-                ? providerSettings.copilotEnabled
-                  ? "This task will use GitHub Copilot CLI. You can change the agent later; running sessions stay unchanged."
-                  : "This task is saved for GitHub Copilot CLI. Enable it in Settings → Integrations before starting the task."
-                : providerSettings.claudeCodeEnabled
-                  ? "This task will use Claude Code CLI. You can change the agent later; running sessions stay unchanged."
-                  : "This task is saved for Claude Code CLI. Enable it in Settings → Integrations before starting the task."}
+              {isProviderEnabled(provider, providerSettings)
+                ? `This task will use ${providerMeta.cliLabel}. You can change the agent later; running sessions stay unchanged.`
+                : `This task is saved for ${providerMeta.cliLabel}. Enable it in Settings → Integrations before starting the task.`}
             </p>
           </fieldset>
           <label className="task-dialog-field">
@@ -984,9 +1073,7 @@ function ProjectTaskDialog({
             <label htmlFor="project-task-model">Model</label>
             <TaskSettingHelp
               label="Model"
-              text={provider === "claudeCode"
-                ? "Choose Auto to use Claude Code's configured default, or select a Claude model. Availability depends on your Claude Code plan."
-                : "The model choices follow GitHub Copilot's supported-model catalog. Availability depends on your Copilot plan and the model support in your Copilot CLI/ACP version. Auto uses the CLI default; enter a custom model ID if needed."}
+              text={providerMeta.modelHelp}
             />
             <select id="project-task-model" value={modelChoice} onChange={(event) => setModelChoice(event.target.value)}>
               <option value="auto">Auto (default)</option>
@@ -1004,8 +1091,8 @@ function ProjectTaskDialog({
                 maxLength={120}
                 value={customModel}
                 onChange={(event) => setCustomModel(event.target.value)}
-                placeholder={provider === "claudeCode" ? "Claude model ID" : "Copilot model ID"}
-                aria-label={`Custom ${provider === "claudeCode" ? "Claude Code" : "Copilot"} model ID`}
+                placeholder={providerMeta.customModelPlaceholder}
+                aria-label={providerMeta.customModelAriaLabel}
               />
             )}
           </div>
@@ -1095,6 +1182,7 @@ function ProjectTaskDetail({
   onCancelDelete: () => void;
 }) {
   const linkedSessionId = task.sessionId;
+  const taskProviderMeta = TASK_PROVIDER_META[task.provider];
   const stepBudget = Math.max(task.stepBudget, 1);
   const stepsUsed = Math.max(task.stepsUsed, 0);
   const visibleStepsUsed = Math.min(stepsUsed, stepBudget);
@@ -1167,12 +1255,12 @@ function ProjectTaskDetail({
           <div className="project-task-setting">
             <span className="project-task-setting-label">Agent</span>
             <strong className="project-task-setting-value">
-              {task.provider === "copilot" ? "GitHub Copilot CLI" : "Claude Code CLI"}
+              {taskProviderMeta.cliLabel}
             </strong>
             <span className="project-task-setting-detail">
-              {task.provider === "copilot"
-                ? providerSettings.copilotEnabled ? "Enabled in Integrations." : "Enable in Integrations before starting."
-                : providerSettings.claudeCodeEnabled ? "Enabled in Integrations." : "Enable in Integrations before starting."}
+              {isProviderEnabled(task.provider, providerSettings)
+                ? "Enabled in Integrations."
+                : "Enable in Integrations before starting."}
             </span>
           </div>
           <div className="project-task-setting">
@@ -1189,8 +1277,8 @@ function ProjectTaskDetail({
             <strong className="project-task-setting-value">{task.model === "auto" ? "Automatic" : task.model}</strong>
             <span className="project-task-setting-detail">
               {task.model === "auto"
-                ? `Uses the ${task.provider === "copilot" ? "Copilot" : "Claude Code"} CLI default.`
-                : `Selected ${task.provider === "copilot" ? "Copilot" : "Claude Code"} model.`}
+                ? `Uses the ${taskProviderMeta.shortLabel} CLI default.`
+                : `Selected ${taskProviderMeta.shortLabel} model.`}
             </span>
           </div>
           <div className="project-task-setting">
@@ -1257,7 +1345,7 @@ function ProjectTaskDetail({
                 ? "This task is complete. Reopen it if more work is needed."
                 : task.status === "in_progress"
                   ? "A session has been started for this task."
-                  : `Start a ${task.provider === "copilot" ? "GitHub Copilot" : "Claude Code"} session now, or keep this task in your project backlog.`}
+                  : `Start a ${taskProviderMeta.title} session now, or keep this task in your project backlog.`}
           </p>
         </div>
         {!task.archived && (

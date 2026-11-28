@@ -1,4 +1,4 @@
-use crate::{Database, claude_command, copilot_command};
+use crate::{Database, acp::run_antigravity_draft_prompt, claude_command, copilot_command};
 use keyring::Entry;
 use reqwest::{Client, StatusCode, Url, redirect::Policy};
 use rusqlite::OptionalExtension;
@@ -52,7 +52,8 @@ pub(crate) async fn import_jira_ticket(
         let tool_provider = match provider.as_str() {
             "copilot" => "copilot",
             "claudeCode" => "claude_code",
-            _ => return Err("Choose GitHub Copilot CLI or Claude Code CLI as the default agent to import Jira tickets.".to_owned()),
+            "antigravity" => "antigravity",
+            _ => return Err("Choose GitHub Copilot CLI, Claude Code CLI, or Antigravity CLI as the default agent to import Jira tickets.".to_owned()),
         };
         let enabled = connection
             .query_row(
@@ -269,6 +270,12 @@ fn generate_from_prompt(
     prompt: String,
     source: &str,
 ) -> Result<JiraTaskDraft, String> {
+    if provider == "antigravity" {
+        let response = run_antigravity_draft_prompt(&prompt).map_err(|error| {
+            format!("Antigravity CLI could not generate a task from the {source}: {error}")
+        })?;
+        return validate_task_draft(parse_task_draft(&response)?);
+    }
     let output = match provider {
         "claudeCode" => {
             let mut command = claude_command();
@@ -294,7 +301,7 @@ fn generate_from_prompt(
                 .output()
                 .map_err(|error| format!("Unable to start GitHub Copilot CLI: {error}"))?
         }
-        _ => return Err("Choose GitHub Copilot CLI or Claude Code CLI as the default agent to import Jira tickets.".to_owned()),
+        _ => return Err("Choose GitHub Copilot CLI, Claude Code CLI, or Antigravity CLI as the default agent to import Jira tickets.".to_owned()),
     };
     if !output.status.success() {
         let label = if provider == "copilot" {

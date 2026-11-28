@@ -33,19 +33,22 @@ in.
   `PATH`; missing executables and launch failures are reported in the workspace.
 - **Project tools in context** — browse diffs, terminals, pipelines,
   dependencies, and skills alongside each project.
-- **Copilot and Claude Code support** — enable local CLI providers and select a
-  default in Settings.
+- **Copilot, Claude Code, and Antigravity support** — enable local CLI
+  providers and select a default in Settings.
 - **Local-first session data** — session lists and transcripts are stored in
-  the app's own SQLite database. Copilot uses its supported Agent Client
-  Protocol; Claude Code runs through its local headless CLI with structured
-  stream output. The app does not open either CLI's private session stores.
+  the app's own SQLite database. Copilot and Antigravity use the Agent Client
+  Protocol (`copilot --acp` and `agy acp`); Claude Code runs through its local
+  headless CLI with structured stream output. The app does not open any CLI's
+  private session stores.
 
 ## Agent CLI setup
 
-Install GitHub Copilot CLI separately before enabling it in Settings. The
-desktop app searches `PATH`, common per-user install locations such as
-`~/.local/bin`, and standard Homebrew locations. For a custom install location,
-set `COPILOT_CLI_PATH` to the executable path.
+Install GitHub Copilot CLI, Claude Code CLI, or Antigravity CLI (`agy`)
+separately before enabling them in Settings. The desktop app searches `PATH`
+and common per-user install locations (`~/.local/bin`, Homebrew on macOS/Linux,
+and `%LOCALAPPDATA%\agy\bin` on Windows for Antigravity). For custom install
+locations, set `COPILOT_CLI_PATH`, `CLAUDE_CODE_CLI_PATH`, or
+`ANTIGRAVITY_CLI_PATH` to the executable path.
 
 ## Screenshots
 

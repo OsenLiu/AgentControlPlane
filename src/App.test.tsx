@@ -54,6 +54,7 @@ const settings = {
   copilot: { enabled: false },
   gemini: { enabled: false },
   claudeCode: { enabled: true },
+  antigravity: { enabled: false },
   githubUsername: "",
   githubAuthMethod: "token" as const,
   githubTokenConfigured: false,
@@ -376,6 +377,175 @@ describe("App", () => {
     expect(screen.queryByText("Gemini CLI")).toBeNull();
     expect(screen.getByRole("radio", { name: /GitHub Copilot CLI/ })).toBeTruthy();
     expect(screen.getByRole("radio", { name: /Claude Code CLI/ })).toBeTruthy();
+    expect(screen.getByRole("radio", { name: /Antigravity CLI/ })).toBeTruthy();
+  });
+
+  it("enables Antigravity CLI, persists it as default, and launches or resumes Antigravity sessions", async () => {
+    const project = {
+      id: "/work/website",
+      name: "website",
+      path: "/work/website",
+      branch: "main",
+      currentCommit: "abcdef0",
+      gitState: "clean" as const,
+      looping: false,
+      agentTaskCreation: false,
+    };
+    const antigravitySettings = {
+      ...settings,
+      antigravity: { enabled: true },
+      defaultProvider: "antigravity" as const,
+    };
+    let sessions: Array<Record<string, unknown>> = [];
+    const defaultImplementation = invokeMock.getMockImplementation();
+    invokeMock.mockImplementation(async (command, args) => {
+      if (command === "list_projects") return [project];
+      if (command === "list_agent_sessions") return sessions;
+      if (command === "save_settings") return antigravitySettings;
+      if (command === "start_agent_session") {
+        const payload = args as { provider: string; task: string; resumeSessionId?: string };
+        sessions = [{
+          id: payload.resumeSessionId ?? "antigravity-1",
+          externalSessionId: "agy-ext-1",
+          project: "website",
+          task: payload.task || "Build Antigravity integration",
+          branch: "main",
+          provider: payload.provider,
+          status: payload.resumeSessionId ? "idle" : "completed",
+          step: payload.resumeSessionId ? "Ready for your message" : "Done",
+          elapsed: "2026-11-28 15:00:00",
+          tokens: "6.4k",
+          contextTokens: 6400,
+          contextWindowSize: 200000,
+          permissionMode: "Plan",
+          managed: true,
+          lastEvent: "Completed",
+          archived: false,
+          statusReason: "",
+          updatedAt: "2026-11-28 15:00:00",
+          taskDone: false,
+          taskArchived: false,
+        }];
+        return sessions[0];
+      }
+      if (command === "get_session_transcript") return [];
+      if (!defaultImplementation) throw new Error("Missing invoke mock implementation");
+      return defaultImplementation(command, args);
+    });
+
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Settings" }));
+    const antigravityCard = screen.getByRole("heading", { name: "Antigravity CLI" }).closest("article");
+    expect(antigravityCard).toBeTruthy();
+    fireEvent.click(within(antigravityCard as HTMLElement).getByRole("checkbox"));
+    fireEvent.click(screen.getByRole("radio", { name: /Antigravity CLI/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith(
+      "save_settings",
+      {
+        input: expect.objectContaining({
+          antigravity: { enabled: true },
+          defaultProvider: "antigravity",
+        }),
+      },
+    ));
+
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    const providerSelect = await screen.findByLabelText("AGENT PROVIDER");
+    expect(providerSelect).toHaveProperty("value", "antigravity");
+    fireEvent.change(screen.getByLabelText("TASK PROMPT"), { target: { value: "Build Antigravity integration" } });
+    fireEvent.click(screen.getByRole("button", { name: /Start Antigravity session/ }));
+
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("start_agent_session", {
+      provider: "antigravity",
+      projectId: "/work/website",
+      task: "Build Antigravity integration",
+    }));
+
+    const resumeButton = await screen.findByRole("button", { name: "Resume session" });
+    fireEvent.click(resumeButton);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("start_agent_session", {
+      provider: "antigravity",
+      projectId: null,
+      task: "",
+      resumeSessionId: "antigravity-1",
+    }));
+  });
+
+  it("creates and updates a project task assigned to Antigravity with its model catalog", async () => {
+    const project = { id: "/work/demo", name: "demo" };
+    let createdTask: Record<string, unknown> | null = null;
+    invokeMock.mockImplementation(async (command, args) => {
+      const payload = args as Record<string, unknown>;
+      if (command === "list_project_tasks") return createdTask ? [createdTask] : [];
+      if (command === "create_project_task") {
+        createdTask = {
+          id: "task-agy-1",
+          projectId: payload.projectId,
+          title: payload.title,
+          description: payload.description,
+          provider: payload.provider,
+          mode: payload.mode,
+          model: payload.model,
+          stepBudget: payload.stepBudget,
+          stepsUsed: 0,
+          autoApprove: payload.autoApprove,
+          useWorktree: payload.useWorktree,
+          workspaceLocked: false,
+          status: "backlog",
+          loopEnabled: true,
+          origin: "user",
+          sessionId: null,
+          worktreePath: null,
+          createdAt: "2026-11-28",
+          updatedAt: "2026-11-28",
+          archived: false,
+          reviewPending: false,
+        };
+        return createdTask;
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(
+      <ProjectTasksTab
+        project={project}
+        providerSettings={{
+          copilotEnabled: true,
+          claudeCodeEnabled: true,
+          antigravityEnabled: true,
+          defaultProvider: "antigravity",
+          jiraConfigured: false,
+        }}
+        onOpenSession={() => {}}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "+ New task" }));
+    expect(screen.getByRole("radio", { name: /Antigravity/ })).toHaveProperty("checked", true);
+    expect(screen.getByRole("option", { name: "Gemini 4 Carbon" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Gemini 4 Neon" })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: "GPT-6.1 Terra" })).toBeNull();
+
+    fireEvent.change(screen.getByLabelText("Task title"), { target: { value: "Wire Antigravity ACP" } });
+    fireEvent.change(screen.getByLabelText("Brief"), { target: { value: "Use agy acp for managed sessions." } });
+    fireEvent.change(screen.getByLabelText("Model"), { target: { value: "gemini-4-carbon" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create task" }));
+
+    expect(await screen.findByRole("heading", { name: "Wire Antigravity ACP" })).toBeTruthy();
+    expect(screen.getByText("Antigravity CLI")).toBeTruthy();
+    expect(screen.getByText("Selected Antigravity model.")).toBeTruthy();
+    expect(invokeMock).toHaveBeenCalledWith("create_project_task", expect.objectContaining({
+      projectId: "/work/demo",
+      provider: "antigravity",
+      model: "gemini-4-carbon",
+    }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    expect(screen.getByRole("combobox", { name: "Model" })).toHaveProperty("value", "gemini-4-carbon");
+    fireEvent.click(screen.getByRole("radio", { name: /Claude Code/ }));
+    expect(screen.getByRole("combobox", { name: "Model" })).toHaveProperty("value", "auto");
   });
 
   it("applies and persists the application text size", async () => {

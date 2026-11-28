@@ -662,8 +662,11 @@ pub(crate) fn create_project_task(
 
 fn validate_task_provider(provider: &str) -> Result<&str, String> {
     match provider {
-        "copilot" | "claudeCode" => Ok(provider),
-        _ => Err("Choose GitHub Copilot CLI or Claude Code CLI for this task.".to_owned()),
+        "copilot" | "claudeCode" | "antigravity" => Ok(provider),
+        _ => Err(
+            "Choose GitHub Copilot CLI, Claude Code CLI, or Antigravity CLI for this task."
+                .to_owned(),
+        ),
     }
 }
 
@@ -678,7 +681,7 @@ fn validate_task_model(model: &str) -> Result<&str, String> {
     let model = model.trim();
     if model.is_empty() || model.len() > 120 || model.starts_with('-') {
         return Err(
-            "Choose Auto or enter a valid Copilot model ID (up to 120 characters).".to_owned(),
+            "Choose Auto or enter a valid model ID (up to 120 characters).".to_owned(),
         );
     }
     Ok(model)
@@ -2724,6 +2727,15 @@ mod tests {
         assert_eq!(tasks[0].origin, "user");
         assert!(!tasks[0].use_worktree);
         assert!(!tasks[0].workspace_locked);
+    }
+
+    #[test]
+    fn task_provider_validation_accepts_antigravity_and_rejects_unknown() {
+        assert_eq!(validate_task_provider("copilot"), Ok("copilot"));
+        assert_eq!(validate_task_provider("claudeCode"), Ok("claudeCode"));
+        assert_eq!(validate_task_provider("antigravity"), Ok("antigravity"));
+        assert!(validate_task_provider("gemini").is_err());
+        assert!(validate_task_provider("unknown").is_err());
     }
 
     #[test]

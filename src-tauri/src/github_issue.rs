@@ -511,7 +511,8 @@ pub(crate) async fn import_github_issue(
         let tool = match provider.as_str() {
             "copilot" => "copilot",
             "claudeCode" => "claude_code",
-            _ => return Err("Choose GitHub Copilot CLI or Claude Code CLI as the default agent to import GitHub issues.".to_owned()),
+            "antigravity" => "antigravity",
+            _ => return Err("Choose GitHub Copilot CLI, Claude Code CLI, or Antigravity CLI as the default agent to import GitHub issues.".to_owned()),
         };
         let enabled = connection
             .query_row(
