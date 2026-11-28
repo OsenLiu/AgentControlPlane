@@ -2391,4 +2391,69 @@ describe("App", () => {
       expect(screen.queryByRole("dialog", { name: "Refactor transcript viewer" })).toBeNull();
     });
   });
+
+  it("shows, filters, and autocompletes slash commands in the session chat input", async () => {
+    const session = {
+      id: "session-slash",
+      externalSessionId: "agy-slash",
+      project: "AgentControlPlane",
+      task: "Slash command test",
+      branch: "main",
+      provider: "antigravity",
+      status: "idle",
+      step: "Prompt completed",
+      elapsed: "2026-11-28 16:00:00",
+      tokens: "0",
+      contextTokens: null,
+      contextWindowSize: null,
+      lastEvent: "Ready",
+      updatedAt: "2026-11-28 16:00:00",
+      managed: true,
+      archived: false,
+    };
+    const commands = [
+      { name: "plan", description: "Create an implementation plan", inputHint: "topic" },
+      { name: "compact", description: "Summarize the conversation", inputHint: null },
+      { name: "help", description: "Show available commands", inputHint: null },
+    ];
+    invokeMock.mockImplementation(async (command) => {
+      if (command === "list_projects") return [];
+      if (command === "load_settings") return settings;
+      if (command === "list_agent_sessions") return [session];
+      if (command === "get_pending_session_permission") return null;
+      if (command === "get_session_transcript") return [];
+      if (command === "get_session_slash_commands") return commands;
+      if (command === "send_session_message") return undefined;
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Agent sessions" }));
+    const input = (await screen.findByRole("textbox", { name: "Message Antigravity" })) as HTMLInputElement;
+
+    fireEvent.change(input, { target: { value: "/" } });
+    const listbox = await screen.findByRole("listbox", { name: "Slash commands" });
+    expect(within(listbox).getAllByRole("option")).toHaveLength(3);
+
+    fireEvent.change(input, { target: { value: "/co" } });
+    const filteredOptions = within(screen.getByRole("listbox", { name: "Slash commands" })).getAllByRole("option");
+    expect(filteredOptions).toHaveLength(1);
+    expect(filteredOptions[0].textContent).toContain("/compact");
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(input.value).toBe("/compact ");
+    expect(screen.queryByRole("listbox", { name: "Slash commands" })).toBeNull();
+    expect(invokeMock).not.toHaveBeenCalledWith("send_session_message", expect.anything());
+
+    fireEvent.change(input, { target: { value: "/" } });
+    await screen.findByRole("listbox", { name: "Slash commands" });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Tab" });
+    expect(input.value).toBe("/compact ");
+
+    fireEvent.change(input, { target: { value: "/" } });
+    await screen.findByRole("listbox", { name: "Slash commands" });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByRole("listbox", { name: "Slash commands" })).toBeNull();
+  });
 });

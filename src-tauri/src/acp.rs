@@ -1,12 +1,12 @@
 use crate::{
     AgentSession, Database, PendingPermission, PermissionOption, SessionControl, SessionProcesses,
-    TranscriptActivity, antigravity_command, append_assistant_chunk, capture_session_activity,
-    configure_agent_process, copilot_command, fail_project_task, handle_project_task_turn,
-    insert_session_message, list_agent_sessions_from_connection,
+    SlashCommand, TranscriptActivity, antigravity_command, append_assistant_chunk,
+    capture_session_activity, configure_agent_process, copilot_command, fail_project_task,
+    handle_project_task_turn, insert_session_message, list_agent_sessions_from_connection,
     project_features::{increment_project_task_step, prepare_task_worktree, project_task_step_usage},
     project_session_auto_approve_permissions, reset_task_after_start_failure,
-    terminate_agent_process, update_session_status, update_session_token_count,
-    validate_session_message_status,
+    terminate_agent_process, update_session_slash_commands, update_session_status,
+    update_session_token_count, validate_session_message_status,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -303,6 +303,48 @@ pub(crate) fn acp_observation_from_line(
     }
 
     Ok(observation)
+}
+
+pub(crate) fn acp_available_commands_from_message(message: &Value) -> Option<Vec<SlashCommand>> {
+    if message.get("method").and_then(Value::as_str) != Some("session/update") {
+        return None;
+    }
+    let update = &message["params"]["update"];
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("available_commands_update") {
+        return None;
+    }
+    let commands = update.get("availableCommands")?.as_array()?;
+    let parsed = commands
+        .iter()
+        .filter_map(|command| {
+            let name = command
+                .get("name")
+                .and_then(Value::as_str)?
+                .trim()
+                .trim_start_matches('/')
+                .to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            Some(SlashCommand {
+                name,
+                description: command
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned),
+                input_hint: command
+                    .get("input")
+                    .and_then(|input| input.get("hint"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned),
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(parsed)
 }
 
 pub(crate) fn acp_token_count_from_message(
@@ -783,6 +825,10 @@ fn spawn_acp_process(
 
             if let Some(activity) = acp_activity_from_message(provider, &message) {
                 capture_session_activity(&database, &app, &reader_session_id, &activity);
+            }
+
+            if let Some(commands) = acp_available_commands_from_message(&message) {
+                update_session_slash_commands(&app, &reader_session_id, commands);
             }
 
             match acp_usage_update_for_session(&database, &message, &reader_session_id) {
@@ -2131,5 +2177,59 @@ mod tests {
             resolve_acp_plan_mode_rpc(&serde_json::json!({ "sessionId": "agy-1" }), "agy-1"),
             None
         );
+    }
+
+    #[test]
+    fn acp_available_commands_update_parses_commands_and_hints() {
+        let message = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-1",
+                "update": {
+                    "sessionUpdate": "available_commands_update",
+                    "availableCommands": [
+                        {
+                            "name": "/plan",
+                            "description": "Create an implementation plan",
+                            "input": { "hint": "topic or task" }
+                        },
+                        {
+                            "name": "compact",
+                            "description": "Summarize conversation"
+                        },
+                        {
+                            "name": "   ",
+                            "description": "Ignored empty command"
+                        }
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            acp_available_commands_from_message(&message),
+            Some(vec![
+                SlashCommand {
+                    name: "plan".to_owned(),
+                    description: Some("Create an implementation plan".to_owned()),
+                    input_hint: Some("topic or task".to_owned()),
+                },
+                SlashCommand {
+                    name: "compact".to_owned(),
+                    description: Some("Summarize conversation".to_owned()),
+                    input_hint: None,
+                },
+            ])
+        );
+
+        let non_command = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "agy-1",
+                "update": { "sessionUpdate": "usage_update" }
+            }
+        });
+        assert_eq!(acp_available_commands_from_message(&non_command), None);
     }
 }

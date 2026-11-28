@@ -108,6 +108,12 @@ type NotificationEvent = {
 
 const taskReadyForReviewStep = "Task ready for review";
 
+type SlashCommand = {
+  name: string;
+  description?: string | null;
+  inputHint?: string | null;
+};
+
 type AgentSession = {
   id: string;
   externalSessionId: string | null;
@@ -673,6 +679,10 @@ function AgentSessionsView({
   const fullTranscriptOpenRef = useRef(false);
   const fullTranscriptListRef = useRef<HTMLDivElement | null>(null);
   const [messageDraft, setMessageDraft] = useState("");
+  const [slashCommands, setSlashCommands] = useState<SlashCommand[]>([]);
+  const [slashMenuDismissed, setSlashMenuDismissed] = useState(false);
+  const [slashActiveIndex, setSlashActiveIndex] = useState(0);
+  const replyInputRef = useRef<HTMLInputElement | null>(null);
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [archivedView, setArchivedView] = useState(initialArchived);
   const [renamingSession, setRenamingSession] = useState(false);
@@ -809,19 +819,36 @@ function AgentSessionsView({
     }).then((unlisten) => {
       unsubscribeActivityError = unlisten;
     });
+    let unsubscribeCommands: (() => void) | undefined;
+    void listen<{ sessionId: string; commands: SlashCommand[] }>("agent-session-commands-updated", (event) => {
+      if (event.payload.sessionId === selectedSession?.id) {
+        setSlashCommands(Array.isArray(event.payload.commands) ? event.payload.commands : []);
+      }
+    }).then((unlisten) => {
+      unsubscribeCommands = unlisten;
+    });
     if (selectedSession) {
       void invoke<PermissionRequest | null>("get_pending_session_permission", {
         sessionId: selectedSession.id,
       }).then(setPermissionRequest).catch((reason) => {
         setLoadError(reason instanceof Error ? reason.message : String(reason));
       });
+      void invoke<SlashCommand[]>("get_session_slash_commands", {
+        sessionId: selectedSession.id,
+      }).then((loaded) => {
+        setSlashCommands(Array.isArray(loaded) ? loaded : []);
+      }).catch(() => {
+        setSlashCommands([]);
+      });
     } else {
       setPermissionRequest(null);
+      setSlashCommands([]);
     }
     return () => {
       unsubscribe?.();
       unsubscribePermission?.();
       unsubscribeActivityError?.();
+      unsubscribeCommands?.();
     };
   }, [selectedSession?.id]);
 
@@ -993,6 +1020,13 @@ function AgentSessionsView({
     } finally {
       setStarting(false);
     }
+  }
+
+  function selectSlashCommand(command: SlashCommand) {
+    setMessageDraft(`/${command.name} `);
+    setSlashMenuDismissed(true);
+    setSlashActiveIndex(0);
+    replyInputRef.current?.focus();
   }
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
@@ -1179,22 +1213,90 @@ function AgentSessionsView({
                 <button className="danger-button" onClick={() => void respondToPermission(null)}>Cancel request</button>
               </div>
             </div>}
-            <form className="reply-row" onSubmit={sendMessage}>
-              <input
-                value={messageDraft}
-                onChange={(event) => setMessageDraft(event.currentTarget.value)}
-                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting"}
-                placeholder={selectedSession.managed ? selectedSession.status === "waiting" ? `Reply to ${selectedSessionProviderName}…` : `Message ${selectedSessionProviderName}…` : "This session is read only"}
-                aria-label={`Message ${selectedSessionProviderName}`}
-              />
-              <button
-                className="primary-button"
-                type="submit"
-                disabled={!selectedSession.managed || sendingMessage || !!permissionRequest || !messageDraft.trim() || selectedSession.status === "running" || selectedSession.status === "starting"}
-              >
-                {sendingMessage ? "Sending…" : "Send"} <span>↗</span>
-              </button>
-            </form>
+            {(() => {
+              const chatInputDisabled = !selectedSession.managed || sendingMessage || !!permissionRequest || selectedSession.status === "running" || selectedSession.status === "starting";
+              const slashMatch = messageDraft.match(/^\/([^\s]*)$/);
+              const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : null;
+              const filteredSlashCommands = slashQuery === null
+                ? []
+                : [
+                  ...slashCommands.filter((command) => command.name.toLowerCase().startsWith(slashQuery)),
+                  ...slashCommands.filter((command) => !command.name.toLowerCase().startsWith(slashQuery) && command.name.toLowerCase().includes(slashQuery)),
+                ];
+              const slashMenuOpen = !chatInputDisabled && !slashMenuDismissed && slashQuery !== null && filteredSlashCommands.length > 0;
+              const clampedSlashIndex = filteredSlashCommands.length > 0 ? Math.min(slashActiveIndex, filteredSlashCommands.length - 1) : 0;
+
+              return (
+                <div className="reply-composer">
+                  {slashMenuOpen && (
+                    <div className="slash-command-menu" role="listbox" aria-label="Slash commands">
+                      {filteredSlashCommands.map((command, index) => (
+                        <button
+                          key={command.name}
+                          type="button"
+                          role="option"
+                          aria-selected={index === clampedSlashIndex}
+                          className={`slash-command-item ${index === clampedSlashIndex ? "active" : ""}`}
+                          onMouseDown={(event) => {
+                            event.preventDefault();
+                            selectSlashCommand(command);
+                          }}
+                          onMouseEnter={() => setSlashActiveIndex(index)}
+                        >
+                          <div className="slash-command-main">
+                            <span className="slash-command-name">/{command.name}</span>
+                            {command.inputHint && <span className="slash-command-hint">{command.inputHint}</span>}
+                          </div>
+                          {command.description && <span className="slash-command-desc">{command.description}</span>}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  <form className="reply-row" onSubmit={sendMessage}>
+                    <input
+                      ref={replyInputRef}
+                      value={messageDraft}
+                      onChange={(event) => {
+                        setMessageDraft(event.currentTarget.value);
+                        setSlashMenuDismissed(false);
+                        setSlashActiveIndex(0);
+                      }}
+                      onKeyDown={(event) => {
+                        if (!slashMenuOpen) return;
+                        if (event.key === "ArrowDown") {
+                          event.preventDefault();
+                          setSlashActiveIndex((current) => (current + 1) % filteredSlashCommands.length);
+                        } else if (event.key === "ArrowUp") {
+                          event.preventDefault();
+                          setSlashActiveIndex((current) => (current - 1 + filteredSlashCommands.length) % filteredSlashCommands.length);
+                        } else if (event.key === "Enter" || event.key === "Tab") {
+                          const chosen = filteredSlashCommands[clampedSlashIndex];
+                          if (chosen) {
+                            event.preventDefault();
+                            selectSlashCommand(chosen);
+                          }
+                        } else if (event.key === "Escape") {
+                          event.preventDefault();
+                          setSlashMenuDismissed(true);
+                        }
+                      }}
+                      disabled={chatInputDisabled}
+                      placeholder={selectedSession.managed ? selectedSession.status === "waiting" ? `Reply to ${selectedSessionProviderName}…` : `Message ${selectedSessionProviderName}…` : "This session is read only"}
+                      aria-label={`Message ${selectedSessionProviderName}`}
+                      aria-expanded={slashMenuOpen}
+                      aria-autocomplete="list"
+                    />
+                    <button
+                      className="primary-button"
+                      type="submit"
+                      disabled={chatInputDisabled || !messageDraft.trim()}
+                    >
+                      {sendingMessage ? "Sending…" : "Send"} <span>↗</span>
+                    </button>
+                  </form>
+                </div>
+              );
+            })()}
             <div className="control-actions">
               <button
                 className="danger-button stop-session-button"

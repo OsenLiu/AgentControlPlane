@@ -45,6 +45,33 @@ use project_features::{
 #[derive(Clone)]
 pub(crate) struct Database(pub(crate) Arc<Mutex<Connection>>);
 pub(crate) struct SessionProcesses(pub(crate) Arc<Mutex<HashMap<String, SessionControl>>>);
+pub(crate) struct SessionSlashCommands(pub(crate) Arc<Mutex<HashMap<String, Vec<SlashCommand>>>>);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SlashCommand {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+    pub(crate) input_hint: Option<String>,
+}
+
+pub(crate) fn update_session_slash_commands(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    commands: Vec<SlashCommand>,
+) {
+    let state = app.state::<SessionSlashCommands>();
+    if let Ok(mut map) = state.0.lock() {
+        map.insert(session_id.to_owned(), commands.clone());
+    }
+    let _ = app.emit(
+        "agent-session-commands-updated",
+        serde_json::json!({
+            "sessionId": session_id,
+            "commands": commands,
+        }),
+    );
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -154,6 +181,7 @@ struct ClaudeObservation {
     completed: bool,
     failed: bool,
     token_count: Option<i64>,
+    slash_commands: Option<Vec<SlashCommand>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -890,10 +918,37 @@ fn claude_observation_from_line(line: &str) -> Result<ClaudeObservation, String>
     let session_id = message["session_id"].as_str().map(str::to_owned);
 
     match event_type {
-        "system" => Ok(ClaudeObservation {
-            session_id,
-            ..ClaudeObservation::default()
-        }),
+        "system" => {
+            let slash_commands = message["slash_commands"].as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let name = item
+                            .as_str()
+                            .or_else(|| item["name"].as_str())?
+                            .trim()
+                            .trim_start_matches('/')
+                            .to_owned();
+                        if name.is_empty() {
+                            return None;
+                        }
+                        Some(SlashCommand {
+                            name,
+                            description: item["description"].as_str().map(str::to_owned),
+                            input_hint: item["input"]["hint"]
+                                .as_str()
+                                .or_else(|| item["argumentHint"].as_str())
+                                .map(str::to_owned),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
+            Ok(ClaudeObservation {
+                session_id,
+                slash_commands,
+                ..ClaudeObservation::default()
+            })
+        }
         "stream_event" => {
             let event = &message["event"];
             let text = (event["type"].as_str() == Some("content_block_delta")
@@ -2502,6 +2557,18 @@ async fn send_session_message(
 }
 
 #[tauri::command]
+fn get_session_slash_commands(
+    session_id: String,
+    commands: State<'_, SessionSlashCommands>,
+) -> Result<Vec<SlashCommand>, String> {
+    let map = commands
+        .0
+        .lock()
+        .map_err(|_| "Session slash commands state is unavailable.".to_owned())?;
+    Ok(map.get(&session_id).cloned().unwrap_or_default())
+}
+
+#[tauri::command]
 fn get_pending_session_permission(
     session_id: String,
     processes: State<'_, SessionProcesses>,
@@ -3301,6 +3368,9 @@ fn start_claude_turn(
             if let Some(id) = observation.session_id {
                 external_id = Some(id);
             }
+            if let Some(commands) = observation.slash_commands {
+                update_session_slash_commands(&reader_app, &reader_session_id, commands);
+            }
             if let Some(step) = observation.step {
                 let _ = update_session_status(
                     &reader_database,
@@ -3836,6 +3906,7 @@ pub fn run() {
         .setup(|app| {
             app.manage(open_database(app.handle())?);
             app.manage(SessionProcesses(Arc::new(Mutex::new(HashMap::new()))));
+            app.manage(SessionSlashCommands(Arc::new(Mutex::new(HashMap::new()))));
             app.manage(TerminalManager::default());
             Ok(())
         })
@@ -3853,6 +3924,7 @@ pub fn run() {
             open_task_in_vscode,
             list_agent_sessions,
             send_session_message,
+            get_session_slash_commands,
             get_pending_session_permission,
             respond_session_permission,
             stop_agent_session,
@@ -4780,6 +4852,31 @@ mod tests {
         assert_eq!(observation.session_id.as_deref(), Some("claude-session"));
         assert_eq!(observation.text.as_deref(), Some("Hello"));
         assert!(!observation.completed);
+    }
+
+    #[test]
+    fn claude_system_init_event_extracts_slash_commands() {
+        let observation = claude_observation_from_line(
+            r#"{"type":"system","subtype":"init","session_id":"claude-session","slash_commands":["/help","compact"]}"#,
+        )
+        .expect("valid Claude system init event");
+
+        assert_eq!(observation.session_id.as_deref(), Some("claude-session"));
+        assert_eq!(
+            observation.slash_commands,
+            Some(vec![
+                SlashCommand {
+                    name: "help".to_owned(),
+                    description: None,
+                    input_hint: None,
+                },
+                SlashCommand {
+                    name: "compact".to_owned(),
+                    description: None,
+                    input_hint: None,
+                },
+            ])
+        );
     }
 
     #[test]
